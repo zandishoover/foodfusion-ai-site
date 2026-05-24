@@ -1,0 +1,41 @@
+{
+  "expo": {
+    "name": "FoodFusion AI",
+    "slug": "foodfusion-ai",
+    "scheme": "foodfusion",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#090D12"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.foodfusion.ai",
+      "infoPlist": {
+        "NSCameraUsageDescription": "FoodFusion AI uses fridge and pantry photos to suggest meals.",
+        "NSLocalNetworkUsageDescription": "FoodFusion AI connects to your nearby analysis service while testing photo scans."
+      }
+    },
+    "android": {
+      "package": "com.foodfusion.ai",
+      "permissions": [
+        "CAMERA"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "FoodFusion AI uses fridge and pantry photos to suggest meals."
+        }
+      ]
+    ]
+  }
+}

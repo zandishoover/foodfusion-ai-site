@@ -1,0 +1,39 @@
+{
+  "name": "foodfusion-ai",
+  "version": "1.0.0",
+  "private": true,
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "postinstall": "node scripts/patchExpoDevMenuXcode.mjs",
+    "start": "expo start",
+    "ios": "expo run:ios",
+    "android": "expo run:android",
+    "web": "expo start --web",
+    "scan:test": "node scripts/testFoodScan.mjs assets/upload_photos/FF1.jpg",
+    "security:check": "node scripts/checkClientSecrets.mjs",
+    "recipe:mcp": "recipe-mcp",
+    "recipe:bridge": "node server/recipeMcpBridge.mjs",
+    "recipe:bridge:device": "FOODFUSION_BRIDGE_HOST=0.0.0.0 node server/recipeMcpBridge.mjs"
+  },
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "1.23.1",
+    "@supabase/supabase-js": "^2.106.1",
+    "expo": "~51.0.28",
+    "expo-clipboard": "~6.0.3",
+    "expo-dev-client": "~4.0.29",
+    "expo-dev-menu": "5.0.23",
+    "expo-dev-menu-interface": "1.8.4",
+    "expo-file-system": "~17.0.1",
+    "expo-image-manipulator": "~12.0.5",
+    "expo-image-picker": "~15.1.0",
+    "expo-keep-awake": "~13.0.2",
+    "expo-status-bar": "~1.12.1",
+    "react": "18.2.0",
+    "react-native": "0.74.5",
+    "react-native-url-polyfill": "^3.0.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.24.0",
+    "@cookwith/recipe-mcp": "^1.0.4"
+  }
+}
