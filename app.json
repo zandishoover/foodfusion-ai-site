@@ -26,7 +26,8 @@
     "android": {
       "package": "com.foodfusion.ai",
       "permissions": [
-        "CAMERA"
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
       ]
     },
     "plugins": [
@@ -36,6 +37,11 @@
           "cameraPermission": "FoodFusion AI uses fridge and pantry photos to suggest meals."
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "fdd9b3c3-a716-4684-90de-22320b5add6b"
+      }
+    }
   }
 }

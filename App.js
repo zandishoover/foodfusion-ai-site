@@ -4652,7 +4652,7 @@ export default function App() {
               <Text style={styles.homeUtilityMeta}>{useSoonItems.length > 0 ? `${useSoonItems.length} use soon` : 'Track freshness'}</Text>
             </Pressable>
             <Pressable onPress={() => setScreen('collections')} style={({ pressed }) => [styles.homeUtilityCard, pressed && styles.pressed]}>
-              <Text style={styles.homeUtilityTitle}>Collections</Text>
+              <Text style={styles.homeUtilityTitle}>Specials</Text>
               <Text style={styles.homeUtilityMeta}>Find a mood</Text>
             </Pressable>
             <Pressable onPress={() => setScreen('search')} style={({ pressed }) => [styles.homeUtilityCard, pressed && styles.pressed]}>
@@ -5934,9 +5934,9 @@ export default function App() {
   if (screen === 'collections') {
     return (
       <Screen toast={toast}>
-        <AppHeader eyebrow="Collections" onBack={() => setScreen('home')} />
+        <AppHeader eyebrow="Specials" onBack={() => setScreen('home')} />
         <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.collectionsScroll}>
-          <Text style={styles.collectionHeadline}>Smart Meal Collections</Text>
+          <Text style={styles.collectionHeadline}>Smart Meal Specials</Text>
           <Text style={styles.collectionIntro}>Choose a moment and get recipes matched to your kitchen.</Text>
           {collectionFolders.map((folder) => {
             const preset = collectionPresets[folder];
