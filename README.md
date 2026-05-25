@@ -72,11 +72,12 @@ If the bridge is not running or `OPENAI_API_KEY` is not configured on the bridge
 
 ## Optional Instacart MCP Shopping
 
-The cart button opens `Shop Ingredients`. Search, store filtering, cart totals, checkout, and order confirmation work locally even without Instacart.
+The Shop tab opens a mobile shopping flow with saved address/ZIP entry, nearby-store selection, store-grouped results, cart totals, checkout, and tracking. Location is stored on-device for convenience and sent to the configured shopping bridge only when it is connected.
 
 To connect an Instacart MCP bridge, expose one of these routes:
 
 ```text
+POST /instacart/stores        { location: { address }, fulfillmentMode }
 POST /instacart/search
 POST /instacart/checkout
 POST /instacart/order
@@ -90,7 +91,7 @@ Then start Expo with:
 EXPO_PUBLIC_INSTACART_MCP_ENDPOINT=http://YOUR_ENDPOINT npx expo start --clear
 ```
 
-If the Instacart MCP server is disconnected, FoodFusion keeps the local cart and shows `Shopping connection unavailable.`
+Keep any Instacart or retailer credentials on the server side. Never add provider secret keys to an `EXPO_PUBLIC_` variable. If the shopping bridge is disconnected, FoodFusion retains the cart locally and offers store options with a clear live-availability notice.
 
 Search results can include:
 
@@ -104,7 +105,7 @@ Search results can include:
 }
 ```
 
-Checkout can return `{ orderId, eta }`, and tracking can return `{ status, statusIndex, eta, timeRemaining }`. If not available, FoodFusion uses local demo order tracking and persists orders on device.
+Checkout can return `{ orderId, eta }`, and tracking can return `{ status, statusIndex, eta, timeRemaining }`. If not available, FoodFusion uses local order tracking and persists orders on device.
 
 ## Local Recipe MCP Server
 

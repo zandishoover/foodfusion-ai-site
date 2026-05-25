@@ -88,13 +88,52 @@ function normalizeItem(item, fallbackQuery = 'grocery item') {
   };
 }
 
-export async function searchInstacartItems(query) {
+function normalizeStore(store) {
+  const name = store?.name || store?.store || store?.retailer || store?.retailerName || 'Store';
+  return {
+    id: `${store?.id || store?.retailerId || name}`.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+    name,
+    distance: store?.distance || store?.distanceText || '',
+    eta: store?.eta || store?.deliveryTime || store?.fulfillment || '',
+    fee: store?.fee || store?.deliveryFee || '',
+    status: store?.status || store?.openStatus || 'Open'
+  };
+}
+
+export async function getInstacartConnectionStatus() {
+  const data = await firstAvailable(
+    ['/instacart/status', '/health'],
+    ['instacart/status', 'health'],
+    null
+  );
+  return { connected: Boolean(data) };
+}
+
+export async function findInstacartStores(location, fulfillmentMode = 'Delivery') {
+  if (!location?.address) {
+    return { connected: false, stores: [] };
+  }
+
+  const payload = { location, fulfillmentMode };
+  const data = await firstAvailable(
+    ['/instacart/stores', '/stores/nearby'],
+    ['instacart/stores', 'findNearbyStores'],
+    payload
+  );
+  const rawStores = Array.isArray(data) ? data : data?.stores || data?.retailers || [];
+  return {
+    connected: Array.isArray(rawStores),
+    stores: Array.isArray(rawStores) ? rawStores.map(normalizeStore).slice(0, 12) : []
+  };
+}
+
+export async function searchInstacartItems(query, context = {}) {
   const cleanQuery = query.trim();
   if (!cleanQuery) {
     return { connected: false, items: [] };
   }
 
-  const payload = { query: cleanQuery };
+  const payload = { query: cleanQuery, ...context };
   const data = await firstAvailable(
     ['/instacart/search', '/search'],
     ['instacart/search', 'searchItems'],
@@ -108,14 +147,14 @@ export async function searchInstacartItems(query) {
   };
 }
 
-export async function createInstacartCheckout(cartItems = []) {
+export async function createInstacartCheckout(cartItems = [], context = {}) {
   const items = cartItems.map((item) => ({
     id: item.id,
     name: item.name,
     quantity: item.quantity || 1
   }));
 
-  const payload = { items };
+  const payload = { items, ...context };
   const data = await firstAvailable(
     ['/instacart/checkout', '/checkout'],
     ['instacart/checkout', 'createCart', 'createCheckout'],

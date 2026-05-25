@@ -31,6 +31,7 @@ import {
 } from './services/recipeMcp';
 import {
   createInstacartCheckout,
+  findInstacartStores,
   getInstacartOrderTracking,
   searchInstacartItems
 } from './services/instacartMcp';
@@ -62,6 +63,7 @@ const HISTORY_KEY = 'foodfusion:mealHistory';
 const FAVORITES_KEY = 'foodfusion:favorites';
 const GROCERY_KEY = 'foodfusion:groceryList';
 const SHOPPING_CART_KEY = 'foodfusion:shoppingCart';
+const SHOPPING_LOCATION_KEY = 'foodfusion:shoppingLocation';
 const ORDER_HISTORY_KEY = 'foodfusion:orderHistory';
 const PREFERENCES_KEY = 'foodfusion:preferences';
 const DISLIKES_KEY = 'foodfusion:dislikedIngredients';
@@ -320,6 +322,34 @@ const localShoppingCatalog = [
   { key: 'protein', name: 'Protein Powder', store: 'Walmart', price: '$24.99', size: '1 lb' },
   { key: 'protein', name: 'Whey Protein', store: 'Target', price: '$29.99', size: '1.5 lb' }
 ];
+const localStoreProfiles = [
+  { name: "Fry's", baseDistance: 1.2, deliveryFee: '$3.99' },
+  { name: 'Safeway', baseDistance: 2.1, deliveryFee: '$4.99' },
+  { name: 'Walmart', baseDistance: 3.4, deliveryFee: '$2.99' },
+  { name: 'Target', baseDistance: 4.1, deliveryFee: '$4.99' },
+  { name: "Trader Joe's", baseDistance: 5.3, deliveryFee: '$5.99' },
+  { name: 'Whole Foods', baseDistance: 6.2, deliveryFee: '$5.99' },
+  { name: 'Costco', baseDistance: 8.7, deliveryFee: '$6.99' }
+];
+
+function nearbyStoreOptionsForLocation(location, mode = 'Delivery') {
+  const cleanLocation = `${location?.address || ''}`.trim();
+  const locationSeed = [...cleanLocation].reduce((total, char) => total + char.charCodeAt(0), 0);
+  return localStoreProfiles
+    .map((store, index) => {
+      const distance = store.baseDistance + ((locationSeed + index * 3) % 8) / 10;
+      const metadata = shoppingStoreMeta[store.name];
+      return {
+        id: store.name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+        name: store.name,
+        distance: `${distance.toFixed(1)} mi`,
+        eta: mode === 'Delivery' ? metadata.delivery : metadata.pickup,
+        fee: mode === 'Delivery' ? store.deliveryFee : 'No pickup fee',
+        status: (locationSeed + index) % 6 === 0 ? 'Closes soon' : 'Open'
+      };
+    })
+    .sort((first, second) => parseFloat(first.distance) - parseFloat(second.distance));
+}
 
 const ingredientSets = [
   ['eggs', 'spinach', 'cheddar', 'rice', 'tomatoes'],
@@ -2404,8 +2434,14 @@ export default function App() {
   const [shoppingResults, setShoppingResults] = useState([]);
   const [shoppingNotice, setShoppingNotice] = useState('');
   const [shoppingStoreFilter, setShoppingStoreFilter] = useState('All Stores');
+  const [shoppingLocation, setShoppingLocation] = useState(null);
+  const [shoppingLocationDraft, setShoppingLocationDraft] = useState('');
+  const [nearbyStores, setNearbyStores] = useState([]);
+  const [shoppingConnectionStatus, setShoppingConnectionStatus] = useState('Not Connected');
+  const [isNearbyStoresLoading, setIsNearbyStoresLoading] = useState(false);
   const [globalSearchQuery, setGlobalSearchQuery] = useState('');
   const [fulfillmentMode, setFulfillmentMode] = useState('Delivery');
+  const [fulfillmentWindow, setFulfillmentWindow] = useState('Within 2 hours');
   const [promoCode, setPromoCode] = useState('');
   const [promoApplied, setPromoApplied] = useState(false);
   const [orderConfirmation, setOrderConfirmation] = useState(null);
@@ -2535,9 +2571,16 @@ export default function App() {
     const savings = promoApplied ? Math.min(5, totals.subtotal * 0.1) : 0;
     return { ...totals, savings, total: totals.total - savings };
   }, [shoppingCart, promoApplied]);
+  const cartGroups = useMemo(() => Object.entries(
+    shoppingCart.reduce((groups, item) => {
+      const storeName = item.store || item.brand || 'Store';
+      return { ...groups, [storeName]: [...(groups[storeName] || []), item] };
+    }, {})
+  ).map(([store, items]) => ({ store, items, totals: shoppingTotals(items) })), [shoppingCart]);
   const cartItemCount = shoppingCart.reduce((total, item) => total + (item.quantity || 1), 0);
   const primaryCartStore = shoppingCart[0]?.store || shoppingCart[0]?.brand || "Fry's";
-  const primaryStoreMeta = shoppingStoreMeta[primaryCartStore] || shoppingStoreMeta["Fry's"];
+  const primaryNearbyStore = nearbyStores.find((store) => store.name === primaryCartStore);
+  const primaryStoreMeta = primaryNearbyStore || shoppingStoreMeta[primaryCartStore] || shoppingStoreMeta["Fry's"];
   const shoppingSuggestions = grocerySuggestionGroups(shoppingQuery, shoppingCart);
   const globalSearchResults = useMemo(() => {
     const query = globalSearchQuery.trim().toLowerCase();
@@ -2583,6 +2626,7 @@ export default function App() {
         storedFavorites,
         storedGrocery,
         storedShoppingCart,
+        storedShoppingLocation,
         storedRecentSearches,
         storedOrderHistory,
         storedPreferences,
@@ -2618,6 +2662,7 @@ export default function App() {
         AsyncStorage.getItem(FAVORITES_KEY),
         AsyncStorage.getItem(GROCERY_KEY),
         AsyncStorage.getItem(SHOPPING_CART_KEY),
+        AsyncStorage.getItem(SHOPPING_LOCATION_KEY),
         AsyncStorage.getItem(RECENT_SEARCHES_KEY),
         AsyncStorage.getItem(ORDER_HISTORY_KEY),
         AsyncStorage.getItem(PREFERENCES_KEY),
@@ -2664,6 +2709,11 @@ export default function App() {
       setFavorites(storedFavorites ? JSON.parse(storedFavorites) : []);
       setGroceryList(storedGrocery ? JSON.parse(storedGrocery) : []);
       setShoppingCart(storedShoppingCart ? JSON.parse(storedShoppingCart) : []);
+      const savedShoppingLocation = storedShoppingLocation ? JSON.parse(storedShoppingLocation) : null;
+      setShoppingLocation(savedShoppingLocation);
+      setShoppingLocationDraft(savedShoppingLocation?.address || '');
+      setFulfillmentMode(savedShoppingLocation?.fulfillmentMode || 'Delivery');
+      setNearbyStores(savedShoppingLocation ? nearbyStoreOptionsForLocation(savedShoppingLocation, savedShoppingLocation.fulfillmentMode || 'Delivery') : []);
       setRecentSearches(storedRecentSearches ? JSON.parse(storedRecentSearches) : []);
       setOrderHistory(storedOrderHistory ? JSON.parse(storedOrderHistory) : []);
       setShoppingResults(localShoppingSearch('eggs'));
@@ -2695,6 +2745,9 @@ export default function App() {
       });
       setCameraPermissionIntroSeen(storedCameraPermissionIntro === 'true');
       setNotificationsEnabled(storedNotificationsEnabled === 'true');
+      if (savedShoppingLocation) {
+        loadNearbyStores(savedShoppingLocation, savedShoppingLocation.fulfillmentMode || 'Delivery');
+      }
       if (sessionProfile) {
         hydrateSyncedUserData();
       }
@@ -2910,7 +2963,7 @@ export default function App() {
   }
 
   function navigateTab(nextScreen) {
-    setScreen(nextScreen);
+    setScreen(nextScreen === 'shopping' && !shoppingLocation ? 'shoppingLocation' : nextScreen);
     if (['favorites', 'shopping', 'orderHistory'].includes(nextScreen)) {
       setTabLoading(nextScreen);
       setTimeout(() => setTabLoading(null), 340);
@@ -3250,10 +3303,13 @@ export default function App() {
       item.store.toLowerCase().includes(cleanQuery)
     );
 
-    const sourceItems = matches.length > 0
-      ? matches
-      : shoppingStoreOptions
-          .filter((store) => store !== 'All Stores')
+    const availableStoreNames = nearbyStores.length > 0
+      ? nearbyStores.map((store) => store.name)
+      : shoppingStoreOptions.filter((store) => store !== 'All Stores');
+    const locationMatches = matches.filter((item) => availableStoreNames.includes(item.store));
+    const sourceItems = locationMatches.length > 0
+      ? locationMatches
+      : availableStoreNames
           .slice(0, 5)
           .map((store, index) => ({
             key: cleanQuery,
@@ -3267,7 +3323,9 @@ export default function App() {
       ...item,
       id: `${item.store}-${item.name}-${item.size}`.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
       brand: item.store,
-      eta: shoppingStoreMeta[item.store]?.delivery || 'Delivery 45-60 min'
+      eta: nearbyStores.find((store) => store.name === item.store)?.eta ||
+        (fulfillmentMode === 'Delivery' ? shoppingStoreMeta[item.store]?.delivery : shoppingStoreMeta[item.store]?.pickup) ||
+        'Available today'
     }));
   }
 
@@ -3287,8 +3345,13 @@ export default function App() {
     setIsShoppingLoading(true);
     setShoppingNotice('');
     try {
-      const result = await searchInstacartItems(query);
+      const result = await searchInstacartItems(query, {
+        location: shoppingLocation,
+        fulfillmentMode,
+        stores: nearbyStores.map((store) => ({ id: store.id, name: store.name }))
+      });
       if (result.connected && result.items.length > 0) {
+        setShoppingConnectionStatus('Connected');
         setShoppingResults(result.items.map((item) => ({
           ...item,
           store: item.store || item.retailer || item.brand || 'Instacart',
@@ -3297,13 +3360,66 @@ export default function App() {
         setShoppingNotice('');
       } else {
         setShoppingResults(localShoppingSearch(query));
-        setShoppingNotice('Shopping connection unavailable. Showing nearby store results.');
+        setShoppingConnectionStatus('Not Connected');
+        setShoppingNotice('Live availability unavailable. Showing store options for your area.');
       }
     } catch {
       setShoppingResults(localShoppingSearch(query));
-      setShoppingNotice('Shopping connection unavailable. Showing nearby store results.');
+      setShoppingConnectionStatus('Not Connected');
+      setShoppingNotice('Live availability unavailable. Showing store options for your area.');
     } finally {
       setIsShoppingLoading(false);
+    }
+  }
+
+  async function loadNearbyStores(location = shoppingLocation, mode = fulfillmentMode) {
+    if (!location?.address) {
+      return;
+    }
+    setIsNearbyStoresLoading(true);
+    setShoppingNotice('');
+    try {
+      const result = await findInstacartStores(location, mode);
+      if (result.connected && result.stores.length > 0) {
+        setNearbyStores(result.stores);
+        setShoppingConnectionStatus('Connected');
+      } else {
+        setNearbyStores(nearbyStoreOptionsForLocation(location, mode));
+        setShoppingConnectionStatus('Not Connected');
+        setShoppingNotice('Live availability unavailable. Confirm pricing and times at checkout.');
+      }
+      setShoppingResults([]);
+    } catch {
+      setNearbyStores(nearbyStoreOptionsForLocation(location, mode));
+      setShoppingConnectionStatus('Not Connected');
+      setShoppingNotice('Live availability unavailable. Confirm pricing and times at checkout.');
+      setShoppingResults([]);
+    } finally {
+      setIsNearbyStoresLoading(false);
+    }
+  }
+
+  async function saveShoppingLocation() {
+    const address = shoppingLocationDraft.trim();
+    if (address.length < 3) {
+      Alert.alert('Shopping Location', 'Enter an address or ZIP code to find stores.');
+      return;
+    }
+    const nextLocation = { address, fulfillmentMode };
+    setShoppingLocation(nextLocation);
+    setShoppingStoreFilter('All Stores');
+    await AsyncStorage.setItem(SHOPPING_LOCATION_KEY, JSON.stringify(nextLocation));
+    await loadNearbyStores(nextLocation, fulfillmentMode);
+    setScreen('shoppingStores');
+  }
+
+  async function updateShoppingFulfillment(mode) {
+    setFulfillmentMode(mode);
+    if (shoppingLocation?.address) {
+      const nextLocation = { ...shoppingLocation, fulfillmentMode: mode };
+      setShoppingLocation(nextLocation);
+      await AsyncStorage.setItem(SHOPPING_LOCATION_KEY, JSON.stringify(nextLocation));
+      await loadNearbyStores(nextLocation, mode);
     }
   }
 
@@ -3325,7 +3441,7 @@ export default function App() {
     const query = item.key || item.name;
     setShoppingQuery(query);
     setShoppingResults(localShoppingSearch(query));
-    setScreen('shopping');
+    setScreen(shoppingLocation ? 'shopping' : 'shoppingLocation');
   }
 
   async function removeShoppingItem(itemId) {
@@ -3352,16 +3468,16 @@ export default function App() {
     setIsCheckoutLoading(true);
     setShoppingNotice('');
     try {
-      const checkout = await createInstacartCheckout(shoppingCart);
+      const checkout = await createInstacartCheckout(shoppingCart, { location: shoppingLocation, fulfillmentMode });
       const checkoutUrl = checkout?.url || checkout?.checkoutUrl || checkout?.cartUrl;
       if (checkoutUrl) {
         await Linking.openURL(checkoutUrl);
         setShoppingNotice('Instacart checkout is ready.');
       } else {
-        setShoppingNotice('Shopping connection unavailable. Showing nearby store results.');
+        setShoppingNotice('Shopping connection unavailable. Your cart remains available.');
       }
     } catch {
-      setShoppingNotice('Shopping connection unavailable. Showing nearby store results.');
+      setShoppingNotice('Shopping connection unavailable. Your cart remains available.');
     } finally {
       setIsCheckoutLoading(false);
     }
@@ -3383,7 +3499,11 @@ export default function App() {
     setIsCheckoutLoading(true);
     let mcpOrder = null;
     try {
-      mcpOrder = await createInstacartCheckout(shoppingCart);
+      mcpOrder = await createInstacartCheckout(shoppingCart, {
+        location: shoppingLocation,
+        fulfillmentMode,
+        fulfillmentWindow
+      });
     } catch {
       // Optional MCP checkout. Local confirmation still completes the flow.
     }
@@ -3402,7 +3522,10 @@ export default function App() {
       id: mcpOrderId || orderNumber(),
       mode: fulfillmentMode,
       store: tracking?.store || primaryCartStore,
-      eta: tracking?.eta || tracking?.estimatedTime || (fulfillmentMode === 'Delivery' ? primaryStoreMeta.delivery : primaryStoreMeta.pickup),
+      eta: tracking?.eta || tracking?.estimatedTime || primaryNearbyStore?.eta ||
+        (fulfillmentMode === 'Delivery' ? primaryStoreMeta.delivery : primaryStoreMeta.pickup),
+      address: shoppingLocation?.address || '',
+      fulfillmentWindow,
       total: cartTotals.total,
       items: shoppingCart,
       placedAt: Date.now(),
@@ -4216,7 +4339,12 @@ export default function App() {
     setShoppingResults([]);
     setShoppingNotice('');
     setShoppingStoreFilter('All Stores');
+    setShoppingLocation(null);
+    setShoppingLocationDraft('');
+    setNearbyStores([]);
+    setShoppingConnectionStatus('Not Connected');
     setFulfillmentMode('Delivery');
+    setFulfillmentWindow('Within 2 hours');
     setPromoCode('');
     setPromoApplied(false);
     setOrderConfirmation(null);
@@ -4268,6 +4396,7 @@ export default function App() {
       FAVORITES_KEY,
       GROCERY_KEY,
       SHOPPING_CART_KEY,
+      SHOPPING_LOCATION_KEY,
       RECENT_SEARCHES_KEY,
       ORDER_HISTORY_KEY,
       PREFERENCES_KEY,
@@ -5543,13 +5672,115 @@ export default function App() {
     );
   }
 
+  if (screen === 'shoppingLocation') {
+    return (
+      <Screen toast={toast}>
+        <AppHeader eyebrow="Shopping Location" onBack={() => setScreen('home')} accent={flowColors.shopping.accent} />
+        <ScrollView showsVerticalScrollIndicator={false} style={styles.tabScroll} contentContainerStyle={styles.tabScrollContent}>
+          <FlowProgress steps={['Location', 'Stores', 'Cart']} current={0} tone={flowColors.shopping} />
+          <View style={[styles.shopSearchCard, { borderColor: flowColors.shopping.tint }]}>
+            <Text style={[styles.shopTitle, { color: flowColors.shopping.accent }]}>Find Stores Near You</Text>
+            <Text style={styles.settingsSubtitle}>Enter your delivery address or ZIP code to see store options.</Text>
+            <Text style={styles.filterLabel}>Address or ZIP code</Text>
+            <TextInput
+              value={shoppingLocationDraft}
+              onChangeText={setShoppingLocationDraft}
+              onSubmitEditing={saveShoppingLocation}
+              placeholder="85001 or 123 Main Street"
+              placeholderTextColor={palette.muted}
+              autoCapitalize="words"
+              style={styles.locationInput}
+            />
+            <View style={styles.fulfillmentToggle}>
+              {['Delivery', 'Pickup'].map((mode) => (
+                <Pressable
+                  key={mode}
+                  onPress={() => setFulfillmentMode(mode)}
+                  style={[
+                    styles.fulfillmentOption,
+                    fulfillmentMode === mode && styles.activeFulfillmentOption,
+                    fulfillmentMode === mode && { backgroundColor: flowColors.shopping.tint }
+                  ]}
+                >
+                  <Text style={[styles.fulfillmentText, fulfillmentMode === mode && { color: flowColors.shopping.accent }]}>{mode}</Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+          <Button accent={flowColors.shopping.accent} onPress={saveShoppingLocation} disabled={isNearbyStoresLoading}>
+            {isNearbyStoresLoading ? 'Finding Stores...' : 'Save Location'}
+          </Button>
+          {isNearbyStoresLoading ? <LoadingState text="Finding stores..." rows={3} tone={flowColors.shopping} /> : null}
+        </ScrollView>
+        <BottomTabs active="shopping" onNavigate={navigateTab} />
+      </Screen>
+    );
+  }
+
+  if (screen === 'shoppingStores') {
+    return (
+      <Screen toast={toast}>
+        <AppHeader eyebrow="Nearby Stores" onBack={() => setScreen('shoppingLocation')} accent={flowColors.shopping.accent} />
+        <ScrollView showsVerticalScrollIndicator={false} style={styles.tabScroll} contentContainerStyle={styles.tabScrollContent}>
+          <FlowProgress steps={['Location', 'Stores', 'Cart']} current={1} tone={flowColors.shopping} />
+          <View style={styles.locationSummaryCard}>
+            <Text style={styles.listTitle}>{fulfillmentMode} near {shoppingLocation?.address}</Text>
+            <Text style={styles.shopItemMeta}>{shoppingConnectionStatus === 'Connected' ? 'Live store availability connected' : 'Live availability unavailable. Confirm details at checkout.'}</Text>
+          </View>
+          {isNearbyStoresLoading ? <LoadingState text="Finding stores..." rows={4} tone={flowColors.shopping} /> : null}
+          {!isNearbyStoresLoading && nearbyStores.map((store) => (
+            <Pressable
+              key={store.id}
+              onPress={() => {
+                setShoppingStoreFilter(store.name);
+                setScreen('shopping');
+              }}
+              style={({ pressed }) => [styles.nearbyStoreCard, pressed && styles.pressed]}
+            >
+              <View style={styles.storeCardHeader}>
+                <Text style={styles.listTitle}>{store.name}</Text>
+                <Text style={[styles.storeStatus, store.status !== 'Open' && styles.storeStatusClosing]}>{store.status}</Text>
+              </View>
+              <Text style={styles.shopItemMeta}>{[store.distance, store.eta, store.fee].filter(Boolean).join(' • ')}</Text>
+              <Text style={[styles.orderHistoryText, { color: flowColors.shopping.accent }]}>Shop this store</Text>
+            </Pressable>
+          ))}
+          <Button accent={flowColors.shopping.accent} onPress={() => {
+            setShoppingStoreFilter('All Stores');
+            setScreen('shopping');
+          }}>Shop All Stores</Button>
+        </ScrollView>
+        <BottomTabs active="shopping" onNavigate={navigateTab} />
+      </Screen>
+    );
+  }
+
   if (screen === 'shopping') {
     const filteredResults = visibleShoppingResults();
+    const storeFilters = ['All Stores', ...nearbyStores.map((store) => store.name)];
+    const groupedResults = Object.entries(filteredResults.reduce((groups, item) => {
+      const storeName = item.store || item.brand || 'Store';
+      return { ...groups, [storeName]: [...(groups[storeName] || []), item] };
+    }, {}));
     return (
       <Screen toast={toast}>
         <AppHeader eyebrow="Shop Ingredients" onSettings={() => setScreen('settings')} accent={flowColors.shopping.accent} />
         <ScrollView showsVerticalScrollIndicator={false} style={styles.tabScroll} contentContainerStyle={styles.tabScrollContent}>
           <FlowProgress steps={['Cart', 'Checkout', 'Tracking']} current={0} tone={flowColors.shopping} />
+          <View style={styles.locationSummaryCard}>
+            <View style={styles.storeCardHeader}>
+              <View style={styles.shopItemInfo}>
+                <Text style={styles.listTitle}>{fulfillmentMode} location</Text>
+                <Text style={styles.shopItemMeta}>{shoppingLocation?.address || 'Add a location'}</Text>
+              </View>
+              <Pressable onPress={() => setScreen('shoppingLocation')} style={styles.tinyAction}>
+                <Text style={styles.tinyActionText}>Change</Text>
+              </Pressable>
+            </View>
+            <Pressable onPress={() => setScreen('shoppingStores')} style={styles.orderHistoryButton}>
+              <Text style={[styles.orderHistoryText, { color: flowColors.shopping.accent }]}>Browse Nearby Stores</Text>
+            </Pressable>
+          </View>
           <View style={[styles.shopSearchCard, { borderColor: flowColors.shopping.tint }]}>
             <Text style={[styles.shopTitle, { color: flowColors.shopping.accent }]}>Search Items</Text>
             <View style={styles.dislikeInputRow}>
@@ -5591,7 +5822,7 @@ export default function App() {
             </Pressable>
             <ScrollView horizontal showsHorizontalScrollIndicator={false}>
               <View style={styles.storeFilterRow}>
-                {shoppingStoreOptions.map((store) => (
+                {storeFilters.map((store) => (
                   <Pressable
                     key={store}
                     onPress={() => setShoppingStoreFilter(store)}
@@ -5610,10 +5841,11 @@ export default function App() {
 
           {tabLoading === 'shopping' ? <LoadingState text="Loading shop..." rows={2} tone={flowColors.shopping} /> : null}
           {isShoppingLoading ? <LoadingState text="Searching groceries..." rows={3} tone={flowColors.shopping} /> : null}
-          {filteredResults.length > 0 ? (
-            <View style={[styles.listCard, { borderColor: flowColors.shopping.tint }]}>
-              <Text style={[styles.listTitle, { color: flowColors.shopping.accent }]}>Results</Text>
-              {filteredResults.map((item) => (
+          {groupedResults.map(([store, items]) => (
+            <View key={store} style={[styles.listCard, { borderColor: flowColors.shopping.tint }]}>
+              <Text style={[styles.listTitle, { color: flowColors.shopping.accent }]}>{store}</Text>
+              <Text style={styles.shopItemMeta}>{nearbyStores.find((item) => item.name === store)?.eta || fulfillmentMode}</Text>
+              {items.map((item) => (
                 <View key={item.id} style={styles.shopItemRow}>
                   <View style={styles.productThumb}>
                     <Text style={styles.productThumbText}>{item.name.slice(0, 1)}</Text>
@@ -5630,7 +5862,7 @@ export default function App() {
                 </View>
               ))}
             </View>
-          ) : null}
+          ))}
 
           {shoppingSuggestions.length > 0 ? (
             <View style={styles.listCard}>
@@ -5639,7 +5871,8 @@ export default function App() {
                 <View key={group.title} style={styles.suggestionGroup}>
                   <Text style={styles.filterLabel}>{group.title}</Text>
                   {group.products.map((product) => {
-                    const suggestedItem = localShoppingSearch(product.key).find((item) => item.name === product.name);
+                    const suggestedItem = localShoppingSearch(product.key).find((item) => item.name === product.name) ||
+                      localShoppingSearch(product.key)[0];
                     return (
                       <View key={`${group.title}-${product.name}`} style={styles.suggestionRow}>
                         <View style={styles.shopItemInfo}>
@@ -5660,30 +5893,38 @@ export default function App() {
           <View style={[styles.listCard, { borderColor: flowColors.shopping.tint }]}>
             <View style={styles.demoHeader}>
               <Text style={styles.listTitle}>Cart</Text>
-              <Text style={styles.demoMeta}>{shoppingCart.length} items</Text>
+              <Text style={styles.demoMeta}>{cartItemCount} items</Text>
             </View>
             {shoppingCart.length === 0 ? <EmptyState title="Your cart is empty" text="Search ingredients to get started." tone={flowColors.shopping} symbol="+" /> : null}
-            {shoppingCart.map((item) => (
-              <View key={item.id} style={styles.shopItemRow}>
-                <View style={styles.productThumb}>
-                  <Text style={styles.productThumbText}>{item.name.slice(0, 1)}</Text>
+            {cartGroups.map((group) => (
+              <View key={group.store} style={styles.cartStoreSection}>
+                <View style={styles.storeCardHeader}>
+                  <Text style={styles.filterLabel}>{group.store}</Text>
+                  <Text style={styles.shopItemMeta}>{formatMoney(group.totals.subtotal)}</Text>
                 </View>
-                <View style={styles.shopItemInfo}>
-                  <Text style={styles.shopItemName}>{item.name}</Text>
-                  <Text style={styles.shopItemMeta}>{[item.store || item.brand, item.price].filter(Boolean).join(' • ')}</Text>
-                </View>
-                <View style={styles.quantityControl}>
-                  <Pressable onPress={() => updateShoppingQuantity(item.id, -1)} style={styles.quantityButton}>
-                    <Text style={styles.quantityText}>-</Text>
-                  </Pressable>
-                  <Text style={styles.quantityValue}>{item.quantity || 1}</Text>
-                  <Pressable onPress={() => updateShoppingQuantity(item.id, 1)} style={styles.quantityButton}>
-                    <Text style={styles.quantityText}>+</Text>
-                  </Pressable>
-                </View>
-                <Pressable onPress={() => removeShoppingItem(item.id)} style={styles.tinyAction}>
-                  <Text style={styles.tinyActionText}>Remove</Text>
-                </Pressable>
+                {group.items.map((item) => (
+                  <View key={item.id} style={styles.shopItemRow}>
+                    <View style={styles.productThumb}>
+                      <Text style={styles.productThumbText}>{item.name.slice(0, 1)}</Text>
+                    </View>
+                    <View style={styles.shopItemInfo}>
+                      <Text style={styles.shopItemName}>{item.name}</Text>
+                      <Text style={styles.shopItemMeta}>{item.price}</Text>
+                    </View>
+                    <View style={styles.quantityControl}>
+                      <Pressable onPress={() => updateShoppingQuantity(item.id, -1)} style={styles.quantityButton}>
+                        <Text style={styles.quantityText}>-</Text>
+                      </Pressable>
+                      <Text style={styles.quantityValue}>{item.quantity || 1}</Text>
+                      <Pressable onPress={() => updateShoppingQuantity(item.id, 1)} style={styles.quantityButton}>
+                        <Text style={styles.quantityText}>+</Text>
+                      </Pressable>
+                    </View>
+                    <Pressable onPress={() => removeShoppingItem(item.id)} style={styles.tinyAction}>
+                      <Text style={styles.tinyActionText}>Remove</Text>
+                    </Pressable>
+                  </View>
+                ))}
               </View>
             ))}
             {shoppingCart.length > 0 ? (
@@ -5718,7 +5959,7 @@ export default function App() {
   }
 
   if (screen === 'shoppingCheckout') {
-    const deliveryEta = fulfillmentMode === 'Delivery' ? primaryStoreMeta.delivery : primaryStoreMeta.pickup;
+    const deliveryEta = primaryNearbyStore?.eta || (fulfillmentMode === 'Delivery' ? primaryStoreMeta.delivery : primaryStoreMeta.pickup);
     return (
       <Screen toast={toast}>
         <AppHeader eyebrow="Checkout" onBack={() => setScreen('shopping')} accent={flowColors.shopping.accent} />
@@ -5726,22 +5967,27 @@ export default function App() {
           <FlowProgress steps={['Cart', 'Checkout', 'Tracking']} current={1} tone={flowColors.shopping} />
           <View style={styles.listCard}>
             <Text style={styles.shopTitle}>Cart Summary</Text>
-            {shoppingCart.map((item) => (
-              <View key={item.id} style={styles.checkoutLine}>
-                <Text style={styles.checkoutLineText}>{`${item.quantity || 1}x ${item.name}`}</Text>
-                <Text style={styles.checkoutLineText}>{formatMoney(parsePrice(item.price) * (item.quantity || 1))}</Text>
+            {cartGroups.map((group) => (
+              <View key={group.store} style={styles.cartStoreSection}>
+                <Text style={styles.filterLabel}>{group.store}</Text>
+                {group.items.map((item) => (
+                  <View key={item.id} style={styles.checkoutLine}>
+                    <Text style={styles.checkoutLineText}>{`${item.quantity || 1}x ${item.name}`}</Text>
+                    <Text style={styles.checkoutLineText}>{formatMoney(parsePrice(item.price) * (item.quantity || 1))}</Text>
+                  </View>
+                ))}
               </View>
             ))}
           </View>
 
           <View style={styles.listCard}>
-            <Text style={styles.listTitle}>Store</Text>
-            <Text style={styles.shopItemMeta}>{primaryCartStore}</Text>
+            <Text style={styles.listTitle}>Fulfillment</Text>
+            <Text style={styles.shopItemMeta}>{cartGroups.map((group) => group.store).join(' • ')}</Text>
             <View style={styles.fulfillmentToggle}>
               {['Delivery', 'Pickup'].map((mode) => (
                 <Pressable
                   key={mode}
-                  onPress={() => setFulfillmentMode(mode)}
+                  onPress={() => updateShoppingFulfillment(mode)}
                   style={[
                     styles.fulfillmentOption,
                     fulfillmentMode === mode && styles.activeFulfillmentOption,
@@ -5755,7 +6001,7 @@ export default function App() {
             {fulfillmentMode === 'Delivery' ? (
               <View style={styles.checkoutField}>
                 <Text style={styles.totalLabel}>Delivery Address</Text>
-                <Text style={styles.checkoutPlaceholder}>Add home address</Text>
+                <Text style={styles.checkoutPlaceholder}>{shoppingLocation?.address || 'Add delivery location'}</Text>
               </View>
             ) : (
               <View style={styles.checkoutField}>
@@ -5766,6 +6012,22 @@ export default function App() {
             <View style={styles.checkoutField}>
               <Text style={styles.totalLabel}>{fulfillmentMode === 'Delivery' ? 'Delivery Time' : 'Pickup Time'}</Text>
               <Text style={styles.checkoutPlaceholder}>{deliveryEta}</Text>
+            </View>
+            <Text style={styles.filterLabel}>Time Window</Text>
+            <View style={styles.optionRow}>
+              {['Within 2 hours', 'This evening', 'Tomorrow morning'].map((window) => (
+                <Pressable
+                  key={window}
+                  onPress={() => setFulfillmentWindow(window)}
+                  style={[
+                    styles.storeChip,
+                    fulfillmentWindow === window && styles.activeStoreChip,
+                    fulfillmentWindow === window && { backgroundColor: flowColors.shopping.tint, borderColor: flowColors.shopping.accent }
+                  ]}
+                >
+                  <Text style={[styles.storeChipText, fulfillmentWindow === window && { color: flowColors.shopping.accent }]}>{window}</Text>
+                </Pressable>
+              ))}
             </View>
           </View>
 
@@ -5856,6 +6118,7 @@ export default function App() {
           <View style={styles.listCard}>
             <Text style={styles.listTitle}>{order.store}</Text>
             <Text style={styles.shopItemMeta}>{`${order.mode} • ${order.eta} • Order ${order.id}`}</Text>
+            {order.address ? <Text style={styles.shopItemMeta}>{`${order.mode} location • ${order.address}`}</Text> : null}
             <View style={styles.timelineWrap}>
               {steps.map((step, index) => (
                 <View key={step} style={styles.timelineRow}>
@@ -6399,6 +6662,17 @@ export default function App() {
           </View>
 
           <View style={styles.settingsCard}>
+            <Text style={styles.settingsTitle}>Shopping Connection</Text>
+            <Text style={styles.settingsSubtitle}>{shoppingConnectionStatus}</Text>
+            <Text style={styles.legalText}>
+              {shoppingLocation?.address ? `${fulfillmentMode} location: ${shoppingLocation.address}` : 'Add a location in Shop to browse store options.'}
+            </Text>
+            <Button variant="ghost" accent={flowColors.shopping.accent} onPress={() => setScreen('shoppingLocation')}>
+              {shoppingLocation?.address ? 'Update Shopping Location' : 'Add Shopping Location'}
+            </Button>
+          </View>
+
+          <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Notifications</Text>
             <Text style={styles.settingsSubtitle}>{notificationsEnabled ? 'Updates enabled' : 'Choose the updates you want to receive.'}</Text>
             {[
@@ -6571,7 +6845,7 @@ export default function App() {
             <Text style={styles.legalSectionTitle}>Recipe and Nutrition Data</Text>
             <Text style={styles.legalText}>Saved recipes, ingredient selections, and nutrition estimates support recommendations and your saved cooking activity.</Text>
             <Text style={styles.legalSectionTitle}>Shopping and Order Data</Text>
-            <Text style={styles.legalText}>Cart items and placed orders are saved to support checkout, order history, and tracking features.</Text>
+            <Text style={styles.legalText}>Your saved shopping location, cart items, and placed orders support store discovery, checkout, order history, and tracking. Your shopping location is shared with a connected shopping provider only when you use shopping features.</Text>
             <Text style={styles.legalSectionTitle}>Account Data</Text>
             <Text style={styles.legalText}>You may log out or delete your account and local app data at any time in Settings.</Text>
             <Text style={styles.legalSectionTitle}>Contact and Support</Text>
@@ -8999,6 +9273,53 @@ const styles = StyleSheet.create({
     marginBottom: 14,
     padding: 16
   },
+  locationInput: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 14,
+    borderWidth: 1,
+    color: palette.cream,
+    fontSize: 16,
+    fontWeight: '700',
+    minHeight: 52,
+    paddingHorizontal: 14,
+    paddingVertical: 14
+  },
+  locationSummaryCard: {
+    backgroundColor: palette.card,
+    borderColor: flowColors.shopping.tint,
+    borderRadius: 20,
+    borderWidth: 1,
+    marginBottom: 14,
+    padding: 16
+  },
+  nearbyStoreCard: {
+    backgroundColor: palette.card,
+    borderColor: flowColors.shopping.tint,
+    borderRadius: 20,
+    borderWidth: 1,
+    marginBottom: 12,
+    padding: 16
+  },
+  storeCardHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+    justifyContent: 'space-between'
+  },
+  storeStatus: {
+    backgroundColor: flowColors.shopping.tint,
+    borderRadius: 999,
+    color: flowColors.shopping.accent,
+    fontSize: 11,
+    fontWeight: '900',
+    overflow: 'hidden',
+    paddingHorizontal: 10,
+    paddingVertical: 5
+  },
+  storeStatusClosing: {
+    color: flowColors.fusion.accent
+  },
   shopTitle: {
     color: palette.cream,
     fontSize: 22,
@@ -9148,6 +9469,12 @@ const styles = StyleSheet.create({
     gap: 8,
     paddingHorizontal: 7,
     paddingVertical: 5
+  },
+  cartStoreSection: {
+    borderTopColor: palette.line,
+    borderTopWidth: 1,
+    marginTop: 10,
+    paddingTop: 4
   },
   quantityButton: {
     alignItems: 'center',
