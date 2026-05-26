@@ -18,6 +18,7 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.foodfusion.ai",
+      "buildNumber": "1",
       "infoPlist": {
         "NSCameraUsageDescription": "FoodFusion AI uses fridge and pantry photos to suggest meals.",
         "NSLocalNetworkUsageDescription": "FoodFusion AI connects to your nearby analysis service while testing photo scans."

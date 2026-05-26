@@ -62,12 +62,22 @@ npm run scan:test
 
 If the bridge is not running or `OPENAI_API_KEY` is not configured on the bridge, FoodFusion reports the scan error and lets the user retry or enter ingredients manually without crashing. It does not substitute local detections for a failed live scan.
 
+## Hosted Scan Readiness
+
+For TestFlight or production, replace the local bridge URL with a hosted HTTPS endpoint:
+
+```text
+EXPO_PUBLIC_FOOD_SCAN_ENDPOINT=https://api.your-domain.com/scan-food
+```
+
+The mobile app sends the signed-in user's Supabase bearer session to a hosted endpoint. The hosted backend must verify that session before processing `POST /scan-food`, then make the OpenAI request server-side. `OPENAI_API_KEY` must never be stored in Expo configuration or bundled application code.
+
 ## Key Security
 
 - `OPENAI_API_KEY` is server-only. Never add it to `App.js`, an `EXPO_PUBLIC_` value, or a committed environment file.
 - `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY` is intended for mobile clients. Protect user data with Row Level Security policies on every app table.
 - Never put a Supabase secret key or `service_role` key in the mobile app.
-- `EXPO_PUBLIC_FOOD_SCAN_ACCESS_TOKEN` is only a short-lived local demo access token; it is visible in a development app bundle. Production scans should authorize users on a hosted backend with their authenticated session.
+- `EXPO_PUBLIC_FOOD_SCAN_ACCESS_TOKEN` is only a short-lived local development access token; it is visible in a development app bundle. Production scans should authorize users on a hosted backend with their authenticated session.
 - Run `npm run security:check` before a release build or repository upload.
 
 ## Optional Instacart MCP Shopping
@@ -106,6 +116,28 @@ Search results can include:
 ```
 
 Checkout can return `{ orderId, eta }`, and tracking can return `{ status, statusIndex, eta, timeRemaining }`. If not available, FoodFusion uses local order tracking and persists orders on device.
+
+## Supabase Data Sync
+
+For signed-in Supabase accounts, AsyncStorage is an offline cache and Supabase is the durable account store. The app synchronizes:
+
+- preferences and shopping location through `user_preferences`
+- structured scan history through `scans`, `scan_ingredients`, and `recipes`
+- favorites and opened saved recipes through `recipes` and `user_recipes`
+- shopping carts through `shopping_carts` and `shopping_cart_items`
+- orders through `orders` and `order_items`
+- Fusion+ status through `subscriptions`
+
+No scan photos or payment card details are stored in Supabase. Apply migrations `004_offline_sync_foundation.sql`, `005_primary_equipment_preference.sql`, and `006_client_subscription_sync.sql` before testing account synchronization.
+
+## Production Configuration Checklist
+
+- Development scan endpoint points to the private local bridge only during device testing.
+- Production scan endpoint is hosted over HTTPS and verifies the Supabase user session.
+- Supabase URL and publishable client key are configured; no secret or service-role key is bundled.
+- `OPENAI_API_KEY` and any retailer provider credentials exist only on hosted backend services.
+- `app.json` version and iOS build number are updated for each TestFlight build.
+- Tap the build label five times in Settings to unlock Developer Mode, then complete `QA Checklist` on a physical iPhone.
 
 ## Local Recipe MCP Server
 

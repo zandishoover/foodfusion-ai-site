@@ -15,6 +15,13 @@ const usesSetupPlaceholder =
 
 export const supabaseConfigured = Boolean(supabaseUrl && supabaseKey && !usesSetupPlaceholder);
 
+// GoTrue's auto-refresh tick probes the auth lock with a zero timeout.
+// In one React Native JS process, queue that probe behind in-flight auth work
+// instead of logging a harmless timeout while AsyncStorage is being read.
+function reactNativeAuthLock(name, acquireTimeout, operation) {
+  return processLock(name, acquireTimeout === 0 ? -1 : acquireTimeout, operation);
+}
+
 export const supabase = supabaseConfigured
   ? createClient(supabaseUrl, supabaseKey, {
       auth: {
@@ -22,10 +29,13 @@ export const supabase = supabaseConfigured
         autoRefreshToken: true,
         persistSession: true,
         detectSessionInUrl: false,
-        lock: processLock
+        lock: reactNativeAuthLock,
+        lockAcquireTimeout: 10000
       }
     })
   : null;
+
+let sessionRequest = null;
 
 function profileFromUser(user) {
   if (!user) {
@@ -39,15 +49,33 @@ function profileFromUser(user) {
   };
 }
 
-export async function getSupabaseSessionProfile() {
+async function getSupabaseSession() {
   if (!supabase) {
     return null;
   }
-  const { data, error } = await supabase.auth.getSession();
-  if (error) {
-    throw error;
+  if (!sessionRequest) {
+    sessionRequest = supabase.auth.getSession()
+      .then(({ data, error }) => {
+        if (error) {
+          throw error;
+        }
+        return data.session || null;
+      })
+      .finally(() => {
+        sessionRequest = null;
+      });
   }
-  return profileFromUser(data.session?.user);
+  return sessionRequest;
+}
+
+export async function getSupabaseSessionProfile() {
+  const session = await getSupabaseSession();
+  return profileFromUser(session?.user);
+}
+
+export async function getSupabaseAccessToken() {
+  const session = await getSupabaseSession();
+  return session?.access_token || null;
 }
 
 export async function signInWithSupabase(email, password) {
