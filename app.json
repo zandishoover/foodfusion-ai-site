@@ -7,11 +7,6 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
-    "splash": {
-      "image": "./assets/splash.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#090D12"
-    },
     "assetBundlePatterns": [
       "**/*"
     ],
@@ -36,6 +31,15 @@
         "expo-image-picker",
         {
           "cameraPermission": "FoodFusion AI uses fridge and pantry photos to suggest meals."
+        }
+      ],
+      "expo-status-bar",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#090D12"
         }
       ]
     ],

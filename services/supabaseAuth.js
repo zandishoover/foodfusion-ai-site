@@ -1,7 +1,9 @@
 import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import 'react-native-url-polyfill/auto';
-import { createClient, processLock } from '@supabase/supabase-js';
+// Use Supabase's CJS artifact on Hermes; its ESM artifact contains an optional
+// dynamic telemetry import that Hermes cannot compile in production bundles.
+import { createClient, processLock } from '@supabase/supabase-js/dist/index.cjs';
 
 const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL;
 const supabaseKey =
