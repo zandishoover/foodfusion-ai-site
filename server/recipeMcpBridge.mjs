@@ -10,11 +10,12 @@ const __dirname = dirname(__filename);
 const rootDir = dirname(__dirname);
 const tsxBin = join(rootDir, 'node_modules', '.bin', 'tsx');
 const recipeMcpServer = join(rootDir, 'node_modules', '@cookwith', 'recipe-mcp', 'mcp-server.ts');
-const port = Number(process.env.RECIPE_MCP_BRIDGE_PORT || 3333);
-const host = process.env.FOODFUSION_BRIDGE_HOST || '127.0.0.1';
+const port = Number(process.env.PORT || process.env.RECIPE_MCP_BRIDGE_PORT || 3333);
+const host = process.env.FOODFUSION_BRIDGE_HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
 const openAiModel = process.env.OPENAI_VISION_MODEL || 'gpt-4.1-mini';
 const scanAccessToken = process.env.FOODFUSION_SCAN_ACCESS_TOKEN?.trim();
 const isNetworkExposed = !['127.0.0.1', 'localhost', '::1'].includes(host);
+const maxJsonBodyBytes = Number(process.env.FOODFUSION_MAX_JSON_BODY_BYTES || 8 * 1024 * 1024);
 
 if (process.env.EXPO_PUBLIC_OPENAI_API_KEY) {
   throw new Error('Remove EXPO_PUBLIC_OPENAI_API_KEY. OpenAI credentials must never be exposed to the mobile app.');
@@ -308,6 +309,16 @@ async function ensureClient() {
   return clientPromise;
 }
 
+async function getRecipeMcpHealth() {
+  try {
+    await ensureClient();
+    return { connected: true, tools: cachedTools.map((tool) => tool.name) };
+  } catch (error) {
+    console.warn('[recipe-bridge] Recipe MCP unavailable:', error instanceof Error ? error.message : error);
+    return { connected: false, tools: [] };
+  }
+}
+
 async function callRecipeTool(name, args) {
   const client = await ensureClient();
   const result = await client.callTool({ name, arguments: args });
@@ -343,6 +354,11 @@ async function readBody(request) {
   return new Promise((resolve, reject) => {
     let body = '';
     request.on('data', (chunk) => {
+      if (Buffer.byteLength(body) + chunk.length > maxJsonBodyBytes) {
+        reject(new Error('Request body is too large.'));
+        request.destroy();
+        return;
+      }
       body += chunk;
     });
     request.on('end', () => {
@@ -358,11 +374,16 @@ async function readBody(request) {
 
 function send(response, statusCode, payload) {
   response.writeHead(statusCode, {
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-FoodFusion-Scan-Token',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Origin': '*',
+    'Access-Control-Max-Age': '86400',
     'Content-Type': 'application/json'
   });
+  if (statusCode === 204) {
+    response.end();
+    return;
+  }
   response.end(JSON.stringify(payload));
 }
 
@@ -429,16 +450,16 @@ const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://localhost:${port}`);
 
     if (request.method === 'GET' && url.pathname === '/health') {
-      if (!hasValidBridgeToken(request)) {
-        send(response, 401, { error: 'Bridge authorization failed.' });
-        return;
-      }
-      await ensureClient();
+      const recipeMcp = await getRecipeMcpHealth();
       send(response, 200, {
         connected: true,
         name: 'recipe-mcp',
         bridge: 'foodfusion-recipe-bridge',
-        tools: cachedTools.map((tool) => tool.name)
+        scan: {
+          openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
+          authorization: scanAccessToken ? 'token-required' : 'local-only'
+        },
+        recipeMcp
       });
       return;
     }

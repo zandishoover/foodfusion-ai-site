@@ -12,9 +12,11 @@
     "security:check": "node scripts/checkClientSecrets.mjs",
     "recipe:mcp": "recipe-mcp",
     "recipe:bridge": "node server/recipeMcpBridge.mjs",
-    "recipe:bridge:device": "FOODFUSION_BRIDGE_HOST=0.0.0.0 node server/recipeMcpBridge.mjs"
+    "recipe:bridge:device": "FOODFUSION_BRIDGE_HOST=0.0.0.0 node server/recipeMcpBridge.mjs",
+    "start:api": "node server/recipeMcpBridge.mjs"
   },
   "dependencies": {
+    "@cookwith/recipe-mcp": "^1.0.4",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@supabase/supabase-js": "^2.106.1",
     "babel-preset-expo": "~56.0.0",
@@ -32,8 +34,7 @@
     "react-native-url-polyfill": "^3.0.0"
   },
   "devDependencies": {
-    "@babel/core": "^7.24.0",
-    "@cookwith/recipe-mcp": "^1.0.4"
+    "@babel/core": "^7.24.0"
   },
   "expo": {
     "doctor": {

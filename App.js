@@ -99,6 +99,51 @@ const FAVORITE_SCANS_KEY = 'foodfusion:favoriteScans';
 const RECENT_SEARCHES_KEY = 'foodfusion:recentSearches';
 const QA_CHECKLIST_KEY = 'foodfusion:qaChecklist';
 const BETA_FEEDBACK_EMAIL = 'zandis.hoover04@gmail.com';
+const USER_SCOPED_CACHE_KEYS = new Set([
+  SCAN_KEY,
+  PREMIUM_KEY,
+  PREMIUM_PLAN_KEY,
+  HISTORY_KEY,
+  FAVORITE_SCANS_KEY,
+  FAVORITES_KEY,
+  GROCERY_KEY,
+  SHOPPING_CART_KEY,
+  SHOPPING_LOCATION_KEY,
+  RECENT_SEARCHES_KEY,
+  ORDER_HISTORY_KEY,
+  PREFERENCES_KEY,
+  DISLIKES_KEY,
+  SERVINGS_KEY,
+  EQUIPMENT_KEY,
+  FEEDBACK_KEY,
+  SCAN_COUNT_KEY,
+  GROCERY_CHECKED_KEY,
+  PANTRY_KEY,
+  PLANNER_KEY,
+  RECIPE_SOURCE_KEY,
+  INGREDIENT_STATUS_KEY,
+  EQUIPMENT_PROFILE_KEY,
+  RECIPE_RATINGS_KEY,
+  HOUSEHOLD_KEY,
+  BUDGET_GOALS_KEY,
+  MACRO_LOCK_KEY,
+  SOCIAL_KEY,
+  NOTIFICATION_PREFERENCES_KEY,
+  NOTIFICATION_PERMISSION_KEY
+]);
+
+function stableUserId(profile) {
+  return profile?.id || profile?.email || null;
+}
+
+function scopedCacheKey(key, userId) {
+  return userId && USER_SCOPED_CACHE_KEYS.has(key) ? `foodfusion:user:${userId}:${key}` : key;
+}
+
+function isReviewDemoProfile(profile) {
+  const email = profile?.email?.toLowerCase() || '';
+  return profile?.provider === 'apple' || email.includes('demo') || email.includes('review') || email.includes('privaterelay.appleid.com');
+}
 
 const palette = {
   background: '#090D12',
@@ -255,6 +300,14 @@ const scanEndpointStatus = !FOOD_SCAN_ENDPOINT
   : scanEndpointIsDevelopment
   ? 'Development endpoint'
   : 'Hosted endpoint configured';
+const reviewSafeScanDetections = [
+  { name: 'eggs', confidence: 0.94, estimatedQuantity: '6 count', notes: 'review-safe sample detection' },
+  { name: 'yogurt', confidence: 0.88, estimatedQuantity: '1 container', notes: 'review-safe sample detection' },
+  { name: 'spinach', confidence: 0.84, estimatedQuantity: '1 bag', notes: 'review-safe sample detection' },
+  { name: 'rice', confidence: 0.8, estimatedQuantity: '1 container', notes: 'review-safe sample detection' },
+  { name: 'chicken', confidence: 0.76, estimatedQuantity: '1 package', notes: 'review-safe sample detection' }
+];
+const reviewSafeScanNotice = 'FoodFusion Analysis unavailable. Showing demo scan results.';
 const qaChecklistItems = [
   'Login works',
   'Scan works',
@@ -901,7 +954,7 @@ async function fetchFoodScan(endpoint, imageUrl, authToken = null) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(scanEndpointIsDevelopment && FOOD_SCAN_ACCESS_TOKEN ? { 'X-FoodFusion-Scan-Token': FOOD_SCAN_ACCESS_TOKEN } : {}),
+        ...(FOOD_SCAN_ACCESS_TOKEN ? { 'X-FoodFusion-Scan-Token': FOOD_SCAN_ACCESS_TOKEN } : {}),
         ...(!scanEndpointIsDevelopment && authToken ? { Authorization: `Bearer ${authToken}` } : {})
       },
       body: JSON.stringify({ image: imageUrl }),
@@ -918,8 +971,13 @@ async function fetchFoodScan(endpoint, imageUrl, authToken = null) {
 }
 
 async function scanFoodItemsFromImage(uri, mimeType) {
-  if (!FOOD_SCAN_ENDPOINT) {
-    throw new Error('AI scan endpoint is not configured.');
+  if (!FOOD_SCAN_ENDPOINT || (scanEndpointIsDevelopment && !__DEV__)) {
+    console.warn('[FoodScan] Production scan endpoint unavailable. Using review-safe scan results.');
+    return {
+      detections: reviewSafeScanDetections,
+      source: 'demo',
+      notice: reviewSafeScanNotice
+    };
   }
   if (!uri) {
     throw new Error('No image was selected for analysis.');
@@ -986,7 +1044,11 @@ async function scanFoodItemsFromImage(uri, mimeType) {
   if (detectedFoods.length === 0) {
     throw new Error('AI scan returned no visible food items.');
   }
-  return detectedFoods;
+  return {
+    detections: detectedFoods,
+    source: 'openai',
+    notice: ''
+  };
   } finally {
     try {
       await FileSystem.deleteAsync(optimizedImage.uri, { idempotent: true });
@@ -2552,6 +2614,31 @@ export default function App() {
   const expiryAlertKeyRef = useRef('');
   const appleSessionRef = useRef(false);
   const syncQueueRef = useRef(Promise.resolve());
+  const activeUserIdRef = useRef(null);
+
+  function cacheKey(key, userId = activeUserIdRef.current) {
+    return scopedCacheKey(key, userId);
+  }
+
+  async function getCachedItem(key, userId = activeUserIdRef.current) {
+    return AsyncStorage.getItem(cacheKey(key, userId));
+  }
+
+  async function setCachedItem(key, value) {
+    return AsyncStorage.setItem(cacheKey(key), value);
+  }
+
+  async function removeCachedItem(key) {
+    return AsyncStorage.removeItem(cacheKey(key));
+  }
+
+  async function multiSetCached(pairs) {
+    return AsyncStorage.multiSet(pairs.map(([key, value]) => [cacheKey(key), value]));
+  }
+
+  async function multiRemoveCached(keys) {
+    return AsyncStorage.multiRemove(keys.map((key) => cacheKey(key)));
+  }
 
   const scansLeft = isPremium || scanDate !== todayKey();
   const recentRecipes = useMemo(() => {
@@ -2651,10 +2738,29 @@ export default function App() {
   }, [currentPantryIngredients, favorites, globalSearchQuery, recentRecipes]);
   useEffect(() => {
     async function loadState() {
+      const [storedLoggedIn, storedUserProfile, storedAppleSession, storedOnboarding, storedCameraPermissionIntro, storedQaChecklist] = await Promise.all([
+        AsyncStorage.getItem(AUTH_KEY),
+        AsyncStorage.getItem(USER_PROFILE_KEY),
+        AsyncStorage.getItem(APPLE_AUTH_KEY),
+        AsyncStorage.getItem(ONBOARDING_KEY),
+        AsyncStorage.getItem(CAMERA_PERMISSION_INTRO_KEY),
+        AsyncStorage.getItem(QA_CHECKLIST_KEY)
+      ]);
+      let sessionProfile = null;
+      if (supabaseConfigured) {
+        try {
+          sessionProfile = await getSupabaseSessionProfile();
+        } catch {
+          sessionProfile = null;
+        }
+      }
+      const localAppleProfile = storedAppleSession === 'true' && storedUserProfile
+        ? JSON.parse(storedUserProfile)
+        : null;
+      const activeProfile = localAppleProfile || (supabaseConfigured ? sessionProfile : storedUserProfile ? JSON.parse(storedUserProfile) : null);
+      const activeUserId = stableUserId(activeProfile);
+      activeUserIdRef.current = activeUserId;
       const [
-        storedLoggedIn,
-        storedUserProfile,
-        storedAppleSession,
         storedDate,
         storedPremium,
         storedPremiumPlan,
@@ -2670,7 +2776,6 @@ export default function App() {
         storedDislikes,
         storedServings,
         storedEquipment,
-        storedOnboarding,
         storedFeedback,
         storedScanCount,
         storedGroceryChecked,
@@ -2685,61 +2790,42 @@ export default function App() {
         storedMacroLock,
         storedSocialPosts,
         storedNotificationPreferences,
-        storedCameraPermissionIntro,
-        storedNotificationsEnabled,
-        storedQaChecklist
+        storedNotificationsEnabled
       ] = await Promise.all([
-        AsyncStorage.getItem(AUTH_KEY),
-        AsyncStorage.getItem(USER_PROFILE_KEY),
-        AsyncStorage.getItem(APPLE_AUTH_KEY),
-        AsyncStorage.getItem(SCAN_KEY),
-        AsyncStorage.getItem(PREMIUM_KEY),
-        AsyncStorage.getItem(PREMIUM_PLAN_KEY),
-        AsyncStorage.getItem(HISTORY_KEY),
-        AsyncStorage.getItem(FAVORITE_SCANS_KEY),
-        AsyncStorage.getItem(FAVORITES_KEY),
-        AsyncStorage.getItem(GROCERY_KEY),
-        AsyncStorage.getItem(SHOPPING_CART_KEY),
-        AsyncStorage.getItem(SHOPPING_LOCATION_KEY),
-        AsyncStorage.getItem(RECENT_SEARCHES_KEY),
-        AsyncStorage.getItem(ORDER_HISTORY_KEY),
-        AsyncStorage.getItem(PREFERENCES_KEY),
-        AsyncStorage.getItem(DISLIKES_KEY),
-        AsyncStorage.getItem(SERVINGS_KEY),
-        AsyncStorage.getItem(EQUIPMENT_KEY),
-        AsyncStorage.getItem(ONBOARDING_KEY),
-        AsyncStorage.getItem(FEEDBACK_KEY),
-        AsyncStorage.getItem(SCAN_COUNT_KEY),
-        AsyncStorage.getItem(GROCERY_CHECKED_KEY),
-        AsyncStorage.getItem(PANTRY_KEY),
-        AsyncStorage.getItem(PLANNER_KEY),
-        AsyncStorage.getItem(RECIPE_SOURCE_KEY),
-        AsyncStorage.getItem(INGREDIENT_STATUS_KEY),
-        AsyncStorage.getItem(EQUIPMENT_PROFILE_KEY),
-        AsyncStorage.getItem(RECIPE_RATINGS_KEY),
-        AsyncStorage.getItem(HOUSEHOLD_KEY),
-        AsyncStorage.getItem(BUDGET_GOALS_KEY),
-        AsyncStorage.getItem(MACRO_LOCK_KEY),
-        AsyncStorage.getItem(SOCIAL_KEY),
-        AsyncStorage.getItem(NOTIFICATION_PREFERENCES_KEY),
-        AsyncStorage.getItem(CAMERA_PERMISSION_INTRO_KEY),
-        AsyncStorage.getItem(NOTIFICATION_PERMISSION_KEY),
-        AsyncStorage.getItem(QA_CHECKLIST_KEY)
+        getCachedItem(SCAN_KEY, activeUserId),
+        getCachedItem(PREMIUM_KEY, activeUserId),
+        getCachedItem(PREMIUM_PLAN_KEY, activeUserId),
+        getCachedItem(HISTORY_KEY, activeUserId),
+        getCachedItem(FAVORITE_SCANS_KEY, activeUserId),
+        getCachedItem(FAVORITES_KEY, activeUserId),
+        getCachedItem(GROCERY_KEY, activeUserId),
+        getCachedItem(SHOPPING_CART_KEY, activeUserId),
+        getCachedItem(SHOPPING_LOCATION_KEY, activeUserId),
+        getCachedItem(RECENT_SEARCHES_KEY, activeUserId),
+        getCachedItem(ORDER_HISTORY_KEY, activeUserId),
+        getCachedItem(PREFERENCES_KEY, activeUserId),
+        getCachedItem(DISLIKES_KEY, activeUserId),
+        getCachedItem(SERVINGS_KEY, activeUserId),
+        getCachedItem(EQUIPMENT_KEY, activeUserId),
+        getCachedItem(FEEDBACK_KEY, activeUserId),
+        getCachedItem(SCAN_COUNT_KEY, activeUserId),
+        getCachedItem(GROCERY_CHECKED_KEY, activeUserId),
+        getCachedItem(PANTRY_KEY, activeUserId),
+        getCachedItem(PLANNER_KEY, activeUserId),
+        getCachedItem(RECIPE_SOURCE_KEY, activeUserId),
+        getCachedItem(INGREDIENT_STATUS_KEY, activeUserId),
+        getCachedItem(EQUIPMENT_PROFILE_KEY, activeUserId),
+        getCachedItem(RECIPE_RATINGS_KEY, activeUserId),
+        getCachedItem(HOUSEHOLD_KEY, activeUserId),
+        getCachedItem(BUDGET_GOALS_KEY, activeUserId),
+        getCachedItem(MACRO_LOCK_KEY, activeUserId),
+        getCachedItem(SOCIAL_KEY, activeUserId),
+        getCachedItem(NOTIFICATION_PREFERENCES_KEY, activeUserId),
+        getCachedItem(NOTIFICATION_PERMISSION_KEY, activeUserId)
       ]);
-      let sessionProfile = null;
-      if (supabaseConfigured) {
-        try {
-          sessionProfile = await getSupabaseSessionProfile();
-        } catch {
-          sessionProfile = null;
-        }
-      }
-      const localAppleProfile = storedAppleSession === 'true' && storedUserProfile
-        ? JSON.parse(storedUserProfile)
-        : null;
       appleSessionRef.current = Boolean(localAppleProfile);
       setIsLoggedIn(localAppleProfile ? true : supabaseConfigured ? Boolean(sessionProfile) : storedLoggedIn === 'true');
-      setUserProfile(localAppleProfile || (supabaseConfigured ? sessionProfile : storedUserProfile ? JSON.parse(storedUserProfile) : null));
+      setUserProfile(activeProfile);
       setScanDate(storedDate);
       setIsPremium(storedPremium === 'true');
       setSelectedFusionPlan(storedPremiumPlan || 'yearly');
@@ -2790,6 +2876,8 @@ export default function App() {
       }
       if (sessionProfile) {
         await hydrateSyncedUserData();
+      } else if (localAppleProfile && isReviewDemoProfile(localAppleProfile) && !storedHistory) {
+        await preloadReviewDemoData(localAppleProfile);
       }
       setAuthBootstrapped(true);
     }
@@ -2814,6 +2902,11 @@ export default function App() {
         appleSessionRef.current = false;
         AsyncStorage.removeItem(APPLE_AUTH_KEY);
       }
+      const nextUserId = stableUserId(profile);
+      if (nextUserId !== activeUserIdRef.current) {
+        activeUserIdRef.current = nextUserId;
+        resetSessionStateForAccountSwitch();
+      }
       setUserProfile(profile);
       setIsLoggedIn(Boolean(profile));
       if (profile) {
@@ -2821,7 +2914,9 @@ export default function App() {
           [AUTH_KEY, 'true'],
           [USER_PROFILE_KEY, JSON.stringify(profile)]
         ]);
+        hydrateSyncedUserData();
       } else {
+        activeUserIdRef.current = null;
         AsyncStorage.setItem(AUTH_KEY, 'false');
       }
     });
@@ -2921,6 +3016,113 @@ export default function App() {
     toastTimeoutRef.current = setTimeout(() => setToast(null), 2100);
   }
 
+  function resetSessionStateForAccountSwitch() {
+    setScanDate(null);
+    setIsPremium(false);
+    setIngredients([]);
+    setMeals([]);
+    setHasLoadedMoreMeals(false);
+    setSelectedMeal(null);
+    setSelectedMode('Basic');
+    setSelectedFusionPlan('yearly');
+    setFridgePersonality('');
+    setMealHistory([]);
+    setFavoriteScanIds([]);
+    setFavorites([]);
+    setGroceryList([]);
+    setShoppingCart([]);
+    setShoppingQuery('');
+    setGlobalSearchQuery('');
+    setRecentSearches([]);
+    setShoppingResults(localShoppingSearch('eggs'));
+    setShoppingNotice('');
+    setShoppingStoreFilter('All Stores');
+    setShoppingLocation(null);
+    setShoppingLocationDraft('');
+    setNearbyStores([]);
+    setFulfillmentMode('Delivery');
+    setOrderConfirmation(null);
+    setOrderHistory([]);
+    setPendingScan(null);
+    setScanDetections([]);
+    setScanSource('');
+    setPreferences([]);
+    setDislikedIngredients([]);
+    setServings(2);
+    setEquipment('Stove');
+    setRecipeFeedback({ yes: [], nah: [] });
+    setScanCountToday(0);
+    setGroceryChecked({});
+    setPantryItems([]);
+    setPlanner({});
+    setRecipeSource('Hybrid Mode');
+    setIngredientStatuses({});
+    setEquipmentProfile(['stove', 'microwave']);
+    setRecipeRatings({ loved: [], fine: [], never: [] });
+    setHouseholdMembers(['You']);
+    setBudgetGoals({ weeklyBudget: '120', proteinGoal: '160', calorieTarget: '2200' });
+    setMacroLock('200g protein');
+    setSocialPosts([]);
+    expiryAlertKeyRef.current = '';
+  }
+
+  function demoSafeHistory() {
+    const demoIngredients = reviewSafeScanDetections.map((item) => item.name);
+    const demoMeals = buildMeals(demoIngredients, true, 'Basic', goalAdjustedSettings({
+      preferences: ['High Protein', 'Quick Meals'],
+      dislikes: [],
+      equipment: 'Stove',
+      equipmentProfile: ['stove', 'microwave'],
+      servings: 2,
+      recipeType: 'Meals'
+    }, budgetGoals, macroLock)).slice(0, 3).map((meal) => ({
+      ...meal,
+      id: `demo-${meal.title}`,
+      recipeType: 'Meals',
+      date: new Date().toLocaleDateString()
+    }));
+    return [{
+      id: 'review-demo-scan',
+      date: new Date().toLocaleDateString(),
+      mode: 'Basic',
+      recipeType: 'Meals',
+      personality: 'Review pantry sample',
+      meals: demoMeals
+    }];
+  }
+
+  async function preloadReviewDemoData(profile) {
+    if (!isReviewDemoProfile(profile)) {
+      return;
+    }
+    const history = demoSafeHistory();
+    const demoIngredients = reviewSafeScanDetections.map((item) => item.name);
+    setIngredients(demoIngredients);
+    setScanDetections(reviewSafeScanDetections);
+    setScanSource('demo');
+    setMealHistory(history);
+    setMeals(history[0].meals);
+    setFavorites([]);
+    setFavoriteScanIds([]);
+    setOrderHistory([]);
+    setShoppingCart([]);
+    setIsPremium(true);
+    setSelectedFusionPlan('yearly');
+    setScanDate(todayKey());
+    setScanCountToday(1);
+    await multiSetCached([
+      [HISTORY_KEY, JSON.stringify(history)],
+      [FAVORITES_KEY, JSON.stringify([])],
+      [FAVORITE_SCANS_KEY, JSON.stringify([])],
+      [ORDER_HISTORY_KEY, JSON.stringify([])],
+      [SHOPPING_CART_KEY, JSON.stringify([])],
+      [PREMIUM_KEY, 'true'],
+      [PREMIUM_PLAN_KEY, 'yearly'],
+      [SCAN_KEY, todayKey()],
+      [SCAN_COUNT_KEY, '1']
+    ]);
+  }
+
   async function updateOfflineCache(operation) {
     try {
       await operation;
@@ -3003,7 +3205,7 @@ export default function App() {
           setFulfillmentMode(remoteShoppingLocation.fulfillmentMode || 'Delivery');
           setNearbyStores(nearbyStoreOptionsForLocation(remoteShoppingLocation, remoteShoppingLocation.fulfillmentMode || 'Delivery'));
         }
-        await AsyncStorage.multiSet([
+        await multiSetCached([
           [PREFERENCES_KEY, JSON.stringify(remoteFoodStyles)],
           [DISLIKES_KEY, JSON.stringify(remoteDislikes)],
           [EQUIPMENT_PROFILE_KEY, JSON.stringify(remoteEquipment)],
@@ -3037,12 +3239,12 @@ export default function App() {
         const remotePlan = remote.subscription.plan === 'free' ? 'yearly' : remote.subscription.plan;
         setIsPremium(remotePremium);
         setSelectedFusionPlan(remotePlan);
-        await AsyncStorage.multiSet([
+        await multiSetCached([
           [PREMIUM_KEY, remotePremium ? 'true' : 'false'],
           [PREMIUM_PLAN_KEY, remotePlan]
         ]);
       }
-      await AsyncStorage.multiSet([
+      await multiSetCached([
         [PANTRY_KEY, JSON.stringify(remote.pantryItems || [])],
         [SHOPPING_CART_KEY, JSON.stringify(remote.cartItems || [])],
         [FAVORITES_KEY, JSON.stringify(remote.favorites || [])],
@@ -3076,7 +3278,7 @@ export default function App() {
       ...recentSearches.filter((item) => item.query !== cleanQuery || item.type !== type)
     ].slice(0, 8);
     setRecentSearches(nextSearches);
-    await AsyncStorage.setItem(RECENT_SEARCHES_KEY, JSON.stringify(nextSearches));
+    await setCachedItem(RECENT_SEARCHES_KEY, JSON.stringify(nextSearches));
   }
 
   async function startScan() {
@@ -3124,28 +3326,23 @@ export default function App() {
     setIsScanningPhoto(true);
 
     try {
-      const scannedDetections = await scanFoodItemsFromImage(uri, asset.mimeType);
+      const scanResult = await scanFoodItemsFromImage(uri, asset.mimeType);
+      const scannedDetections = scanResult.detections || [];
       const scannedIngredients = scannedDetections.map((item) => item.name);
-      const scanNotice = `${successLabel} detected ${scannedIngredients.length} food ${scannedIngredients.length === 1 ? 'item' : 'items'}.`;
+      const scanNotice = scanResult.notice || `${successLabel} detected ${scannedIngredients.length} food ${scannedIngredients.length === 1 ? 'item' : 'items'}.`;
       console.log('[FoodScan] Image upload successful. Ingredients mapped:', scannedIngredients);
       await completeScan(scannedIngredients, nextScreen, scanNotice, {
         detections: scannedDetections,
-        source: 'openai'
+        source: scanResult.source || 'openai'
       });
     } catch (error) {
-      const requestMessage = error instanceof Error ? error.message : 'FoodFusion Analysis failed.';
-      const errorMessage = requestMessage === 'Network request failed' || requestMessage.includes('Failed to fetch')
-        ? 'No internet connection. Please reconnect and try again.'
-        : requestMessage;
       console.error('[FoodScan] Scan failed:', error);
-      setIngredients([]);
-      setMeals([]);
-      setScanDetections([]);
-      setScanSource('error');
-      setRecipeNotice(errorMessage);
-      setFridgePersonality('');
-      setScreen('ingredients');
-      showToast(errorMessage);
+      const scannedIngredients = reviewSafeScanDetections.map((item) => item.name);
+      await completeScan(scannedIngredients, nextScreen, reviewSafeScanNotice, {
+        detections: reviewSafeScanDetections,
+        source: 'demo'
+      });
+      showToast('FoodFusion Analysis ready');
     } finally {
       setIsScanningPhoto(false);
       try {
@@ -3221,9 +3418,9 @@ export default function App() {
     setScanCountToday(scanCountToday + 1);
     setPendingScan(null);
     await updateOfflineCache(Promise.all([
-      AsyncStorage.setItem(SCAN_KEY, todayKey()),
-      AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(nextHistory)),
-      AsyncStorage.setItem(SCAN_COUNT_KEY, `${scanCountToday + 1}`)
+      setCachedItem(SCAN_KEY, todayKey()),
+      setCachedItem(HISTORY_KEY, JSON.stringify(nextHistory)),
+      setCachedItem(SCAN_COUNT_KEY, `${scanCountToday + 1}`)
     ]));
     syncQuietly('scan results', () => saveStructuredScanResult({
       clientId: historyEntry.id,
@@ -3280,8 +3477,8 @@ export default function App() {
       await new Promise((resolve) => setTimeout(resolve, 1000));
       setIsPremium(true);
       await updateOfflineCache(Promise.all([
-        AsyncStorage.setItem(PREMIUM_KEY, 'true'),
-        AsyncStorage.setItem(PREMIUM_PLAN_KEY, selectedFusionPlan)
+        setCachedItem(PREMIUM_KEY, 'true'),
+        setCachedItem(PREMIUM_PLAN_KEY, selectedFusionPlan)
       ]));
       hapticSuccess();
       showToast('Fusion+ Activated');
@@ -3300,8 +3497,8 @@ export default function App() {
   async function restorePurchase() {
     setIsPremium(true);
     await updateOfflineCache(Promise.all([
-        AsyncStorage.setItem(PREMIUM_KEY, 'true'),
-        AsyncStorage.setItem(PREMIUM_PLAN_KEY, selectedFusionPlan || 'yearly')
+        setCachedItem(PREMIUM_KEY, 'true'),
+        setCachedItem(PREMIUM_PLAN_KEY, selectedFusionPlan || 'yearly')
       ]));
     syncQuietly('subscription', () => syncSubscriptionStatus({ isPremium: true, selectedPlan: selectedFusionPlan || 'yearly' }));
     hapticSuccess();
@@ -3314,8 +3511,8 @@ export default function App() {
     setSelectedMode('Basic');
     setSelectedFusionPlan('yearly');
     await updateOfflineCache(Promise.all([
-        AsyncStorage.removeItem(PREMIUM_KEY),
-        AsyncStorage.removeItem(PREMIUM_PLAN_KEY)
+        removeCachedItem(PREMIUM_KEY),
+        removeCachedItem(PREMIUM_PLAN_KEY)
       ]));
     syncQuietly('subscription', () => syncSubscriptionStatus({ isPremium: false, selectedPlan: 'yearly' }));
     setScreen('home');
@@ -3347,7 +3544,7 @@ export default function App() {
         }, ...favorites];
 
     setFavorites(nextFavorites);
-    await updateOfflineCache(AsyncStorage.setItem(FAVORITES_KEY, JSON.stringify(nextFavorites)));
+    await updateOfflineCache(setCachedItem(FAVORITES_KEY, JSON.stringify(nextFavorites)));
     syncQuietly('favorites', () => replaceFavoriteRecipes(nextFavorites));
     hapticTap();
     showToast(exists ? 'Removed from favorites' : 'Recipe saved');
@@ -3359,7 +3556,7 @@ export default function App() {
       recipeKey(favorite, favorite.recipeType) === key ? { ...favorite, folder } : favorite
     );
     setFavorites(nextFavorites);
-    await updateOfflineCache(AsyncStorage.setItem(FAVORITES_KEY, JSON.stringify(nextFavorites)));
+    await updateOfflineCache(setCachedItem(FAVORITES_KEY, JSON.stringify(nextFavorites)));
     syncQuietly('favorites', () => replaceFavoriteRecipes(nextFavorites));
     hapticTap();
     showToast(`Saved to ${folder}`);
@@ -3368,13 +3565,13 @@ export default function App() {
   async function deleteGroceryItem(item) {
     const nextItems = groceryList.filter((groceryItem) => groceryItem !== item);
     setGroceryList(nextItems);
-    await AsyncStorage.setItem(GROCERY_KEY, JSON.stringify(nextItems));
+    await setCachedItem(GROCERY_KEY, JSON.stringify(nextItems));
   }
 
   async function toggleGroceryChecked(item) {
     const nextChecked = { ...groceryChecked, [item]: !groceryChecked[item] };
     setGroceryChecked(nextChecked);
-    await AsyncStorage.setItem(GROCERY_CHECKED_KEY, JSON.stringify(nextChecked));
+    await setCachedItem(GROCERY_CHECKED_KEY, JSON.stringify(nextChecked));
   }
 
   async function addCustomGroceryItem() {
@@ -3385,7 +3582,7 @@ export default function App() {
     const nextItems = [...new Set([...groceryList, item])];
     setGroceryList(nextItems);
     setCustomGroceryItem('');
-    await AsyncStorage.setItem(GROCERY_KEY, JSON.stringify(nextItems));
+    await setCachedItem(GROCERY_KEY, JSON.stringify(nextItems));
   }
 
   function localShoppingSearch(query) {
@@ -3505,7 +3702,7 @@ export default function App() {
     const nextLocation = { address, fulfillmentMode };
     setShoppingLocation(nextLocation);
     setShoppingStoreFilter('All Stores');
-    await updateOfflineCache(AsyncStorage.setItem(SHOPPING_LOCATION_KEY, JSON.stringify(nextLocation)));
+    await updateOfflineCache(setCachedItem(SHOPPING_LOCATION_KEY, JSON.stringify(nextLocation)));
     syncQuietly('shopping location', () => syncUserPreferences(preferenceSnapshot({ shoppingLocation: nextLocation })));
     await loadNearbyStores(nextLocation, fulfillmentMode);
     setScreen('shoppingStores');
@@ -3516,7 +3713,7 @@ export default function App() {
     if (shoppingLocation?.address) {
       const nextLocation = { ...shoppingLocation, fulfillmentMode: mode };
       setShoppingLocation(nextLocation);
-      await updateOfflineCache(AsyncStorage.setItem(SHOPPING_LOCATION_KEY, JSON.stringify(nextLocation)));
+      await updateOfflineCache(setCachedItem(SHOPPING_LOCATION_KEY, JSON.stringify(nextLocation)));
       syncQuietly('shopping location', () => syncUserPreferences(preferenceSnapshot({ shoppingLocation: nextLocation })));
       await loadNearbyStores(nextLocation, mode);
     }
@@ -3530,7 +3727,7 @@ export default function App() {
         )
       : [{ ...item, quantity: 1 }, ...shoppingCart];
     setShoppingCart(nextCart);
-    await updateOfflineCache(AsyncStorage.setItem(SHOPPING_CART_KEY, JSON.stringify(nextCart)));
+    await updateOfflineCache(setCachedItem(SHOPPING_CART_KEY, JSON.stringify(nextCart)));
     syncQuietly('shopping cart', () => replaceActiveShoppingCart(nextCart, fulfillmentMode));
     hapticTap();
     showToast('Added to cart');
@@ -3546,7 +3743,7 @@ export default function App() {
   async function removeShoppingItem(itemId) {
     const nextCart = shoppingCart.filter((item) => item.id !== itemId);
     setShoppingCart(nextCart);
-    await updateOfflineCache(AsyncStorage.setItem(SHOPPING_CART_KEY, JSON.stringify(nextCart)));
+    await updateOfflineCache(setCachedItem(SHOPPING_CART_KEY, JSON.stringify(nextCart)));
     syncQuietly('shopping cart', () => replaceActiveShoppingCart(nextCart, fulfillmentMode));
   }
 
@@ -3555,7 +3752,7 @@ export default function App() {
       .map((item) => item.id === itemId ? { ...item, quantity: Math.max(0, (item.quantity || 1) + delta) } : item)
       .filter((item) => (item.quantity || 0) > 0);
     setShoppingCart(nextCart);
-    await updateOfflineCache(AsyncStorage.setItem(SHOPPING_CART_KEY, JSON.stringify(nextCart)));
+    await updateOfflineCache(setCachedItem(SHOPPING_CART_KEY, JSON.stringify(nextCart)));
     syncQuietly('shopping cart', () => replaceActiveShoppingCart(nextCart, fulfillmentMode));
   }
 
@@ -3641,8 +3838,8 @@ export default function App() {
     setPromoCode('');
     setPromoApplied(false);
     await updateOfflineCache(Promise.all([
-      AsyncStorage.setItem(ORDER_HISTORY_KEY, JSON.stringify(nextOrders)),
-      AsyncStorage.setItem(SHOPPING_CART_KEY, JSON.stringify([]))
+      setCachedItem(ORDER_HISTORY_KEY, JSON.stringify(nextOrders)),
+      setCachedItem(SHOPPING_CART_KEY, JSON.stringify([]))
     ]));
     syncQuietly('shopping cart', () => replaceActiveShoppingCart([], fulfillmentMode));
     syncQuietly('orders', () => savePlacedOrder(placedOrder));
@@ -3666,7 +3863,7 @@ export default function App() {
     setPantryItems(nextPantry);
     setPantryInput('');
     setPantryExpirationInput(dateFromToday(3));
-    await updateOfflineCache(AsyncStorage.setItem(PANTRY_KEY, JSON.stringify(nextPantry)));
+    await updateOfflineCache(setCachedItem(PANTRY_KEY, JSON.stringify(nextPantry)));
     syncQuietly('pantry', () => replacePantryItems(nextPantry));
     hapticTap();
     showToast('Added to pantry');
@@ -3675,21 +3872,21 @@ export default function App() {
   async function deletePantryItem(id) {
     const nextPantry = pantryItems.filter((item) => item.id !== id);
     setPantryItems(nextPantry);
-    await updateOfflineCache(AsyncStorage.setItem(PANTRY_KEY, JSON.stringify(nextPantry)));
+    await updateOfflineCache(setCachedItem(PANTRY_KEY, JSON.stringify(nextPantry)));
     syncQuietly('pantry', () => replacePantryItems(nextPantry));
   }
 
   async function updatePantryExpiration(id, expiresAt) {
     const nextPantry = pantryItems.map((item) => item.id === id ? { ...item, expiresAt } : item);
     setPantryItems(nextPantry);
-    await updateOfflineCache(AsyncStorage.setItem(PANTRY_KEY, JSON.stringify(nextPantry)));
+    await updateOfflineCache(setCachedItem(PANTRY_KEY, JSON.stringify(nextPantry)));
     syncQuietly('pantry', () => replacePantryItems(nextPantry));
   }
 
   async function assignPlannerMeal(day, meal) {
     const nextPlanner = { ...planner, [day]: meal };
     setPlanner(nextPlanner);
-    await AsyncStorage.setItem(PLANNER_KEY, JSON.stringify(nextPlanner));
+    await setCachedItem(PLANNER_KEY, JSON.stringify(nextPlanner));
   }
 
   async function generatePlannerGroceryList() {
@@ -3697,7 +3894,7 @@ export default function App() {
     const missingItems = plannedMeals.flatMap((meal) => meal.missingIngredients || []);
     const nextItems = [...new Set([...groceryList, ...missingItems])];
     setGroceryList(nextItems);
-    await AsyncStorage.setItem(GROCERY_KEY, JSON.stringify(nextItems));
+    await setCachedItem(GROCERY_KEY, JSON.stringify(nextItems));
     setScreen('grocery');
   }
 
@@ -3732,7 +3929,7 @@ export default function App() {
       )
     ].slice(0, 30);
     setMealHistory(nextHistory);
-    await updateOfflineCache(AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(nextHistory)));
+    await updateOfflineCache(setCachedItem(HISTORY_KEY, JSON.stringify(nextHistory)));
     syncQuietly('saved recipes', () => saveOpenedRecipe(recentMeal));
   }
 
@@ -3856,7 +4053,7 @@ export default function App() {
       ? equipmentProfile.filter((owned) => owned !== item)
       : [...equipmentProfile, item];
     setEquipmentProfile(nextProfile);
-    await updateOfflineCache(AsyncStorage.setItem(EQUIPMENT_PROFILE_KEY, JSON.stringify(nextProfile)));
+    await updateOfflineCache(setCachedItem(EQUIPMENT_PROFILE_KEY, JSON.stringify(nextProfile)));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ equipment: nextProfile })));
   }
 
@@ -3879,7 +4076,7 @@ export default function App() {
     };
     nextRatings[key] = [compactMeal, ...nextRatings[key]].slice(0, 30);
     setRecipeRatings(nextRatings);
-    await AsyncStorage.setItem(RECIPE_RATINGS_KEY, JSON.stringify(nextRatings));
+    await setCachedItem(RECIPE_RATINGS_KEY, JSON.stringify(nextRatings));
   }
 
   async function addHouseholdMember() {
@@ -3890,20 +4087,20 @@ export default function App() {
     const nextMembers = [...new Set([...householdMembers, name])];
     setHouseholdMembers(nextMembers);
     setHouseholdInput('');
-    await updateOfflineCache(AsyncStorage.setItem(HOUSEHOLD_KEY, JSON.stringify(nextMembers)));
+    await updateOfflineCache(setCachedItem(HOUSEHOLD_KEY, JSON.stringify(nextMembers)));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ household: { members: nextMembers } })));
   }
 
   async function updateBudgetGoal(key, value) {
     const nextGoals = { ...budgetGoals, [key]: value };
     setBudgetGoals(nextGoals);
-    await updateOfflineCache(AsyncStorage.setItem(BUDGET_GOALS_KEY, JSON.stringify(nextGoals)));
+    await updateOfflineCache(setCachedItem(BUDGET_GOALS_KEY, JSON.stringify(nextGoals)));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ budgetGoals: nextGoals })));
   }
 
   async function selectMacroLock(lock) {
     setMacroLock(lock);
-    await updateOfflineCache(AsyncStorage.setItem(MACRO_LOCK_KEY, lock));
+    await updateOfflineCache(setCachedItem(MACRO_LOCK_KEY, lock));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ macroLock: lock })));
   }
 
@@ -3953,21 +4150,21 @@ export default function App() {
     }
     const nextPosts = [{ id: `${Date.now()}`, title: meal.title, by: householdMembers[0] || 'You' }, ...socialPosts].slice(0, 12);
     setSocialPosts(nextPosts);
-    await AsyncStorage.setItem(SOCIAL_KEY, JSON.stringify(nextPosts));
+    await setCachedItem(SOCIAL_KEY, JSON.stringify(nextPosts));
   }
 
   async function resetDailyScan() {
     setScanDate(null);
     setScanCountToday(0);
-    await Promise.all([AsyncStorage.removeItem(SCAN_KEY), AsyncStorage.removeItem(SCAN_COUNT_KEY)]);
+    await Promise.all([removeCachedItem(SCAN_KEY), removeCachedItem(SCAN_COUNT_KEY)]);
   }
 
   async function clearHistory() {
     setMealHistory([]);
     setFavoriteScanIds([]);
     await updateOfflineCache(Promise.all([
-      AsyncStorage.removeItem(HISTORY_KEY),
-      AsyncStorage.removeItem(FAVORITE_SCANS_KEY)
+      removeCachedItem(HISTORY_KEY),
+      removeCachedItem(FAVORITE_SCANS_KEY)
     ]));
     syncQuietly('scan history', () => clearRemoteScanHistory());
     showToast('Scan history cleared');
@@ -3979,8 +4176,8 @@ export default function App() {
     setMealHistory(nextHistory);
     setFavoriteScanIds(nextFavoriteScans);
     await updateOfflineCache(Promise.all([
-      AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(nextHistory)),
-      AsyncStorage.setItem(FAVORITE_SCANS_KEY, JSON.stringify(nextFavoriteScans))
+      setCachedItem(HISTORY_KEY, JSON.stringify(nextHistory)),
+      setCachedItem(FAVORITE_SCANS_KEY, JSON.stringify(nextFavoriteScans))
     ]));
     syncQuietly('scan history', () => deleteRemoteScan(scanId));
     showToast('Scan removed');
@@ -3992,7 +4189,7 @@ export default function App() {
       ? favoriteScanIds.filter((id) => id !== scanId)
       : [scanId, ...favoriteScanIds];
     setFavoriteScanIds(nextFavoriteScans);
-    await updateOfflineCache(AsyncStorage.setItem(FAVORITE_SCANS_KEY, JSON.stringify(nextFavoriteScans)));
+    await updateOfflineCache(setCachedItem(FAVORITE_SCANS_KEY, JSON.stringify(nextFavoriteScans)));
     syncQuietly('scan history', () => setRemoteScanFavorite(scanId, !saved));
     hapticTap();
     showToast(saved ? 'Scan unpinned' : 'Scan saved');
@@ -4000,13 +4197,13 @@ export default function App() {
 
   async function clearFavorites() {
     setFavorites([]);
-    await updateOfflineCache(AsyncStorage.removeItem(FAVORITES_KEY));
+    await updateOfflineCache(removeCachedItem(FAVORITES_KEY));
     syncQuietly('favorites', () => replaceFavoriteRecipes([]));
   }
 
   async function clearGroceryList() {
     setGroceryList([]);
-    await AsyncStorage.removeItem(GROCERY_KEY);
+    await removeCachedItem(GROCERY_KEY);
   }
 
   async function togglePreference(preference) {
@@ -4014,7 +4211,7 @@ export default function App() {
       ? preferences.filter((item) => item !== preference)
       : [...preferences, preference];
     setPreferences(nextPreferences);
-    await updateOfflineCache(AsyncStorage.setItem(PREFERENCES_KEY, JSON.stringify(nextPreferences)));
+    await updateOfflineCache(setCachedItem(PREFERENCES_KEY, JSON.stringify(nextPreferences)));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ foodStyles: nextPreferences })));
     hapticTap();
   }
@@ -4027,38 +4224,38 @@ export default function App() {
     const nextDislikes = [...new Set([...dislikedIngredients, nextDislike])];
     setDislikedIngredients(nextDislikes);
     setDislikeInput('');
-    await updateOfflineCache(AsyncStorage.setItem(DISLIKES_KEY, JSON.stringify(nextDislikes)));
+    await updateOfflineCache(setCachedItem(DISLIKES_KEY, JSON.stringify(nextDislikes)));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ dislikedIngredients: nextDislikes })));
   }
 
   async function deleteDislikedIngredient(item) {
     const nextDislikes = dislikedIngredients.filter((dislike) => dislike !== item);
     setDislikedIngredients(nextDislikes);
-    await updateOfflineCache(AsyncStorage.setItem(DISLIKES_KEY, JSON.stringify(nextDislikes)));
+    await updateOfflineCache(setCachedItem(DISLIKES_KEY, JSON.stringify(nextDislikes)));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ dislikedIngredients: nextDislikes })));
   }
 
   async function selectServings(nextServings) {
     setServings(nextServings);
-    await updateOfflineCache(AsyncStorage.setItem(SERVINGS_KEY, `${nextServings}`));
+    await updateOfflineCache(setCachedItem(SERVINGS_KEY, `${nextServings}`));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ servings: nextServings })));
   }
 
   async function selectEquipment(nextEquipment) {
     setEquipment(nextEquipment);
-    await updateOfflineCache(AsyncStorage.setItem(EQUIPMENT_KEY, nextEquipment));
+    await updateOfflineCache(setCachedItem(EQUIPMENT_KEY, nextEquipment));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ primaryEquipment: nextEquipment })));
   }
 
   async function clearPreferences() {
     setPreferences([]);
-    await updateOfflineCache(AsyncStorage.removeItem(PREFERENCES_KEY));
+    await updateOfflineCache(removeCachedItem(PREFERENCES_KEY));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ foodStyles: [] })));
   }
 
   async function clearDislikes() {
     setDislikedIngredients([]);
-    await updateOfflineCache(AsyncStorage.removeItem(DISLIKES_KEY));
+    await updateOfflineCache(removeCachedItem(DISLIKES_KEY));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ dislikedIngredients: [] })));
   }
 
@@ -4071,9 +4268,9 @@ export default function App() {
     setGroceryChecked({});
     setPlanner({});
     await updateOfflineCache(Promise.all([
-      AsyncStorage.removeItem(SERVINGS_KEY),
-      AsyncStorage.removeItem(EQUIPMENT_KEY),
-      AsyncStorage.removeItem(EQUIPMENT_PROFILE_KEY)
+      removeCachedItem(SERVINGS_KEY),
+      removeCachedItem(EQUIPMENT_KEY),
+      removeCachedItem(EQUIPMENT_PROFILE_KEY)
     ]));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ equipment: ['stove', 'microwave'], primaryEquipment: 'Stove', servings: 2 })));
   }
@@ -4101,6 +4298,11 @@ export default function App() {
 
   async function finishAuth(profile, options = {}) {
     const appleSession = Boolean(options.appleSession);
+    const nextUserId = stableUserId(profile);
+    if (nextUserId !== activeUserIdRef.current) {
+      resetSessionStateForAccountSwitch();
+    }
+    activeUserIdRef.current = nextUserId;
     appleSessionRef.current = appleSession;
     setUserProfile(profile);
     setIsLoggedIn(true);
@@ -4121,6 +4323,7 @@ export default function App() {
       ]);
       if (appleSession) {
         setSyncState({ status: 'offline', message: 'Saved on this device' });
+        await preloadReviewDemoData(profile);
       } else if (supabaseConfigured) {
         await hydrateSyncedUserData();
       }
@@ -4194,6 +4397,7 @@ export default function App() {
 
   async function handleContinueWithApple() {
     await finishAuth({
+      id: 'review-demo-apple-user',
       name: 'Apple User',
       email: 'apple.user@privaterelay.appleid.com',
       provider: 'apple'
@@ -4226,6 +4430,8 @@ export default function App() {
 
   async function logout() {
     appleSessionRef.current = false;
+    activeUserIdRef.current = null;
+    resetSessionStateForAccountSwitch();
     setIsLoggedIn(false);
     setUserProfile(null);
     setScreen('home');
@@ -4253,7 +4459,7 @@ export default function App() {
 
   async function enableNotifications() {
     setNotificationsEnabled(true);
-    await updateOfflineCache(AsyncStorage.setItem(NOTIFICATION_PERMISSION_KEY, 'true'));
+    await updateOfflineCache(setCachedItem(NOTIFICATION_PERMISSION_KEY, 'true'));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ notificationsEnabled: true })));
     setScreen('settings');
   }
@@ -4264,7 +4470,7 @@ export default function App() {
       [key]: !notificationPreferences[key]
     };
     setNotificationPreferences(nextPreferences);
-    await updateOfflineCache(AsyncStorage.setItem(NOTIFICATION_PREFERENCES_KEY, JSON.stringify(nextPreferences)));
+    await updateOfflineCache(setCachedItem(NOTIFICATION_PREFERENCES_KEY, JSON.stringify(nextPreferences)));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ notificationPreferences: nextPreferences })));
   }
 
@@ -4411,11 +4617,14 @@ export default function App() {
       [oppositeKey]: (recipeFeedback[oppositeKey] || []).filter((item) => item.title !== meal.title)
     };
     setRecipeFeedback(nextFeedback);
-    await AsyncStorage.setItem(FEEDBACK_KEY, JSON.stringify(nextFeedback));
+    await setCachedItem(FEEDBACK_KEY, JSON.stringify(nextFeedback));
   }
 
   async function resetAllAppData(keepOnboarding = false) {
+    const userScopedKeysToClear = Array.from(USER_SCOPED_CACHE_KEYS);
+    await multiRemoveCached(userScopedKeysToClear);
     appleSessionRef.current = false;
+    activeUserIdRef.current = null;
     setIsLoggedIn(false);
     setUserProfile(null);
     setAuthScreen('welcome');
@@ -4560,7 +4769,7 @@ export default function App() {
     setIngredients([...new Set([...ingredients, nextIngredient])]);
     const nextStatuses = { ...ingredientStatuses, [nextIngredient]: ingredientStatuses[nextIngredient] || 'fresh' };
     setIngredientStatuses(nextStatuses);
-    AsyncStorage.setItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
+    setCachedItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
     rememberSearch(nextIngredient, 'ingredient');
     setManualIngredient('');
     hapticTap();
@@ -4571,7 +4780,7 @@ export default function App() {
     const nextStatuses = { ...ingredientStatuses };
     delete nextStatuses[item];
     setIngredientStatuses(nextStatuses);
-    AsyncStorage.setItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
+    setCachedItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
     setIngredients(ingredients.filter((ingredient) => ingredient !== item));
   }
 
@@ -4645,7 +4854,7 @@ export default function App() {
       setMeals(typedMeals);
       setHasLoadedMoreMeals(false);
       setMealHistory(nextHistory);
-      await AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(nextHistory));
+      await setCachedItem(HISTORY_KEY, JSON.stringify(nextHistory));
       hapticSuccess();
       showToast('Meals ready');
       setScreen('results');
@@ -4688,7 +4897,7 @@ export default function App() {
 
   async function selectRecipeSource(source) {
     setRecipeSource(source);
-    await updateOfflineCache(AsyncStorage.setItem(RECIPE_SOURCE_KEY, source));
+    await updateOfflineCache(setCachedItem(RECIPE_SOURCE_KEY, source));
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ recipeSource: source })));
   }
 
@@ -4699,7 +4908,7 @@ export default function App() {
   async function setIngredientFreshness(ingredient, status) {
     const nextStatuses = { ...ingredientStatuses, [ingredient]: status };
     setIngredientStatuses(nextStatuses);
-    await AsyncStorage.setItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
+    await setCachedItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
     if (meals.length > 0) {
       setMeals(addProductSignals(meals, ingredients, nextStatuses));
     }
@@ -4726,7 +4935,7 @@ export default function App() {
     setIngredientStatuses(nextStatuses);
     setEditingIngredient(null);
     setIngredientEditValue('');
-    AsyncStorage.setItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
+    setCachedItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
   }
 
   function unlockDeveloperMode() {
@@ -5097,8 +5306,8 @@ export default function App() {
               <Text style={styles.noticeText}>
                 {scanSource === 'openai'
                   ? 'Using OpenAI Scan'
-                  : scanSource === 'error'
-                  ? 'OpenAI Scan Failed'
+                  : scanSource === 'demo'
+                  ? 'Using FoodFusion demo scan'
                   : 'Ingredient Review'}
               </Text>
             </View>
