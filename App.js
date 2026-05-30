@@ -2638,6 +2638,9 @@ export default function App() {
   const syncQueueRef = useRef(Promise.resolve());
   const activeUserIdRef = useRef(null);
   const accountHydrateRef = useRef(0);
+  const restoringUserIdRef = useRef(null);
+  const restoredUserIdRef = useRef(null);
+  const restoreFailsafeTimerRef = useRef(null);
 
   function cacheKey(key, userId = activeUserIdRef.current) {
     return scopedCacheKey(key, userId);
@@ -2661,6 +2664,61 @@ export default function App() {
 
   async function multiRemoveCached(keys) {
     return AsyncStorage.multiRemove(keys.map((key) => cacheKey(key)));
+  }
+
+  function clearAccountRestoreLoading(reason, userId = activeUserIdRef.current) {
+    if (restoreFailsafeTimerRef.current) {
+      clearTimeout(restoreFailsafeTimerRef.current);
+      restoreFailsafeTimerRef.current = null;
+    }
+    setSubscriptionLoading(false);
+    setHistoryLoading(false);
+    restoringUserIdRef.current = null;
+    if (userId) {
+      restoredUserIdRef.current = userId;
+    }
+    console.log('[FoodFusion Restore] Loading flags cleared:', { reason, userId });
+  }
+
+  function beginAccountRestore(userId, reason) {
+    if (!userId) {
+      clearAccountRestoreLoading('no user id');
+      return false;
+    }
+    if (restoringUserIdRef.current === userId) {
+      console.log('[FoodFusion Restore] Restore already running:', { userId, reason });
+      return false;
+    }
+    if (restoredUserIdRef.current === userId) {
+      console.log('[FoodFusion Restore] Restore already completed:', { userId, reason });
+      clearAccountRestoreLoading('already restored', userId);
+      return false;
+    }
+    if (restoreFailsafeTimerRef.current) {
+      clearTimeout(restoreFailsafeTimerRef.current);
+    }
+    restoringUserIdRef.current = userId;
+    console.log('[FoodFusion Restore] Restore start:', { userId, reason });
+    setSubscriptionLoading(true);
+    setHistoryLoading(true);
+    restoreFailsafeTimerRef.current = setTimeout(() => {
+      console.warn('[FoodFusion Restore] Restore timeout:', { userId });
+      if (activeUserIdRef.current === userId) {
+        clearAccountRestoreLoading('failsafe timeout', userId);
+      }
+    }, 5000);
+    return true;
+  }
+
+  function resetAccountRestoreGuard(options = {}) {
+    if (restoreFailsafeTimerRef.current) {
+      clearTimeout(restoreFailsafeTimerRef.current);
+      restoreFailsafeTimerRef.current = null;
+    }
+    restoringUserIdRef.current = null;
+    if (options.clearCompleted !== false) {
+      restoredUserIdRef.current = null;
+    }
   }
 
   async function readAccountRestoreCache(userId = activeUserIdRef.current) {
@@ -3002,8 +3060,11 @@ export default function App() {
       appleSessionRef.current = Boolean(localAppleProfile);
       setIsLoggedIn(localAppleProfile ? true : supabaseConfigured ? Boolean(sessionProfile) : storedLoggedIn === 'true');
       setUserProfile(activeProfile);
-      setSubscriptionLoading(needsRemoteRestore);
-      setHistoryLoading(needsRemoteRestore);
+      if (needsRemoteRestore) {
+        beginAccountRestore(activeUserId, 'startup session restore');
+      } else {
+        clearAccountRestoreLoading('startup local restore', activeUserId);
+      }
       applyAccountCacheSnapshot(cachedAccount, {
         includeSubscription: !needsRemoteRestore,
         includeHistory: !needsRemoteRestore
@@ -3020,17 +3081,15 @@ export default function App() {
         await hydrateSyncedUserData(activeProfile);
       } else if (localAppleProfile && isReviewDemoProfile(localAppleProfile) && cachedAccount.history.length === 0) {
         await preloadReviewDemoData(localAppleProfile);
-        setSubscriptionLoading(false);
-        setHistoryLoading(false);
       } else {
-        setSubscriptionLoading(false);
-        setHistoryLoading(false);
+        clearAccountRestoreLoading('startup complete', activeUserId);
       }
       setAuthBootstrapped(true);
     }
 
     loadState().catch((error) => {
       console.warn('[FoodFusion Auth] Startup cache load deferred:', error);
+      clearAccountRestoreLoading('startup error');
       setAuthBootstrapped(true);
     });
   }, []);
@@ -3061,9 +3120,14 @@ export default function App() {
           [AUTH_KEY, 'true'],
           [USER_PROFILE_KEY, JSON.stringify(profile)]
         ]);
-        hydrateSyncedUserData(profile);
+        if (restoredUserIdRef.current === nextUserId) {
+          console.log('[FoodFusion Restore] Observer hydrate skipped:', { userId: nextUserId });
+        } else {
+          hydrateSyncedUserData(profile);
+        }
       } else {
         activeUserIdRef.current = null;
+        clearAccountRestoreLoading('signed out');
         AsyncStorage.setItem(AUTH_KEY, 'false');
       }
     });
@@ -3138,7 +3202,12 @@ export default function App() {
     };
   }, [screen]);
 
-  useEffect(() => () => clearTimeout(toastTimeoutRef.current), []);
+  useEffect(() => () => {
+    clearTimeout(toastTimeoutRef.current);
+    if (restoreFailsafeTimerRef.current) {
+      clearTimeout(restoreFailsafeTimerRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     const alertKey = useSoonItems.map((item) => `${item.id}:${item.expiresAt}`).join('|');
@@ -3165,9 +3234,13 @@ export default function App() {
 
   function resetSessionStateForAccountSwitch(options = {}) {
     accountHydrateRef.current += 1;
+    resetAccountRestoreGuard({ clearCompleted: true });
     const loadingAccountData = options.loading !== false;
-    setSubscriptionLoading(loadingAccountData);
-    setHistoryLoading(loadingAccountData);
+    if (loadingAccountData) {
+      beginAccountRestore(activeUserIdRef.current, 'account switch');
+    } else {
+      clearAccountRestoreLoading('account switch without remote restore');
+    }
     setScanDate(null);
     if (!loadingAccountData) {
       setIsPremium(false);
@@ -3246,7 +3319,7 @@ export default function App() {
     }];
   }
 
-  async function preloadReviewDemoData(profile) {
+  async function preloadReviewDemoData(profile, options = {}) {
     if (!isReviewDemoProfile(profile)) {
       return;
     }
@@ -3285,8 +3358,9 @@ export default function App() {
     } catch (error) {
       console.warn('[FoodFusion Sync] Demo account cache seed deferred:', error);
     } finally {
-      setSubscriptionLoading(false);
-      setHistoryLoading(false);
+      if (options.settleLoading !== false) {
+        clearAccountRestoreLoading('demo seed complete', stableUserId(profile));
+      }
     }
   }
 
@@ -3346,22 +3420,28 @@ export default function App() {
 
   async function hydrateSyncedUserData(profileOverride = userProfile) {
     if (!supabaseConfigured || appleSessionRef.current) {
-      setSubscriptionLoading(false);
-      setHistoryLoading(false);
+      clearAccountRestoreLoading('remote restore skipped');
       return;
     }
     const hydrateUserId = activeUserIdRef.current;
     if (!hydrateUserId) {
-      setSubscriptionLoading(false);
-      setHistoryLoading(false);
+      clearAccountRestoreLoading('remote restore missing user');
+      return;
+    }
+    const alreadyRunningForUser = restoringUserIdRef.current === hydrateUserId;
+    if (!alreadyRunningForUser && restoredUserIdRef.current === hydrateUserId) {
+      console.log('[FoodFusion Restore] Hydration skipped, already settled:', { userId: hydrateUserId });
+      clearAccountRestoreLoading('already settled', hydrateUserId);
+      return;
+    }
+    if (!alreadyRunningForUser && !beginAccountRestore(hydrateUserId, 'hydration request')) {
       return;
     }
     const hydrateRunId = accountHydrateRef.current + 1;
     accountHydrateRef.current = hydrateRunId;
-    setSubscriptionLoading(true);
-    setHistoryLoading(true);
     try {
       setSyncState({ status: 'loading', message: 'Checking Fusion+ status...' });
+      console.log('[FoodFusion Restore] Hydrating user:', { userId: hydrateUserId });
       let cachedAccount = await withRestoreTimeout(
         readAccountRestoreCache(hydrateUserId),
         'Local account cache restore',
@@ -3371,7 +3451,7 @@ export default function App() {
         return emptyAccountRestoreSnapshot();
       });
       if (isReviewDemoProfile(profileOverride) && cachedAccount.history.length === 0) {
-        await preloadReviewDemoData(profileOverride);
+        await preloadReviewDemoData(profileOverride, { settleLoading: false });
         cachedAccount = await withRestoreTimeout(
           readAccountRestoreCache(hydrateUserId),
           'Demo account cache restore',
@@ -3476,8 +3556,10 @@ export default function App() {
         [ORDER_HISTORY_KEY, JSON.stringify(ordersSnapshot || [])]
       ]);
       setSyncState({ status: 'synced', message: 'Synced to your account' });
+      console.log('[FoodFusion Restore] Restore success:', { userId: hydrateUserId });
       console.log('[FoodFusion Sync] Synced account cache loaded.');
     } catch (error) {
+      console.warn('[FoodFusion Restore] Restore timeout or failure:', { userId: hydrateUserId, message: error?.message });
       console.warn('[FoodFusion Sync] Account cache refresh deferred:', error);
       try {
         if (hydrateRunId !== accountHydrateRef.current) {
@@ -3499,8 +3581,7 @@ export default function App() {
       setSyncState({ status: 'error', message: 'Sync failed. Saved on this device.' });
     } finally {
       if (hydrateRunId === accountHydrateRef.current) {
-        setSubscriptionLoading(false);
-        setHistoryLoading(false);
+        clearAccountRestoreLoading('hydration finally', hydrateUserId);
       }
     }
   }
