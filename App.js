@@ -2629,6 +2629,16 @@ export default function App() {
   });
   const [subscriptionLoading, setSubscriptionLoading] = useState(supabaseConfigured);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [accountDiagnostics, setAccountDiagnostics] = useState({
+    userId: null,
+    subscriptionSource: 'Free',
+    subscriptionStatus: 'free',
+    hydrationSource: 'None',
+    isPremium: false,
+    selectedPlan: 'yearly',
+    favoriteCount: 0,
+    recentCount: 0
+  });
   const [qaChecklist, setQaChecklist] = useState({});
   const recipePagerRef = useRef(null);
   const manualIngredientInputRef = useRef(null);
@@ -2666,6 +2676,10 @@ export default function App() {
     return AsyncStorage.multiRemove(keys.map((key) => cacheKey(key)));
   }
 
+  async function multiSetCachedForUser(userId, pairs) {
+    return AsyncStorage.multiSet(pairs.map(([key, value]) => [scopedCacheKey(key, userId), value]));
+  }
+
   function clearAccountRestoreLoading(reason, userId = activeUserIdRef.current) {
     if (restoreFailsafeTimerRef.current) {
       clearTimeout(restoreFailsafeTimerRef.current);
@@ -2676,6 +2690,7 @@ export default function App() {
     restoringUserIdRef.current = null;
     if (userId) {
       restoredUserIdRef.current = userId;
+      setAccountDiagnostics((current) => ({ ...current, userId }));
     }
     console.log('[FoodFusion Restore] Loading flags cleared:', { reason, userId });
   }
@@ -2928,6 +2943,209 @@ export default function App() {
     if (snapshot.shoppingLocation) {
       loadNearbyStores(snapshot.shoppingLocation, snapshot.shoppingLocation.fulfillmentMode || 'Delivery');
     }
+  }
+
+  async function restoreSubscriptionForUser(userId, options = {}) {
+    console.log('[Subscription] restoring for userId', userId);
+    const cachedAccount = options.cachedAccount || await withRestoreTimeout(
+      readAccountRestoreCache(userId),
+      'Subscription cache restore',
+      2500
+    ).catch(() => emptyAccountRestoreSnapshot());
+
+    let remoteSubscription = options.remoteSubscription;
+    if (options.fetchRemote && supabaseConfigured && !appleSessionRef.current) {
+      try {
+        const remote = await withRestoreTimeout(loadSyncedUserData(), 'Subscription Supabase restore');
+        remoteSubscription = remote?.subscription || null;
+      } catch (error) {
+        console.warn('[Subscription] Supabase restore failed:', error?.message);
+      }
+    }
+
+    console.log('[Subscription] Supabase result', remoteSubscription || null);
+    console.log('[Subscription] cache result', cachedAccount.subscription || null);
+
+    let finalActive = false;
+    let finalPlan = 'yearly';
+    let source = 'Free';
+
+    if (remoteSubscription) {
+      finalActive = remoteSubscription.status === 'active' && remoteSubscription.plan !== 'free';
+      finalPlan = remoteSubscription.plan === 'free' ? 'yearly' : remoteSubscription.plan || 'yearly';
+      source = 'Supabase';
+    } else if (cachedAccount.subscription?.isPremium) {
+      finalActive = true;
+      finalPlan = cachedAccount.subscription.selectedPlan || 'yearly';
+      source = 'Cache';
+      if (options.syncCacheToSupabase && supabaseConfigured && !appleSessionRef.current && activeUserIdRef.current === userId) {
+        try {
+          await withRestoreTimeout(
+            syncSubscriptionStatus({ isPremium: true, selectedPlan: finalPlan }),
+            'Subscription cache backfill'
+          );
+          source = 'Cache';
+        } catch (error) {
+          console.warn('[Subscription] Cache backfill deferred:', error?.message);
+        }
+      }
+    }
+
+    if (activeUserIdRef.current === userId) {
+      setIsPremium(finalActive);
+      setSelectedFusionPlan(finalPlan);
+    }
+    await withRestoreTimeout(multiSetCachedForUser(userId, [
+      [PREMIUM_KEY, finalActive ? 'true' : 'false'],
+      [PREMIUM_PLAN_KEY, finalPlan]
+    ]), 'Subscription cache save', 2500).catch((error) => {
+      console.warn('[Subscription] Cache save deferred:', error?.message);
+    });
+    setAccountDiagnostics((current) => ({
+      ...current,
+      userId,
+      subscriptionSource: source,
+      subscriptionStatus: finalActive ? 'active' : 'free',
+      isPremium: finalActive,
+      selectedPlan: finalPlan
+    }));
+    console.log('[Subscription] final active state', { userId, active: finalActive, plan: finalPlan, source });
+    console.log('[Subscription] saved to cache', { userId, active: finalActive, plan: finalPlan });
+    return { isPremium: finalActive, selectedPlan: finalPlan, source };
+  }
+
+  async function restoreAccountDataForUser(userId, profileOverride = userProfile) {
+    console.log('[FoodFusion Restore] Account data restore start:', { userId });
+    let hydrationSource = 'Cache';
+    let cachedAccount = await withRestoreTimeout(
+      readAccountRestoreCache(userId),
+      'Local account cache restore',
+      2500
+    ).catch((error) => {
+      console.warn('[FoodFusion Sync] Local account cache restore deferred:', error);
+      return emptyAccountRestoreSnapshot();
+    });
+
+    if (isReviewDemoProfile(profileOverride) && cachedAccount.history.length === 0) {
+      await preloadReviewDemoData(profileOverride, { settleLoading: false });
+      cachedAccount = await withRestoreTimeout(
+        readAccountRestoreCache(userId),
+        'Demo account cache restore',
+        2500
+      ).catch(() => cachedAccount);
+    }
+
+    let remote = null;
+    try {
+      remote = await withRestoreTimeout(loadSyncedUserData(), 'Supabase account restore');
+      if (remote) {
+        hydrationSource = 'Supabase';
+      }
+    } catch (error) {
+      hydrationSource = 'Cache';
+      console.warn('[FoodFusion Restore] Supabase account restore failed:', { userId, message: error?.message });
+    }
+
+    if (activeUserIdRef.current !== userId) {
+      return;
+    }
+
+    const remoteHistory = remote ? [...(remote.savedRecipeHistory || []), ...(remote.scanHistory || [])]
+      .filter((entry, index, all) => all.findIndex((candidate) => {
+        const meal = candidate.meals?.[0];
+        const entryMeal = entry.meals?.[0];
+        return meal && entryMeal && recipeKey(meal, candidate.recipeType) === recipeKey(entryMeal, entry.recipeType);
+      }) === index)
+      .slice(0, 30) : [];
+    const restoredHistory = mergeAccountHistory(remoteHistory, cachedAccount.history);
+    const favoritesSnapshot = remote?.favorites?.length ? remote.favorites : cachedAccount.favorites;
+    const favoriteScansSnapshot = remote?.favoriteScanIds?.length ? remote.favoriteScanIds : cachedAccount.favoriteScanIds;
+    const pantrySnapshot = remote?.pantryItems?.length ? remote.pantryItems : cachedAccount.pantryItems;
+    const cartSnapshot = remote?.cartItems?.length ? remote.cartItems : cachedAccount.shoppingCart;
+    const ordersSnapshot = remote?.orders?.length ? remote.orders : cachedAccount.orderHistory;
+
+    if (remote?.preferences) {
+      const remoteFoodStyles = remote.preferences.food_styles || [];
+      const remoteDislikes = remote.preferences.disliked_ingredients || [];
+      const remoteEquipment = remote.preferences.equipment || [];
+      setPreferences(remoteFoodStyles);
+      setDislikedIngredients(remoteDislikes);
+      setEquipmentProfile(remoteEquipment);
+      setEquipment(remote.preferences.primary_equipment || 'Stove');
+      setServings(remote.preferences.default_servings || 2);
+      setRecipeSource(remote.preferences.recipe_source || 'Hybrid Mode');
+      setMacroLock(remote.preferences.macro_lock || '200g protein');
+      setBudgetGoals(remote.preferences.budget_goals || budgetGoals);
+      setHouseholdMembers(remote.preferences.household?.members || ['You']);
+      setNotificationPreferences(remote.preferences.notification_preferences || notificationPreferences);
+      setNotificationsEnabled(Boolean(remote.preferences.notifications_enabled));
+      const remoteShoppingLocation = remote.preferences.shopping_location?.address
+        ? remote.preferences.shopping_location
+        : cachedAccount.shoppingLocation;
+      if (remoteShoppingLocation?.address) {
+        setShoppingLocation(remoteShoppingLocation);
+        setShoppingLocationDraft(remoteShoppingLocation.address);
+        setFulfillmentMode(remoteShoppingLocation.fulfillmentMode || 'Delivery');
+        setNearbyStores(nearbyStoreOptionsForLocation(remoteShoppingLocation, remoteShoppingLocation.fulfillmentMode || 'Delivery'));
+      }
+      await withRestoreTimeout(multiSetCachedForUser(userId, [
+        [PREFERENCES_KEY, JSON.stringify(remoteFoodStyles)],
+        [DISLIKES_KEY, JSON.stringify(remoteDislikes)],
+        [EQUIPMENT_PROFILE_KEY, JSON.stringify(remoteEquipment)],
+        [EQUIPMENT_KEY, remote.preferences.primary_equipment || 'Stove'],
+        [SERVINGS_KEY, `${remote.preferences.default_servings || 2}`],
+        [RECIPE_SOURCE_KEY, remote.preferences.recipe_source || 'Hybrid Mode'],
+        [MACRO_LOCK_KEY, remote.preferences.macro_lock || '200g protein'],
+        [BUDGET_GOALS_KEY, JSON.stringify(remote.preferences.budget_goals || budgetGoals)],
+        [HOUSEHOLD_KEY, JSON.stringify(remote.preferences.household?.members || ['You'])],
+        [NOTIFICATION_PREFERENCES_KEY, JSON.stringify(remote.preferences.notification_preferences || notificationPreferences)],
+        [NOTIFICATION_PERMISSION_KEY, remote.preferences.notifications_enabled ? 'true' : 'false'],
+        [SHOPPING_LOCATION_KEY, JSON.stringify(remoteShoppingLocation || {})]
+      ]), 'Preferences cache save', 2500).catch((error) => {
+        console.warn('[FoodFusion Sync] Preferences cache save deferred:', error?.message);
+      });
+    } else {
+      applyAccountCacheSnapshot(cachedAccount, { includeSubscription: false, includeHistory: false });
+    }
+
+    setPantryItems(pantrySnapshot || []);
+    setShoppingCart(cartSnapshot || []);
+    setFulfillmentMode(remote?.fulfillmentMode || cachedAccount.shoppingLocation?.fulfillmentMode || 'Delivery');
+    setFavorites(favoritesSnapshot || []);
+    setFavoriteScanIds(favoriteScansSnapshot || []);
+    setOrderHistory(ordersSnapshot || []);
+    setMealHistory(restoredHistory);
+
+    await restoreSubscriptionForUser(userId, {
+      remoteSubscription: remote?.subscription || null,
+      cachedAccount,
+      syncCacheToSupabase: true
+    });
+
+    await withRestoreTimeout(multiSetCachedForUser(userId, [
+      [PANTRY_KEY, JSON.stringify(pantrySnapshot || [])],
+      [SHOPPING_CART_KEY, JSON.stringify(cartSnapshot || [])],
+      [FAVORITES_KEY, JSON.stringify(favoritesSnapshot || [])],
+      [HISTORY_KEY, JSON.stringify(restoredHistory)],
+      [FAVORITE_SCANS_KEY, JSON.stringify(favoriteScansSnapshot || [])],
+      [ORDER_HISTORY_KEY, JSON.stringify(ordersSnapshot || [])]
+    ]), 'Account cache save', 2500).catch((error) => {
+      console.warn('[FoodFusion Sync] Account cache save deferred:', error?.message);
+    });
+
+    setAccountDiagnostics((current) => ({
+      ...current,
+      userId,
+      hydrationSource,
+      favoriteCount: (favoritesSnapshot || []).length,
+      recentCount: restoredHistory.length
+    }));
+    console.log('[FoodFusion Restore] Account data restored:', {
+      userId,
+      hydrationSource,
+      favorites: (favoritesSnapshot || []).length,
+      recents: restoredHistory.length
+    });
   }
 
   const fusionStatusLoading = Boolean(isLoggedIn && subscriptionLoading);
@@ -3291,6 +3509,16 @@ export default function App() {
     setBudgetGoals({ weeklyBudget: '120', proteinGoal: '160', calorieTarget: '2200' });
     setMacroLock('200g protein');
     setSocialPosts([]);
+    setAccountDiagnostics({
+      userId: null,
+      subscriptionSource: 'Free',
+      subscriptionStatus: 'free',
+      hydrationSource: 'None',
+      isPremium: false,
+      selectedPlan: 'yearly',
+      favoriteCount: 0,
+      recentCount: 0
+    });
     expiryAlertKeyRef.current = '';
   }
 
@@ -3442,119 +3670,10 @@ export default function App() {
     try {
       setSyncState({ status: 'loading', message: 'Checking Fusion+ status...' });
       console.log('[FoodFusion Restore] Hydrating user:', { userId: hydrateUserId });
-      let cachedAccount = await withRestoreTimeout(
-        readAccountRestoreCache(hydrateUserId),
-        'Local account cache restore',
-        2500
-      ).catch((error) => {
-        console.warn('[FoodFusion Sync] Local account cache restore deferred:', error);
-        return emptyAccountRestoreSnapshot();
-      });
-      if (isReviewDemoProfile(profileOverride) && cachedAccount.history.length === 0) {
-        await preloadReviewDemoData(profileOverride, { settleLoading: false });
-        cachedAccount = await withRestoreTimeout(
-          readAccountRestoreCache(hydrateUserId),
-          'Demo account cache restore',
-          2500
-        ).catch(() => cachedAccount);
-      }
-      const remote = await withRestoreTimeout(loadSyncedUserData(), 'Supabase account restore');
       if (hydrateRunId !== accountHydrateRef.current || hydrateUserId !== activeUserIdRef.current) {
         return;
       }
-      if (!remote) {
-        applyAccountCacheSnapshot(cachedAccount);
-        if (!cachedAccount.subscription) {
-          setIsPremium(false);
-          setSelectedFusionPlan('yearly');
-        }
-        return;
-      }
-      if (remote.preferences) {
-        const remoteFoodStyles = remote.preferences.food_styles || [];
-        const remoteDislikes = remote.preferences.disliked_ingredients || [];
-        const remoteEquipment = remote.preferences.equipment || [];
-        setPreferences(remoteFoodStyles);
-        setDislikedIngredients(remoteDislikes);
-        setEquipmentProfile(remoteEquipment);
-        setEquipment(remote.preferences.primary_equipment || 'Stove');
-        setServings(remote.preferences.default_servings || 2);
-        setRecipeSource(remote.preferences.recipe_source || 'Hybrid Mode');
-        setMacroLock(remote.preferences.macro_lock || '200g protein');
-        setBudgetGoals(remote.preferences.budget_goals || budgetGoals);
-        setHouseholdMembers(remote.preferences.household?.members || ['You']);
-        setNotificationPreferences(remote.preferences.notification_preferences || notificationPreferences);
-        setNotificationsEnabled(Boolean(remote.preferences.notifications_enabled));
-        const remoteShoppingLocation = remote.preferences.shopping_location?.address
-          ? remote.preferences.shopping_location
-          : shoppingLocation;
-        if (remoteShoppingLocation?.address) {
-          setShoppingLocation(remoteShoppingLocation);
-          setShoppingLocationDraft(remoteShoppingLocation.address);
-          setFulfillmentMode(remoteShoppingLocation.fulfillmentMode || 'Delivery');
-          setNearbyStores(nearbyStoreOptionsForLocation(remoteShoppingLocation, remoteShoppingLocation.fulfillmentMode || 'Delivery'));
-        }
-        await multiSetCached([
-          [PREFERENCES_KEY, JSON.stringify(remoteFoodStyles)],
-          [DISLIKES_KEY, JSON.stringify(remoteDislikes)],
-          [EQUIPMENT_PROFILE_KEY, JSON.stringify(remoteEquipment)],
-          [EQUIPMENT_KEY, remote.preferences.primary_equipment || 'Stove'],
-          [SERVINGS_KEY, `${remote.preferences.default_servings || 2}`],
-          [RECIPE_SOURCE_KEY, remote.preferences.recipe_source || 'Hybrid Mode'],
-          [MACRO_LOCK_KEY, remote.preferences.macro_lock || '200g protein'],
-          [BUDGET_GOALS_KEY, JSON.stringify(remote.preferences.budget_goals || budgetGoals)],
-          [HOUSEHOLD_KEY, JSON.stringify(remote.preferences.household?.members || ['You'])],
-          [NOTIFICATION_PREFERENCES_KEY, JSON.stringify(remote.preferences.notification_preferences || notificationPreferences)],
-          [NOTIFICATION_PERMISSION_KEY, remote.preferences.notifications_enabled ? 'true' : 'false'],
-          [SHOPPING_LOCATION_KEY, JSON.stringify(remoteShoppingLocation || {})]
-        ]);
-      } else {
-        applyAccountCacheSnapshot(cachedAccount, { includeSubscription: false, includeHistory: false });
-      }
-      const pantrySnapshot = remote.pantryItems?.length ? remote.pantryItems : cachedAccount.pantryItems;
-      const cartSnapshot = remote.cartItems?.length ? remote.cartItems : cachedAccount.shoppingCart;
-      const favoritesSnapshot = remote.favorites?.length ? remote.favorites : cachedAccount.favorites;
-      const favoriteScansSnapshot = remote.favoriteScanIds?.length ? remote.favoriteScanIds : cachedAccount.favoriteScanIds;
-      const ordersSnapshot = remote.orders?.length ? remote.orders : cachedAccount.orderHistory;
-      setPantryItems(pantrySnapshot || []);
-      setShoppingCart(cartSnapshot || []);
-      setFulfillmentMode(remote.fulfillmentMode || shoppingLocation?.fulfillmentMode || 'Delivery');
-      setFavorites(favoritesSnapshot || []);
-      setFavoriteScanIds(favoriteScansSnapshot || []);
-      setOrderHistory(ordersSnapshot || []);
-      const remoteHistory = [...(remote.savedRecipeHistory || []), ...(remote.scanHistory || [])]
-        .filter((entry, index, all) => all.findIndex((candidate) => {
-          const meal = candidate.meals?.[0];
-          const entryMeal = entry.meals?.[0];
-          return meal && entryMeal && recipeKey(meal, candidate.recipeType) === recipeKey(entryMeal, entry.recipeType);
-        }) === index)
-        .slice(0, 30);
-      const restoredHistory = mergeAccountHistory(remoteHistory, cachedAccount.history);
-      setMealHistory(restoredHistory);
-      if (remote.subscription) {
-        const remotePremium = remote.subscription.status === 'active' && remote.subscription.plan !== 'free';
-        const remotePlan = remote.subscription.plan === 'free' ? 'yearly' : remote.subscription.plan;
-        setIsPremium(remotePremium);
-        setSelectedFusionPlan(remotePlan);
-        await multiSetCached([
-          [PREMIUM_KEY, remotePremium ? 'true' : 'false'],
-          [PREMIUM_PLAN_KEY, remotePlan]
-        ]);
-      } else if (cachedAccount.subscription) {
-        setIsPremium(cachedAccount.subscription.isPremium);
-        setSelectedFusionPlan(cachedAccount.subscription.selectedPlan || 'yearly');
-      } else {
-        setIsPremium(false);
-        setSelectedFusionPlan('yearly');
-      }
-      await multiSetCached([
-        [PANTRY_KEY, JSON.stringify(pantrySnapshot || [])],
-        [SHOPPING_CART_KEY, JSON.stringify(cartSnapshot || [])],
-        [FAVORITES_KEY, JSON.stringify(favoritesSnapshot || [])],
-        [HISTORY_KEY, JSON.stringify(restoredHistory)],
-        [FAVORITE_SCANS_KEY, JSON.stringify(favoriteScansSnapshot || [])],
-        [ORDER_HISTORY_KEY, JSON.stringify(ordersSnapshot || [])]
-      ]);
+      await restoreAccountDataForUser(hydrateUserId, profileOverride);
       setSyncState({ status: 'synced', message: 'Synced to your account' });
       console.log('[FoodFusion Restore] Restore success:', { userId: hydrateUserId });
       console.log('[FoodFusion Sync] Synced account cache loaded.');
@@ -3570,11 +3689,8 @@ export default function App() {
           'Fallback account cache restore',
           2500
         ).catch(() => emptyAccountRestoreSnapshot());
-        applyAccountCacheSnapshot(cachedAccount);
-        if (!cachedAccount.subscription) {
-          setIsPremium(false);
-          setSelectedFusionPlan('yearly');
-        }
+        applyAccountCacheSnapshot(cachedAccount, { includeSubscription: false });
+        await restoreSubscriptionForUser(hydrateUserId, { cachedAccount });
       } catch (cacheError) {
         console.warn('[FoodFusion Sync] Account cache fallback unavailable:', cacheError);
       }
@@ -3811,6 +3927,9 @@ export default function App() {
           syncSubscriptionStatus({ isPremium: true, selectedPlan: selectedFusionPlan }),
           'Subscription activation sync'
         );
+        if (activeUserIdRef.current) {
+          await restoreSubscriptionForUser(activeUserIdRef.current, { fetchRemote: true });
+        }
         setSyncState({ status: 'synced', message: 'Synced to your account' });
       }
       hapticSuccess();
@@ -3821,29 +3940,39 @@ export default function App() {
       hapticSuccess();
       showToast('Fusion+ Activated');
       setScreen('fusionSuccess');
+    } finally {
       setIsProcessingPayment(false);
     }
   }
 
   async function restorePurchase() {
+    const userId = activeUserIdRef.current;
     setSubscriptionLoading(true);
-    setIsPremium(true);
     await updateOfflineCache(Promise.all([
-        setCachedItem(PREMIUM_KEY, 'true'),
-        setCachedItem(PREMIUM_PLAN_KEY, selectedFusionPlan || 'yearly')
-      ]));
+      setCachedItem(PREMIUM_KEY, 'true'),
+      setCachedItem(PREMIUM_PLAN_KEY, selectedFusionPlan || 'yearly')
+    ]));
     try {
-      if (supabaseConfigured && isLoggedIn && !appleSessionRef.current) {
+      if (userId && supabaseConfigured && isLoggedIn && !appleSessionRef.current) {
         await withRestoreTimeout(
           syncSubscriptionStatus({ isPremium: true, selectedPlan: selectedFusionPlan || 'yearly' }),
           'Restore purchase sync'
         );
-        await hydrateSyncedUserData();
+        await restoreSubscriptionForUser(userId, { fetchRemote: true });
+      } else if (userId) {
+        await restoreSubscriptionForUser(userId);
+        setSyncState({ status: 'offline', message: 'Saved on this device' });
       } else {
+        setIsPremium(true);
         setSyncState({ status: 'offline', message: 'Saved on this device' });
       }
     } catch (error) {
       console.warn('[FoodFusion Sync] Restore purchase sync deferred:', error);
+      if (userId) {
+        await restoreSubscriptionForUser(userId).catch(() => {
+          setIsPremium(true);
+        });
+      }
       setSyncState({ status: 'error', message: 'Sync failed. Saved on this device.' });
     } finally {
       setSubscriptionLoading(false);
@@ -3854,6 +3983,7 @@ export default function App() {
   }
 
   async function resetPremium() {
+    const userId = activeUserIdRef.current;
     setIsPremium(false);
     setSelectedMode('Basic');
     setSelectedFusionPlan('yearly');
@@ -3867,7 +3997,12 @@ export default function App() {
           syncSubscriptionStatus({ isPremium: false, selectedPlan: 'yearly' }),
           'Subscription cancellation sync'
         );
+        if (userId) {
+          await restoreSubscriptionForUser(userId, { fetchRemote: true });
+        }
         setSyncState({ status: 'synced', message: 'Synced to your account' });
+      } else if (userId) {
+        await restoreSubscriptionForUser(userId);
       }
     } catch (error) {
       console.warn('[FoodFusion Sync] Subscription cancellation deferred:', error);
@@ -7640,6 +7775,24 @@ export default function App() {
               ['AI scan endpoint', scanEndpointStatus],
               ['Development bridge', scanEndpointIsDevelopment ? 'In use' : 'Not in use'],
               ['Support email', SUPPORT_EMAIL]
+            ].map(([label, value]) => (
+              <View key={label} style={styles.launchRow}>
+                <Text style={styles.launchLabel}>{label}</Text>
+                <Text style={styles.launchValue}>{value}</Text>
+              </View>
+            ))}
+          </View>
+          <View style={styles.settingsCard}>
+            <Text style={styles.settingsTitle}>Account Diagnostics</Text>
+            {[
+              ['Current user ID', accountDiagnostics.userId || activeUserIdRef.current || 'Not signed in'],
+              ['Subscription source', accountDiagnostics.subscriptionSource],
+              ['Subscription status', accountDiagnostics.subscriptionStatus],
+              ['isPremium', accountDiagnostics.isPremium ? 'true' : 'false'],
+              ['Selected plan', accountDiagnostics.selectedPlan || selectedFusionPlan],
+              ['Hydration source', accountDiagnostics.hydrationSource],
+              ['Favorite count', `${favorites.length}`],
+              ['Recent count', `${mealHistory.length}`]
             ].map(([label, value]) => (
               <View key={label} style={styles.launchRow}>
                 <Text style={styles.launchLabel}>{label}</Text>
