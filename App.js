@@ -37,6 +37,7 @@ import {
 } from './services/instacartMcp';
 import {
   getSupabaseAccessToken,
+  getSupabaseAuthDebug,
   getSupabaseSessionProfile,
   manageSupabaseAutoRefresh,
   observeSupabaseAuth,
@@ -44,6 +45,7 @@ import {
   signInWithSupabase,
   signOutOfSupabase,
   signUpWithSupabase,
+  supabaseAuthConfig,
   supabaseConfigured
 } from './services/supabaseAuth';
 import {
@@ -158,6 +160,27 @@ function withRestoreTimeout(promise, label, ms = ACCOUNT_RESTORE_TIMEOUT_MS) {
     timeoutId = setTimeout(() => reject(new Error(`${label} timed out.`)), ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
+function readableAuthError(error) {
+  const message = error?.message || `${error || ''}` || 'Authentication failed.';
+  const lower = message.toLowerCase();
+  if (lower.includes('invalid login') || lower.includes('invalid credentials')) {
+    return 'Invalid credentials. Check your email and password.';
+  }
+  if (lower.includes('network') || lower.includes('fetch') || lower.includes('request failed')) {
+    return `Network failure during login: ${message}`;
+  }
+  if (lower.includes('redirect')) {
+    return `Missing or invalid redirect URI: ${message}`;
+  }
+  if (lower.includes('storage') || lower.includes('asyncstorage')) {
+    return `Session storage failure: ${message}`;
+  }
+  if (lower.includes('supabase') || error?.status) {
+    return `Supabase auth failure: ${message}`;
+  }
+  return message;
 }
 
 function isReviewDemoProfile(profile) {
@@ -309,17 +332,24 @@ const APP_VERSION = '1.0.0';
 const APP_BUILD_NUMBER = '1';
 const SUPPORT_EMAIL = 'support@foodfusion.ai';
 const FOOD_SCAN_ENDPOINT = process.env.EXPO_PUBLIC_FOOD_SCAN_ENDPOINT?.trim();
+const RECIPE_MCP_ENDPOINT = process.env.EXPO_PUBLIC_RECIPE_MCP_ENDPOINT?.trim();
 // A development bridge access token is not an API secret; production requests must use authenticated server authorization.
 const FOOD_SCAN_ACCESS_TOKEN = process.env.EXPO_PUBLIC_FOOD_SCAN_ACCESS_TOKEN?.trim();
 const FOOD_SCAN_TIMEOUT_MS = 45000;
 const FOOD_SCAN_IMAGE_MAX_WIDTH = 1280;
 const FOOD_SCAN_IMAGE_QUALITY = 0.52;
+const STORE_LOOKUP_TIMEOUT_MS = 9000;
 const scanEndpointIsDevelopment = Boolean(FOOD_SCAN_ENDPOINT && /(localhost|127\.0\.0\.1|192\.168\.|10\.)/.test(FOOD_SCAN_ENDPOINT));
 const scanEndpointStatus = !FOOD_SCAN_ENDPOINT
   ? 'Not configured'
   : scanEndpointIsDevelopment
   ? 'Development endpoint'
   : 'Hosted endpoint configured';
+const aiScanMode = !FOOD_SCAN_ENDPOINT
+  ? 'demo fallback'
+  : scanEndpointIsDevelopment
+  ? 'development'
+  : 'production';
 const reviewSafeScanDetections = [
   { name: 'eggs', confidence: 0.94, estimatedQuantity: '6 count', notes: 'review-safe sample detection' },
   { name: 'yogurt', confidence: 0.88, estimatedQuantity: '1 container', notes: 'review-safe sample detection' },
@@ -423,33 +453,171 @@ const localShoppingCatalog = [
   { key: 'protein', name: 'Protein Powder', store: 'Walmart', price: '$24.99', size: '1 lb' },
   { key: 'protein', name: 'Whey Protein', store: 'Target', price: '$29.99', size: '1.5 lb' }
 ];
-const localStoreProfiles = [
-  { name: "Fry's", baseDistance: 1.2, deliveryFee: '$3.99' },
-  { name: 'Safeway', baseDistance: 2.1, deliveryFee: '$4.99' },
-  { name: 'Walmart', baseDistance: 3.4, deliveryFee: '$2.99' },
-  { name: 'Target', baseDistance: 4.1, deliveryFee: '$4.99' },
-  { name: "Trader Joe's", baseDistance: 5.3, deliveryFee: '$5.99' },
-  { name: 'Whole Foods', baseDistance: 6.2, deliveryFee: '$5.99' },
-  { name: 'Costco', baseDistance: 8.7, deliveryFee: '$6.99' }
-];
-
-function nearbyStoreOptionsForLocation(location, mode = 'Delivery') {
-  const cleanLocation = `${location?.address || ''}`.trim();
-  const locationSeed = [...cleanLocation].reduce((total, char) => total + char.charCodeAt(0), 0);
-  return localStoreProfiles
-    .map((store, index) => {
-      const distance = store.baseDistance + ((locationSeed + index * 3) % 8) / 10;
-      const metadata = shoppingStoreMeta[store.name];
-      return {
-        id: store.name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-        name: store.name,
-        distance: `${distance.toFixed(1)} mi`,
-        eta: mode === 'Delivery' ? metadata.delivery : metadata.pickup,
-        fee: mode === 'Delivery' ? store.deliveryFee : 'No pickup fee',
-        status: (locationSeed + index) % 6 === 0 ? 'Closes soon' : 'Open'
-      };
+function fetchWithStoreTimeout(url, options = {}, timeoutMs = STORE_LOOKUP_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal })
+    .catch((error) => {
+      if (controller.signal.aborted) {
+        throw new Error('Store lookup timed out.');
+      }
+      throw error;
     })
-    .sort((first, second) => parseFloat(first.distance) - parseFloat(second.distance));
+    .finally(() => clearTimeout(timeoutId));
+}
+
+function compactAddressFields(fields = {}) {
+  const street = fields.street?.trim() || '';
+  const city = fields.city?.trim() || '';
+  const state = fields.state?.trim() || '';
+  const zip = fields.zip?.trim() || '';
+  return {
+    street,
+    city,
+    state,
+    zip,
+    fullAddress: [street, city, state, zip].filter(Boolean).join(', ')
+  };
+}
+
+function addressFieldsFromLocation(location = {}) {
+  if (location.addressFields) {
+    return {
+      street: location.addressFields.street || '',
+      zip: location.addressFields.zip || '',
+      city: location.addressFields.city || '',
+      state: location.addressFields.state || ''
+    };
+  }
+  return {
+    street: location.address || '',
+    zip: '',
+    city: '',
+    state: ''
+  };
+}
+
+async function geocodeShoppingLocation(addressFields) {
+  const fields = compactAddressFields(addressFields);
+  console.log('[Store Lookup] address fields', fields);
+  if (!fields.fullAddress) {
+    throw new Error('Enter a street address, ZIP code, or city and state.');
+  }
+  const params = new URLSearchParams({
+    format: 'json',
+    limit: '1',
+    addressdetails: '1',
+    countrycodes: 'us'
+  });
+  if (fields.street || fields.city || fields.state) {
+    if (fields.street) params.set('street', fields.street);
+    if (fields.city) params.set('city', fields.city);
+    if (fields.state) params.set('state', fields.state);
+    if (fields.zip) params.set('postalcode', fields.zip);
+    params.set('country', 'United States');
+  } else {
+    params.set('postalcode', fields.zip);
+    params.set('country', 'United States');
+  }
+  const url = `https://nominatim.openstreetmap.org/search?${params.toString()}`;
+  const response = await fetchWithStoreTimeout(url, {
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'FoodFusionAI/1.0 support@foodfusion.ai'
+    }
+  });
+  if (!response.ok) {
+    throw new Error(`Geocode failed (${response.status}).`);
+  }
+  const results = await response.json();
+  const first = Array.isArray(results) ? results[0] : null;
+  console.log('[Store Lookup] geocode result', first || null);
+  if (!first?.lat || !first?.lon) {
+    throw new Error('Couldn’t find stores near this address.');
+  }
+  const coordinates = {
+    latitude: Number(first.lat),
+    longitude: Number(first.lon),
+    label: first.display_name || fields.fullAddress
+  };
+  console.log('[Store Lookup] latitude/longitude', coordinates);
+  return coordinates;
+}
+
+function normalizeRealStore(element, coordinates, mode = 'Delivery') {
+  const tags = element.tags || {};
+  const name = tags.name || tags.brand || tags.operator || 'Local Grocery Store';
+  const lat = element.lat || element.center?.lat;
+  const lon = element.lon || element.center?.lon;
+  const distanceMiles = lat && lon ? distanceInMiles(coordinates.latitude, coordinates.longitude, lat, lon) : null;
+  return {
+    id: `${element.type}-${element.id}`,
+    name,
+    distance: distanceMiles == null ? '' : `${distanceMiles.toFixed(1)} mi`,
+    eta: mode === 'Pickup' ? 'Pickup today' : distanceMiles != null && distanceMiles < 3 ? 'Delivery 30-50 min' : 'Delivery 45-75 min',
+    fee: mode === 'Pickup' ? 'No pickup fee' : distanceMiles != null && distanceMiles < 4 ? '$3.99' : '$5.99',
+    status: tags.opening_hours ? 'Hours vary' : 'Open',
+    latitude: lat,
+    longitude: lon,
+    source: 'OpenStreetMap'
+  };
+}
+
+function distanceInMiles(lat1, lon1, lat2, lon2) {
+  const toRad = (value) => (value * Math.PI) / 180;
+  const radius = 3958.8;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return radius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function storePriority(name = '') {
+  const lower = name.toLowerCase();
+  const priorities = [
+    ['walmart', 0],
+    ['target', 1],
+    ['kroger', 2],
+    ["fry", 2],
+    ['safeway', 3],
+    ['albertsons', 3],
+    ['whole foods', 4],
+    ['trader joe', 5],
+    ['costco', 6]
+  ];
+  return priorities.find(([key]) => lower.includes(key))?.[1] ?? 20;
+}
+
+async function lookupNearbyGroceryStores(coordinates, mode = 'Delivery') {
+  const radiusMeters = 12000;
+  const query = `
+    [out:json][timeout:12];
+    (
+      node["shop"~"supermarket|grocery|wholesale|convenience"](around:${radiusMeters},${coordinates.latitude},${coordinates.longitude});
+      way["shop"~"supermarket|grocery|wholesale"](around:${radiusMeters},${coordinates.latitude},${coordinates.longitude});
+      relation["shop"~"supermarket|grocery|wholesale"](around:${radiusMeters},${coordinates.latitude},${coordinates.longitude});
+    );
+    out center tags 40;
+  `;
+  const response = await fetchWithStoreTimeout('https://overpass-api.de/api/interpreter', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+    },
+    body: `data=${encodeURIComponent(query)}`
+  }, 14000);
+  if (!response.ok) {
+    throw new Error(`Store lookup failed (${response.status}).`);
+  }
+  const data = await response.json();
+  const stores = (data.elements || [])
+    .map((element) => normalizeRealStore(element, coordinates, mode))
+    .filter((store) => store.name && store.latitude && store.longitude)
+    .filter((store, index, all) => all.findIndex((candidate) => candidate.name === store.name) === index)
+    .sort((a, b) => storePriority(a.name) - storePriority(b.name) || parseFloat(a.distance || '999') - parseFloat(b.distance || '999'))
+    .slice(0, 12);
+  return stores;
 }
 
 const ingredientSets = [
@@ -970,6 +1138,7 @@ async function fetchFoodScan(endpoint, imageUrl, authToken = null) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), FOOD_SCAN_TIMEOUT_MS);
   try {
+    console.log('[AI Scan] request started', { endpoint });
     return await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -992,7 +1161,8 @@ async function fetchFoodScan(endpoint, imageUrl, authToken = null) {
 
 async function scanFoodItemsFromImage(uri, mimeType) {
   if (!FOOD_SCAN_ENDPOINT || (scanEndpointIsDevelopment && !__DEV__)) {
-    console.warn('[FoodScan] Production scan endpoint unavailable. Using review-safe scan results.');
+    const fallbackReason = !FOOD_SCAN_ENDPOINT ? 'missing endpoint' : 'development endpoint in production build';
+    console.warn('[AI Scan] fallback reason', fallbackReason);
     return {
       detections: reviewSafeScanDetections,
       source: 'demo',
@@ -1003,6 +1173,7 @@ async function scanFoodItemsFromImage(uri, mimeType) {
     throw new Error('No image was selected for analysis.');
   }
 
+  console.log('[AI Scan] endpoint used', FOOD_SCAN_ENDPOINT);
   console.log('[FoodScan] Endpoint:', FOOD_SCAN_ENDPOINT);
   console.log('[FoodScan] Image selected:', { uri, mimeType: inferImageMimeType(uri, mimeType) });
   const optimizedImage = await ImageManipulator.manipulateAsync(
@@ -1035,13 +1206,16 @@ async function scanFoodItemsFromImage(uri, mimeType) {
     const authToken = scanEndpointIsDevelopment ? null : await getSupabaseAccessToken();
     response = await fetchFoodScan(FOOD_SCAN_ENDPOINT, imageUrl, authToken);
   } catch (error) {
+    console.error('[AI Scan] fallback reason', error?.message || 'fetch failed');
     console.error('[FoodScan] Fetch failed:', error);
     throw error;
   }
 
   const rawResponse = await response.text();
+  console.log('[AI Scan] response status', response.status);
   console.log('[FoodScan] Raw response:', rawResponse);
   if (!response.ok) {
+    console.error('[AI Scan] fallback reason', `non-200 response ${response.status}`);
     console.error('[FoodScan] Request failed:', { status: response.status, payload: rawResponse });
     let serverDetail = '';
     try {
@@ -2504,6 +2678,18 @@ export default function App() {
   });
   const [authError, setAuthError] = useState('');
   const [authMessage, setAuthMessage] = useState('');
+  const [authDebug, setAuthDebug] = useState({
+    authState: 'Booting',
+    sessionExists: false,
+    supabaseUrlLoaded: supabaseAuthConfig.supabaseUrlLoaded,
+    publishableKeyLoaded: supabaseAuthConfig.publishableKeyLoaded,
+    redirectUrlLoaded: supabaseAuthConfig.redirectUrlLoaded,
+    supabaseUrl: supabaseAuthConfig.supabaseUrl,
+    redirectUrl: supabaseAuthConfig.redirectUrl,
+    persistSession: supabaseAuthConfig.persistSession,
+    autoRefreshToken: supabaseAuthConfig.autoRefreshToken,
+    lastAuthError: ''
+  });
   const [feedbackForm, setFeedbackForm] = useState({
     name: '',
     email: '',
@@ -2548,9 +2734,17 @@ export default function App() {
   const [shoppingStoreFilter, setShoppingStoreFilter] = useState('All Stores');
   const [shoppingLocation, setShoppingLocation] = useState(null);
   const [shoppingLocationDraft, setShoppingLocationDraft] = useState('');
+  const [shoppingAddressFields, setShoppingAddressFields] = useState({ street: '', zip: '', city: '', state: '' });
   const [nearbyStores, setNearbyStores] = useState([]);
   const [shoppingConnectionStatus, setShoppingConnectionStatus] = useState('Not Connected');
   const [isNearbyStoresLoading, setIsNearbyStoresLoading] = useState(false);
+  const [storeLookupDebug, setStoreLookupDebug] = useState({
+    mode: 'fallback',
+    lastAddress: '',
+    coordinates: '',
+    count: 0,
+    error: ''
+  });
   const [globalSearchQuery, setGlobalSearchQuery] = useState('');
   const [fulfillmentMode, setFulfillmentMode] = useState('Delivery');
   const [fulfillmentWindow, setFulfillmentWindow] = useState('Within 2 hours');
@@ -2955,8 +3149,9 @@ export default function App() {
     setShoppingCart(snapshot.shoppingCart || []);
     setShoppingLocation(snapshot.shoppingLocation || null);
     setShoppingLocationDraft(snapshot.shoppingLocation?.address || '');
+    setShoppingAddressFields(addressFieldsFromLocation(snapshot.shoppingLocation || {}));
     setFulfillmentMode(snapshot.shoppingLocation?.fulfillmentMode || 'Delivery');
-    setNearbyStores(snapshot.shoppingLocation ? nearbyStoreOptionsForLocation(snapshot.shoppingLocation, snapshot.shoppingLocation.fulfillmentMode || 'Delivery') : []);
+    setNearbyStores([]);
     setRecentSearches(snapshot.recentSearches || []);
     setOrderHistory(snapshot.orderHistory || []);
     setPreferences(snapshot.preferences || []);
@@ -3204,12 +3399,12 @@ export default function App() {
       const remoteShoppingLocation = remote.preferences.shopping_location?.address
         ? remote.preferences.shopping_location
         : cachedAccount.shoppingLocation;
-      if (remoteShoppingLocation?.address) {
-        setShoppingLocation(remoteShoppingLocation);
-        setShoppingLocationDraft(remoteShoppingLocation.address);
-        setFulfillmentMode(remoteShoppingLocation.fulfillmentMode || 'Delivery');
-        setNearbyStores(nearbyStoreOptionsForLocation(remoteShoppingLocation, remoteShoppingLocation.fulfillmentMode || 'Delivery'));
-      }
+        if (remoteShoppingLocation?.address) {
+          setShoppingLocation(remoteShoppingLocation);
+          setShoppingLocationDraft(remoteShoppingLocation.address);
+          setShoppingAddressFields(addressFieldsFromLocation(remoteShoppingLocation));
+          setFulfillmentMode(remoteShoppingLocation.fulfillmentMode || 'Delivery');
+        }
       await withRestoreTimeout(multiSetCachedForUser(userId, [
         [PREFERENCES_KEY, JSON.stringify(remoteFoodStyles)],
         [DISLIKES_KEY, JSON.stringify(remoteDislikes)],
@@ -3388,7 +3583,9 @@ export default function App() {
       if (supabaseConfigured) {
         try {
           sessionProfile = await getSupabaseSessionProfile();
+          console.log('[FoodFusion Auth] startup session profile:', sessionProfile);
         } catch {
+          console.warn('[FoodFusion Auth] startup session profile failed');
           sessionProfile = null;
         }
       }
@@ -3407,6 +3604,13 @@ export default function App() {
       appleSessionRef.current = Boolean(localAppleProfile);
       setIsLoggedIn(localAppleProfile ? true : supabaseConfigured ? Boolean(sessionProfile) : storedLoggedIn === 'true');
       setUserProfile(activeProfile);
+      setAuthDebug((current) => ({
+        ...current,
+        authState: activeProfile ? 'Logged in' : 'Logged out',
+        sessionExists: Boolean(sessionProfile),
+        sessionUserId: sessionProfile?.id || null,
+        sessionEmail: sessionProfile?.email || null
+      }));
       if (needsRemoteRestore) {
         beginAccountRestore(activeUserId, 'startup session restore');
       } else {
@@ -3436,6 +3640,8 @@ export default function App() {
 
     loadState().catch((error) => {
       console.warn('[FoodFusion Auth] Startup cache load deferred:', error);
+      setAuthError(readableAuthError(error));
+      setAuthDebug((current) => ({ ...current, lastAuthError: readableAuthError(error) }));
       clearAccountRestoreLoading('startup error');
       setAuthBootstrapped(true);
     });
@@ -3448,6 +3654,7 @@ export default function App() {
 
     const stopRefresh = manageSupabaseAutoRefresh();
     const stopObserving = observeSupabaseAuth((profile) => {
+      console.log('[FoodFusion Auth] observeSupabaseAuth profile:', profile);
       if (!profile && appleSessionRef.current) {
         return;
       }
@@ -3462,11 +3669,26 @@ export default function App() {
       }
       setUserProfile(profile);
       setIsLoggedIn(Boolean(profile));
+      setAuthDebug((current) => ({
+        ...current,
+        authState: profile ? 'Logged in' : 'Logged out',
+        sessionExists: Boolean(profile),
+        sessionUserId: profile?.id || null,
+        sessionEmail: profile?.email || null
+      }));
       if (profile) {
+        console.log('[FoodFusion Auth] AsyncStorage auth writes starting:', { userId: profile.id, email: profile.email });
         AsyncStorage.multiSet([
           [AUTH_KEY, 'true'],
           [USER_PROFILE_KEY, JSON.stringify(profile)]
-        ]);
+        ]).then(() => {
+          console.log('[FoodFusion Auth] AsyncStorage auth writes complete');
+        }).catch((error) => {
+          const readable = readableAuthError(error);
+          console.warn('[FoodFusion Auth] AsyncStorage auth writes failed:', error);
+          setAuthError(readable);
+          setAuthDebug((current) => ({ ...current, lastAuthError: readable }));
+        });
         if (restoredUserIdRef.current === nextUserId) {
           console.log('[FoodFusion Restore] Observer hydrate skipped:', { userId: nextUserId });
         } else {
@@ -3563,6 +3785,7 @@ export default function App() {
       }).catch((error) => {
         console.warn('[Account Debug] QA panel refresh failed:', error?.message);
       });
+      refreshAuthDebug().catch(() => {});
     }
   }, [screen]);
 
@@ -3587,6 +3810,43 @@ export default function App() {
     clearTimeout(toastTimeoutRef.current);
     setToast({ id: Date.now(), message });
     toastTimeoutRef.current = setTimeout(() => setToast(null), 2100);
+  }
+
+  async function refreshAuthDebug(extra = {}) {
+    try {
+      const debug = supabaseConfigured
+        ? await withRestoreTimeout(getSupabaseAuthDebug(), 'Auth debug refresh', 2500)
+        : {
+            ...supabaseAuthConfig,
+            sessionExists: false,
+            sessionUserId: null,
+            sessionEmail: null
+          };
+      setAuthDebug((current) => ({
+        ...current,
+        authState: isLoggedIn ? 'Logged in' : 'Logged out',
+        sessionExists: Boolean(debug.sessionExists),
+        sessionUserId: debug.sessionUserId || null,
+        sessionEmail: debug.sessionEmail || null,
+        supabaseUrlLoaded: debug.supabaseUrlLoaded,
+        publishableKeyLoaded: debug.publishableKeyLoaded,
+        redirectUrlLoaded: debug.redirectUrlLoaded,
+        supabaseUrl: debug.supabaseUrl,
+        redirectUrl: debug.redirectUrl,
+        persistSession: debug.persistSession,
+        autoRefreshToken: debug.autoRefreshToken,
+        ...extra
+      }));
+    } catch (error) {
+      const readable = readableAuthError(error);
+      console.warn('[FoodFusion Auth] Debug refresh failed:', error);
+      setAuthDebug((current) => ({
+        ...current,
+        authState: isLoggedIn ? 'Logged in' : 'Logged out',
+        lastAuthError: readable,
+        ...extra
+      }));
+    }
   }
 
   function resetSessionStateForAccountSwitch(options = {}) {
@@ -3624,7 +3884,9 @@ export default function App() {
     setShoppingStoreFilter('All Stores');
     setShoppingLocation(null);
     setShoppingLocationDraft('');
+    setShoppingAddressFields({ street: '', zip: '', city: '', state: '' });
     setNearbyStores([]);
+    setStoreLookupDebug({ mode: 'fallback', lastAddress: '', coordinates: '', count: 0, error: '' });
     setFulfillmentMode('Delivery');
     setOrderConfirmation(null);
     setOrderHistory([]);
@@ -3918,6 +4180,7 @@ export default function App() {
       });
     } catch (error) {
       console.error('[FoodScan] Scan failed:', error);
+      console.warn('[AI Scan] fallback reason', error?.message || 'scan failed');
       const scannedIngredients = reviewSafeScanDetections.map((item) => item.name);
       await completeScan(scannedIngredients, nextScreen, reviewSafeScanNotice, {
         detections: reviewSafeScanDetections,
@@ -4285,40 +4548,70 @@ export default function App() {
         })));
         setShoppingNotice('');
       } else {
-        setShoppingResults(localShoppingSearch(query));
+        setShoppingResults(nearbyStores.length > 0 ? localShoppingSearch(query) : []);
         setShoppingConnectionStatus('Not Connected');
-        setShoppingNotice('Live availability unavailable. Showing store options for your area.');
+        setShoppingNotice(nearbyStores.length > 0
+          ? 'Live item availability unavailable. Showing products matched to nearby stores.'
+          : 'Couldn’t find stores near this address.');
       }
     } catch {
-      setShoppingResults(localShoppingSearch(query));
+      setShoppingResults(nearbyStores.length > 0 ? localShoppingSearch(query) : []);
       setShoppingConnectionStatus('Not Connected');
-      setShoppingNotice('Live availability unavailable. Showing store options for your area.');
+      setShoppingNotice(nearbyStores.length > 0
+        ? 'Live item availability unavailable. Showing products matched to nearby stores.'
+        : 'Couldn’t find stores near this address.');
     } finally {
       setIsShoppingLoading(false);
     }
   }
 
   async function loadNearbyStores(location = shoppingLocation, mode = fulfillmentMode) {
-    if (!location?.address) {
+    const fields = compactAddressFields(location?.addressFields || shoppingAddressFields);
+    if (!fields.fullAddress) {
       return;
     }
     setIsNearbyStoresLoading(true);
     setShoppingNotice('');
     try {
-      const result = await findInstacartStores(location, mode);
-      if (result.connected && result.stores.length > 0) {
-        setNearbyStores(result.stores);
+      console.log('[Store Lookup] address fields', fields);
+      console.log('[Store Lookup] API/source used', 'Nominatim geocode');
+      const geocode = await geocodeShoppingLocation(fields);
+      console.log('[Store Lookup] API/source used', 'Overpass grocery store lookup');
+      let stores = await lookupNearbyGroceryStores(geocode, mode);
+      if (stores.length === 0) {
+        const result = await findInstacartStores({ ...location, coordinates: geocode }, mode);
+        stores = result.connected ? result.stores : [];
+        console.log('[Store Lookup] API/source used', result.connected ? 'Instacart MCP' : 'No store source');
+      }
+      console.log('[Store Lookup] stores returned count', stores.length);
+      if (stores.length > 0) {
+        setNearbyStores(stores);
         setShoppingConnectionStatus('Connected');
+        setStoreLookupDebug({
+          mode: 'production',
+          lastAddress: fields.fullAddress,
+          coordinates: `${geocode.latitude.toFixed(5)}, ${geocode.longitude.toFixed(5)}`,
+          count: stores.length,
+          error: ''
+        });
       } else {
-        setNearbyStores(nearbyStoreOptionsForLocation(location, mode));
-        setShoppingConnectionStatus('Not Connected');
-        setShoppingNotice('Live availability unavailable. Confirm pricing and times at checkout.');
+        throw new Error('Couldn’t find stores near this address');
       }
       setShoppingResults([]);
-    } catch {
-      setNearbyStores(nearbyStoreOptionsForLocation(location, mode));
+    } catch (error) {
+      const message = error?.message || 'Couldn’t find stores near this address';
+      console.warn('[Store Lookup] failed:', message);
+      console.log('[Store Lookup] stores returned count', 0);
+      setNearbyStores([]);
       setShoppingConnectionStatus('Not Connected');
-      setShoppingNotice('Live availability unavailable. Confirm pricing and times at checkout.');
+      setShoppingNotice('Couldn’t find stores near this address');
+      setStoreLookupDebug({
+        mode: 'fallback',
+        lastAddress: fields.fullAddress,
+        coordinates: '',
+        count: 0,
+        error: message
+      });
       setShoppingResults([]);
     } finally {
       setIsNearbyStoresLoading(false);
@@ -4326,18 +4619,30 @@ export default function App() {
   }
 
   async function saveShoppingLocation() {
-    const address = shoppingLocationDraft.trim();
-    if (address.length < 3) {
-      Alert.alert('Shopping Location', 'Enter an address or ZIP code to find stores.');
+    const fields = compactAddressFields(shoppingAddressFields);
+    if (!fields.fullAddress || (!fields.zip && !(fields.city && fields.state) && fields.fullAddress.length < 3)) {
+      Alert.alert('Shopping Location', 'Enter a street address, ZIP code, or city and state to find stores.');
       return;
     }
-    const nextLocation = { address, fulfillmentMode };
+    const nextLocation = { address: fields.fullAddress, addressFields: fields, fulfillmentMode };
     setShoppingLocation(nextLocation);
+    setShoppingLocationDraft(fields.fullAddress);
     setShoppingStoreFilter('All Stores');
     await updateOfflineCache(setCachedItem(SHOPPING_LOCATION_KEY, JSON.stringify(nextLocation)));
     syncQuietly('shopping location', () => syncUserPreferences(preferenceSnapshot({ shoppingLocation: nextLocation })));
     await loadNearbyStores(nextLocation, fulfillmentMode);
     setScreen('shoppingStores');
+  }
+
+  function updateShoppingAddressField(key, value) {
+    setShoppingAddressFields((current) => {
+      const next = { ...current, [key]: value };
+      setShoppingLocationDraft(compactAddressFields(next).fullAddress);
+      return next;
+    });
+    if (shoppingNotice) {
+      setShoppingNotice('');
+    }
   }
 
   async function updateShoppingFulfillment(mode) {
@@ -4931,6 +5236,7 @@ export default function App() {
   async function finishAuth(profile, options = {}) {
     const appleSession = Boolean(options.appleSession);
     const nextUserId = stableUserId(profile);
+    console.log('[FoodFusion Auth] finishAuth starting:', { nextUserId, email: profile?.email, appleSession });
     if (nextUserId !== activeUserIdRef.current) {
       resetSessionStateForAccountSwitch();
     }
@@ -4945,6 +5251,7 @@ export default function App() {
     setAuthError('');
     setAuthMessage('');
     try {
+      console.log('[FoodFusion Auth] AsyncStorage session writes starting:', { nextUserId, appleSession });
       await Promise.all([
         AsyncStorage.setItem(AUTH_KEY, 'true'),
         AsyncStorage.setItem(USER_PROFILE_KEY, JSON.stringify(profile)),
@@ -4953,6 +5260,15 @@ export default function App() {
           ? AsyncStorage.setItem(APPLE_AUTH_KEY, 'true')
           : AsyncStorage.removeItem(APPLE_AUTH_KEY)
       ]);
+      console.log('[FoodFusion Auth] AsyncStorage session writes complete');
+      setAuthDebug((current) => ({
+        ...current,
+        authState: 'Logged in',
+        sessionExists: true,
+        sessionUserId: nextUserId,
+        sessionEmail: profile?.email || '',
+        lastAuthError: ''
+      }));
       if (appleSession) {
         setSyncState({ status: 'offline', message: 'Saved on this device' });
         await preloadReviewDemoData(profile);
@@ -4960,7 +5276,10 @@ export default function App() {
         await hydrateSyncedUserData(profile);
       }
     } catch (error) {
-      // Keep auth usable even if local persistence temporarily fails.
+      const readable = readableAuthError(error);
+      console.warn('[FoodFusion Auth] finishAuth persistence failure:', error);
+      setAuthError(readable);
+      setAuthDebug((current) => ({ ...current, lastAuthError: readable }));
     }
   }
 
@@ -4976,17 +5295,35 @@ export default function App() {
     }
 
     try {
+      setAuthError('');
+      setAuthMessage('Signing in...');
+      setAuthDebug((current) => ({ ...current, authState: 'Signing in', lastAuthError: '' }));
+      console.log('[FoodFusion Auth] Login requested:', {
+        email,
+        supabaseConfigured,
+        supabaseUrlLoaded: supabaseAuthConfig.supabaseUrlLoaded,
+        publishableKeyLoaded: supabaseAuthConfig.publishableKeyLoaded,
+        redirectUrlLoaded: supabaseAuthConfig.redirectUrlLoaded,
+        supabaseUrl: supabaseAuthConfig.supabaseUrl
+      });
       if (supabaseConfigured) {
         const profile = await signInWithSupabase(email, authForm.password);
         await finishAuth(profile);
+        setAuthMessage('');
+        await refreshAuthDebug({ lastAuthError: '' });
         return;
       }
       await finishAuth({
         name: email.split('@')[0] || 'FoodFusion User',
         email
       });
-    } catch {
-      setAuthError('Unable to log in. Check your email and password.');
+      setAuthMessage('');
+    } catch (error) {
+      const readable = readableAuthError(error);
+      console.warn('[FoodFusion Auth] Login failed:', error);
+      setAuthMessage('');
+      setAuthError(readable);
+      setAuthDebug((current) => ({ ...current, authState: 'Login failed', lastAuthError: readable }));
     }
   }
 
@@ -5007,6 +5344,14 @@ export default function App() {
     }
 
     try {
+      setAuthError('');
+      setAuthMessage('Creating account...');
+      setAuthDebug((current) => ({ ...current, authState: 'Signing up', lastAuthError: '' }));
+      console.log('[FoodFusion Auth] Sign up requested:', {
+        email,
+        supabaseConfigured,
+        supabaseUrl: supabaseAuthConfig.supabaseUrl
+      });
       if (supabaseConfigured) {
         const result = await signUpWithSupabase(name, email, authForm.password);
         if (result.confirmationRequired) {
@@ -5016,24 +5361,42 @@ export default function App() {
           return;
         }
         await finishAuth(result.profile);
+        setAuthMessage('');
+        await refreshAuthDebug({ lastAuthError: '' });
         return;
       }
       await finishAuth({
         name: name || email.split('@')[0] || 'FoodFusion User',
         email
       });
-    } catch {
-      setAuthError('Unable to create your account right now.');
+      setAuthMessage('');
+    } catch (error) {
+      const readable = readableAuthError(error);
+      console.warn('[FoodFusion Auth] Sign up failed:', error);
+      setAuthMessage('');
+      setAuthError(readable);
+      setAuthDebug((current) => ({ ...current, authState: 'Sign up failed', lastAuthError: readable }));
     }
   }
 
   async function handleContinueWithApple() {
-    await finishAuth({
-      id: 'review-demo-apple-user',
-      name: 'Apple User',
-      email: 'apple.user@privaterelay.appleid.com',
-      provider: 'apple'
-    }, { appleSession: true });
+    try {
+      setAuthError('');
+      setAuthMessage('Signing in...');
+      console.log('[FoodFusion Auth] Apple local demo sign-in requested');
+      await finishAuth({
+        id: 'review-demo-apple-user',
+        name: 'Apple User',
+        email: 'apple.user@privaterelay.appleid.com',
+        provider: 'apple'
+      }, { appleSession: true });
+      setAuthMessage('');
+    } catch (error) {
+      const readable = readableAuthError(error);
+      setAuthMessage('');
+      setAuthError(readable);
+      setAuthDebug((current) => ({ ...current, authState: 'Apple sign in failed', lastAuthError: readable }));
+    }
   }
 
   function handleForgotPassword() {
@@ -5055,12 +5418,15 @@ export default function App() {
       }
       setAuthError('');
       setAuthMessage('Password reset instructions have been sent.');
-    } catch {
-      setAuthError('Unable to send password reset instructions right now.');
+    } catch (error) {
+      const readable = readableAuthError(error);
+      setAuthError(readable);
+      setAuthDebug((current) => ({ ...current, lastAuthError: readable }));
     }
   }
 
   async function logout() {
+    console.log('[FoodFusion Auth] Logout requested');
     appleSessionRef.current = false;
     activeUserIdRef.current = null;
     resetSessionStateForAccountSwitch({ loading: false });
@@ -5075,10 +5441,21 @@ export default function App() {
       if (supabaseConfigured) {
         await signOutOfSupabase();
       }
+      console.log('[FoodFusion Auth] AsyncStorage logout writes starting');
       await AsyncStorage.multiSet([[AUTH_KEY, 'false']]);
       await AsyncStorage.multiRemove([APPLE_AUTH_KEY, USER_PROFILE_KEY]);
+      console.log('[FoodFusion Auth] AsyncStorage logout writes complete');
+      setAuthDebug((current) => ({
+        ...current,
+        authState: 'Logged out',
+        sessionExists: false,
+        sessionUserId: null,
+        sessionEmail: null
+      }));
     } catch (error) {
-      // Visible logout should still complete if persistence temporarily fails.
+      const readable = readableAuthError(error);
+      console.warn('[FoodFusion Auth] Logout persistence failure:', error);
+      setAuthDebug((current) => ({ ...current, lastAuthError: readable }));
     }
   }
 
@@ -6663,17 +7040,27 @@ export default function App() {
           <FlowProgress steps={['Location', 'Stores', 'Cart']} current={0} tone={flowColors.shopping} />
           <View style={[styles.shopSearchCard, { borderColor: flowColors.shopping.tint }]}>
             <Text style={[styles.shopTitle, { color: flowColors.shopping.accent }]}>Find Stores Near You</Text>
-            <Text style={styles.settingsSubtitle}>Enter your delivery address or ZIP code to see store options.</Text>
-            <Text style={styles.filterLabel}>Address or ZIP code</Text>
-            <TextInput
-              value={shoppingLocationDraft}
-              onChangeText={setShoppingLocationDraft}
-              onSubmitEditing={saveShoppingLocation}
-              placeholder="85001 or 123 Main Street"
-              placeholderTextColor={palette.muted}
-              autoCapitalize="words"
-              style={styles.locationInput}
-            />
+            <Text style={styles.settingsSubtitle}>Enter a full address, ZIP code, or city and state to see nearby real grocery stores.</Text>
+            {[
+              ['street', 'Street Address', '123 Main Street'],
+              ['zip', 'ZIP Code', '85001'],
+              ['city', 'City', 'Phoenix'],
+              ['state', 'State', 'AZ']
+            ].map(([key, label, placeholder]) => (
+              <View key={key}>
+                <Text style={styles.filterLabel}>{label}</Text>
+                <TextInput
+                  value={shoppingAddressFields[key]}
+                  onChangeText={(value) => updateShoppingAddressField(key, value)}
+                  onSubmitEditing={saveShoppingLocation}
+                  placeholder={placeholder}
+                  placeholderTextColor={palette.muted}
+                  autoCapitalize={key === 'state' ? 'characters' : 'words'}
+                  keyboardType={key === 'zip' ? 'number-pad' : 'default'}
+                  style={styles.locationInput}
+                />
+              </View>
+            ))}
             <View style={styles.fulfillmentToggle}>
               {['Delivery', 'Pickup'].map((mode) => (
                 <Pressable
@@ -6693,6 +7080,11 @@ export default function App() {
           <Button accent={flowColors.shopping.accent} onPress={saveShoppingLocation} disabled={isNearbyStoresLoading}>
             {isNearbyStoresLoading ? 'Finding Stores...' : 'Save Location'}
           </Button>
+          {shoppingNotice ? (
+            <View style={styles.noticeCard}>
+              <Text style={styles.noticeText}>{shoppingNotice}</Text>
+            </View>
+          ) : null}
           {isNearbyStoresLoading ? <LoadingState text="Finding stores..." rows={3} tone={flowColors.shopping} /> : null}
         </ScrollView>
         <BottomTabs active="shopping" onNavigate={navigateTab} />
@@ -6711,6 +7103,9 @@ export default function App() {
             <Text style={styles.shopItemMeta}>{shoppingConnectionStatus === 'Connected' ? 'Live store availability connected' : 'Live availability unavailable. Confirm details at checkout.'}</Text>
           </View>
           {isNearbyStoresLoading ? <LoadingState text="Finding stores..." rows={4} tone={flowColors.shopping} /> : null}
+          {!isNearbyStoresLoading && shoppingNotice ? (
+            <EmptyState title="No stores found" text={shoppingNotice} tone={flowColors.shopping} symbol="!" />
+          ) : null}
           {!isNearbyStoresLoading && nearbyStores.map((store) => (
             <Pressable
               key={store.id}
@@ -7648,6 +8043,12 @@ export default function App() {
           </View>
 
           <View style={styles.settingsCard}>
+            <Text style={styles.settingsTitle}>QA Checklist</Text>
+            <Text style={styles.settingsSubtitle}>Open account restore diagnostics for subscription, favorites, and recents.</Text>
+            <Button accent={flowColors.profile.accent} onPress={() => setScreen('launchChecklist')}>QA Checklist</Button>
+          </View>
+
+          <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Subscription</Text>
             <Text style={styles.settingsSubtitle}>
               {fusionStatusLoading ? 'Checking Fusion+ status...' : isPremium ? `Fusion+ Active • ${plan.name} ${plan.price}${plan.cadence}` : 'Fusion Free • 1 scan daily'}
@@ -7912,7 +8313,15 @@ export default function App() {
               ['Build number', APP_BUILD_NUMBER],
               ['Supabase client', supabaseConfigured ? 'Configured' : 'Not configured'],
               ['AI scan endpoint', scanEndpointStatus],
+              ['FOOD_SCAN_ENDPOINT value', FOOD_SCAN_ENDPOINT || 'Missing'],
+              ['MCP endpoint value', RECIPE_MCP_ENDPOINT || 'Missing'],
+              ['Current AI mode', aiScanMode],
               ['Development bridge', scanEndpointIsDevelopment ? 'In use' : 'Not in use'],
+              ['Store lookup mode', storeLookupDebug.mode],
+              ['Last searched address', storeLookupDebug.lastAddress || 'None'],
+              ['Last geocode coordinates', storeLookupDebug.coordinates || 'None'],
+              ['Store count returned', `${storeLookupDebug.count}`],
+              ['Last store lookup error', storeLookupDebug.error || 'None'],
               ['Support email', SUPPORT_EMAIL]
             ].map(([label, value]) => (
               <View key={label} style={styles.launchRow}>
@@ -7920,6 +8329,29 @@ export default function App() {
                 <Text style={styles.launchValue}>{value}</Text>
               </View>
             ))}
+          </View>
+          <View style={styles.settingsCard}>
+            <Text style={styles.settingsTitle}>Auth Debug</Text>
+            {[
+              ['Current auth state', authDebug.authState],
+              ['Current session exists', authDebug.sessionExists ? 'true' : 'false'],
+              ['Supabase URL loaded', authDebug.supabaseUrlLoaded ? 'true' : 'false'],
+              ['Publishable key loaded', authDebug.publishableKeyLoaded ? 'true' : 'false'],
+              ['Redirect URL loaded', authDebug.redirectUrlLoaded ? 'true' : 'false'],
+              ['Supabase URL', authDebug.supabaseUrl || 'Missing'],
+              ['Redirect URL', authDebug.redirectUrl || 'Missing'],
+              ['persistSession', authDebug.persistSession ? 'true' : 'false'],
+              ['autoRefreshToken', authDebug.autoRefreshToken ? 'true' : 'false'],
+              ['Session user ID', authDebug.sessionUserId || 'None'],
+              ['Session email', authDebug.sessionEmail || 'None'],
+              ['Last auth error', authDebug.lastAuthError || 'None']
+            ].map(([label, value]) => (
+              <View key={label} style={styles.launchRow}>
+                <Text style={styles.launchLabel}>{label}</Text>
+                <Text style={styles.launchValue}>{value}</Text>
+              </View>
+            ))}
+            <Button variant="ghost" onPress={() => refreshAuthDebug()}>Refresh Auth Debug</Button>
           </View>
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Account Diagnostics</Text>

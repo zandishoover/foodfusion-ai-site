@@ -17,6 +17,18 @@ const usesSetupPlaceholder =
 
 export const supabaseConfigured = Boolean(supabaseUrl && supabaseKey && !usesSetupPlaceholder);
 
+export const supabaseAuthConfig = {
+  supabaseConfigured,
+  supabaseUrlLoaded: Boolean(supabaseUrl),
+  publishableKeyLoaded: Boolean(supabaseKey),
+  redirectUrlLoaded: Boolean(authRedirectUrl),
+  supabaseUrl: supabaseUrl || '',
+  redirectUrl: authRedirectUrl || '',
+  persistSession: true,
+  autoRefreshToken: true,
+  detectSessionInUrl: false
+};
+
 // GoTrue's auto-refresh tick probes the auth lock with a zero timeout.
 // In one React Native JS process, queue that probe behind in-flight auth work
 // instead of logging a harmless timeout while AsyncStorage is being read.
@@ -53,14 +65,22 @@ function profileFromUser(user) {
 
 async function getSupabaseSession() {
   if (!supabase) {
+    console.log('[Supabase Auth] getSession skipped: client not configured');
     return null;
   }
   if (!sessionRequest) {
+    console.log('[Supabase Auth] getSession request starting');
     sessionRequest = supabase.auth.getSession()
       .then(({ data, error }) => {
         if (error) {
+          console.warn('[Supabase Auth] getSession error:', error);
           throw error;
         }
+        console.log('[Supabase Auth] getSession response:', {
+          sessionExists: Boolean(data.session),
+          userId: data.session?.user?.id || null,
+          email: data.session?.user?.email || null
+        });
         return data.session || null;
       })
       .finally(() => {
@@ -80,23 +100,66 @@ export async function getSupabaseAccessToken() {
   return session?.access_token || null;
 }
 
+export async function getSupabaseAuthDebug() {
+  const session = await getSupabaseSession();
+  return {
+    ...supabaseAuthConfig,
+    sessionExists: Boolean(session),
+    sessionUserId: session?.user?.id || null,
+    sessionEmail: session?.user?.email || null
+  };
+}
+
 export async function signInWithSupabase(email, password) {
+  console.log('[Supabase Auth] signInWithPassword request:', {
+    email,
+    supabaseUrlLoaded: Boolean(supabaseUrl),
+    publishableKeyLoaded: Boolean(supabaseKey),
+    redirectUrlLoaded: Boolean(authRedirectUrl)
+  });
+  if (!supabase) {
+    const error = new Error('Supabase auth is not configured in this build.');
+    console.warn('[Supabase Auth] signInWithPassword unavailable:', error.message);
+    throw error;
+  }
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  console.log('[Supabase Auth] signInWithPassword response:', {
+    hasUser: Boolean(data?.user),
+    hasSession: Boolean(data?.session),
+    userId: data?.user?.id || null,
+    email: data?.user?.email || null,
+    error: error ? { message: error.message, status: error.status, name: error.name } : null
+  });
   if (error) {
     throw error;
   }
+  console.log('[Supabase Auth] session creation:', {
+    sessionExists: Boolean(data.session),
+    expiresAt: data.session?.expires_at || null
+  });
   return profileFromUser(data.user);
 }
 
 export async function signUpWithSupabase(name, email, password) {
+  console.log('[Supabase Auth] signUp request:', { email, nameProvided: Boolean(name) });
+  if (!supabase) {
+    throw new Error('Supabase auth is not configured in this build.');
+  }
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
     options: { data: { name } }
   });
   if (error) {
+    console.warn('[Supabase Auth] signUp error:', error);
     throw error;
   }
+  console.log('[Supabase Auth] signUp response:', {
+    hasUser: Boolean(data.user),
+    hasSession: Boolean(data.session),
+    userId: data.user?.id || null,
+    email: data.user?.email || null
+  });
   return {
     profile: profileFromUser(data.user),
     confirmationRequired: Boolean(data.user && !data.session)
@@ -104,6 +167,9 @@ export async function signUpWithSupabase(name, email, password) {
 }
 
 export async function resetSupabasePassword(email) {
+  if (!authRedirectUrl) {
+    console.warn('[Supabase Auth] reset password requested without redirect URI');
+  }
   const { error } = await supabase.auth.resetPasswordForEmail(
     email,
     authRedirectUrl ? { redirectTo: authRedirectUrl } : undefined
@@ -128,6 +194,12 @@ export function observeSupabaseAuth(onChange) {
     return () => {};
   }
   const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+    console.log('[Supabase Auth] auth state change event:', {
+      event: _event,
+      sessionExists: Boolean(session),
+      userId: session?.user?.id || null,
+      email: session?.user?.email || null
+    });
     onChange(profileFromUser(session?.user));
   });
   return () => data.subscription.unsubscribe();
