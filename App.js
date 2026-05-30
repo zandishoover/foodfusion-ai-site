@@ -99,6 +99,7 @@ const FAVORITE_SCANS_KEY = 'foodfusion:favoriteScans';
 const RECENT_SEARCHES_KEY = 'foodfusion:recentSearches';
 const QA_CHECKLIST_KEY = 'foodfusion:qaChecklist';
 const BETA_FEEDBACK_EMAIL = 'zandis.hoover04@gmail.com';
+const ACCOUNT_RESTORE_TIMEOUT_MS = 4500;
 const USER_SCOPED_CACHE_KEYS = new Set([
   SCAN_KEY,
   PREMIUM_KEY,
@@ -149,6 +150,14 @@ function parseStoredJson(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function withRestoreTimeout(promise, label, ms = ACCOUNT_RESTORE_TIMEOUT_MS) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`${label} timed out.`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
 function isReviewDemoProfile(profile) {
@@ -2761,6 +2770,45 @@ export default function App() {
     };
   }
 
+  function emptyAccountRestoreSnapshot() {
+    return {
+      scanDate: null,
+      subscription: null,
+      history: [],
+      favoriteScanIds: [],
+      favorites: [],
+      groceryList: [],
+      shoppingCart: [],
+      shoppingLocation: null,
+      recentSearches: [],
+      orderHistory: [],
+      preferences: [],
+      dislikes: [],
+      servings: 2,
+      equipment: 'Stove',
+      recipeFeedback: { yes: [], nah: [] },
+      scanCountToday: 0,
+      groceryChecked: {},
+      pantryItems: [],
+      planner: {},
+      recipeSource: 'Hybrid Mode',
+      ingredientStatuses: {},
+      equipmentProfile: ['stove', 'microwave'],
+      recipeRatings: { loved: [], fine: [], never: [] },
+      householdMembers: ['You'],
+      budgetGoals: { weeklyBudget: '120', proteinGoal: '160', calorieTarget: '2200' },
+      macroLock: '200g protein',
+      socialPosts: [],
+      notificationPreferences: {
+        recipeIdeas: true,
+        groceryReminders: true,
+        orderUpdates: true,
+        fusionUpdates: false
+      },
+      notificationsEnabled: false
+    };
+  }
+
   function mergeAccountHistory(remoteHistory = [], cachedHistory = []) {
     const seen = new Set();
     return [...remoteHistory, ...cachedHistory].filter((entry) => {
@@ -2945,7 +2993,11 @@ export default function App() {
       const activeProfile = localAppleProfile || (supabaseConfigured ? sessionProfile : storedUserProfile ? JSON.parse(storedUserProfile) : null);
       const activeUserId = stableUserId(activeProfile);
       activeUserIdRef.current = activeUserId;
-      const cachedAccount = await readAccountRestoreCache(activeUserId);
+      const cachedAccount = await withRestoreTimeout(
+        readAccountRestoreCache(activeUserId),
+        'Startup account cache restore',
+        2500
+      ).catch(() => emptyAccountRestoreSnapshot());
       const needsRemoteRestore = Boolean(sessionProfile) && !localAppleProfile;
       appleSessionRef.current = Boolean(localAppleProfile);
       setIsLoggedIn(localAppleProfile ? true : supabaseConfigured ? Boolean(sessionProfile) : storedLoggedIn === 'true');
@@ -2965,7 +3017,7 @@ export default function App() {
       setCameraPermissionIntroSeen(storedCameraPermissionIntro === 'true');
       setQaChecklist(storedQaChecklist ? JSON.parse(storedQaChecklist) : {});
       if (needsRemoteRestore) {
-        await hydrateSyncedUserData();
+        await hydrateSyncedUserData(activeProfile);
       } else if (localAppleProfile && isReviewDemoProfile(localAppleProfile) && cachedAccount.history.length === 0) {
         await preloadReviewDemoData(localAppleProfile);
         setSubscriptionLoading(false);
@@ -3009,7 +3061,7 @@ export default function App() {
           [AUTH_KEY, 'true'],
           [USER_PROFILE_KEY, JSON.stringify(profile)]
         ]);
-        hydrateSyncedUserData();
+        hydrateSyncedUserData(profile);
       } else {
         activeUserIdRef.current = null;
         AsyncStorage.setItem(AUTH_KEY, 'false');
@@ -3198,6 +3250,11 @@ export default function App() {
     if (!isReviewDemoProfile(profile)) {
       return;
     }
+    const cachedAccount = await withRestoreTimeout(
+      readAccountRestoreCache(stableUserId(profile)),
+      'Demo account cache restore',
+      2500
+    ).catch(() => ({ subscription: null }));
     const history = demoSafeHistory();
     const demoIngredients = reviewSafeScanDetections.map((item) => item.name);
     setIngredients(demoIngredients);
@@ -3209,21 +3266,28 @@ export default function App() {
     setFavoriteScanIds([]);
     setOrderHistory([]);
     setShoppingCart([]);
-    setIsPremium(true);
-    setSelectedFusionPlan('yearly');
+    setIsPremium(Boolean(cachedAccount.subscription?.isPremium));
+    setSelectedFusionPlan(cachedAccount.subscription?.selectedPlan || 'yearly');
     setScanDate(todayKey());
     setScanCountToday(1);
-    await multiSetCached([
-      [HISTORY_KEY, JSON.stringify(history)],
-      [FAVORITES_KEY, JSON.stringify([])],
-      [FAVORITE_SCANS_KEY, JSON.stringify([])],
-      [ORDER_HISTORY_KEY, JSON.stringify([])],
-      [SHOPPING_CART_KEY, JSON.stringify([])],
-      [PREMIUM_KEY, 'true'],
-      [PREMIUM_PLAN_KEY, 'yearly'],
-      [SCAN_KEY, todayKey()],
-      [SCAN_COUNT_KEY, '1']
-    ]);
+    try {
+      await withRestoreTimeout(multiSetCached([
+        [HISTORY_KEY, JSON.stringify(history)],
+        [FAVORITES_KEY, JSON.stringify([])],
+        [FAVORITE_SCANS_KEY, JSON.stringify([])],
+        [ORDER_HISTORY_KEY, JSON.stringify([])],
+        [SHOPPING_CART_KEY, JSON.stringify([])],
+        [PREMIUM_KEY, cachedAccount.subscription?.isPremium ? 'true' : 'false'],
+        [PREMIUM_PLAN_KEY, cachedAccount.subscription?.selectedPlan || 'yearly'],
+        [SCAN_KEY, todayKey()],
+        [SCAN_COUNT_KEY, '1']
+      ]), 'Demo account cache seed', 2500);
+    } catch (error) {
+      console.warn('[FoodFusion Sync] Demo account cache seed deferred:', error);
+    } finally {
+      setSubscriptionLoading(false);
+      setHistoryLoading(false);
+    }
   }
 
   async function updateOfflineCache(operation) {
@@ -3252,7 +3316,7 @@ export default function App() {
         if (!queuedUserId || queuedUserId !== activeUserIdRef.current) {
           return null;
         }
-        return operation();
+        return withRestoreTimeout(operation(), `${label} sync`);
       })
       .then(() => setSyncState({ status: 'synced', message: 'Synced to your account' }))
       .catch((error) => {
@@ -3280,7 +3344,7 @@ export default function App() {
     };
   }
 
-  async function hydrateSyncedUserData() {
+  async function hydrateSyncedUserData(profileOverride = userProfile) {
     if (!supabaseConfigured || appleSessionRef.current) {
       setSubscriptionLoading(false);
       setHistoryLoading(false);
@@ -3298,8 +3362,23 @@ export default function App() {
     setHistoryLoading(true);
     try {
       setSyncState({ status: 'loading', message: 'Checking Fusion+ status...' });
-      const cachedAccount = await readAccountRestoreCache(hydrateUserId);
-      const remote = await loadSyncedUserData();
+      let cachedAccount = await withRestoreTimeout(
+        readAccountRestoreCache(hydrateUserId),
+        'Local account cache restore',
+        2500
+      ).catch((error) => {
+        console.warn('[FoodFusion Sync] Local account cache restore deferred:', error);
+        return emptyAccountRestoreSnapshot();
+      });
+      if (isReviewDemoProfile(profileOverride) && cachedAccount.history.length === 0) {
+        await preloadReviewDemoData(profileOverride);
+        cachedAccount = await withRestoreTimeout(
+          readAccountRestoreCache(hydrateUserId),
+          'Demo account cache restore',
+          2500
+        ).catch(() => cachedAccount);
+      }
+      const remote = await withRestoreTimeout(loadSyncedUserData(), 'Supabase account restore');
       if (hydrateRunId !== accountHydrateRef.current || hydrateUserId !== activeUserIdRef.current) {
         return;
       }
@@ -3404,7 +3483,11 @@ export default function App() {
         if (hydrateRunId !== accountHydrateRef.current) {
           return;
         }
-        const cachedAccount = await readAccountRestoreCache(activeUserIdRef.current);
+        const cachedAccount = await withRestoreTimeout(
+          readAccountRestoreCache(activeUserIdRef.current),
+          'Fallback account cache restore',
+          2500
+        ).catch(() => emptyAccountRestoreSnapshot());
         applyAccountCacheSnapshot(cachedAccount);
         if (!cachedAccount.subscription) {
           setIsPremium(false);
@@ -3643,7 +3726,10 @@ export default function App() {
         setCachedItem(PREMIUM_PLAN_KEY, selectedFusionPlan)
       ]));
       if (supabaseConfigured && isLoggedIn && !appleSessionRef.current) {
-        await syncSubscriptionStatus({ isPremium: true, selectedPlan: selectedFusionPlan });
+        await withRestoreTimeout(
+          syncSubscriptionStatus({ isPremium: true, selectedPlan: selectedFusionPlan }),
+          'Subscription activation sync'
+        );
         setSyncState({ status: 'synced', message: 'Synced to your account' });
       }
       hapticSuccess();
@@ -3667,7 +3753,10 @@ export default function App() {
       ]));
     try {
       if (supabaseConfigured && isLoggedIn && !appleSessionRef.current) {
-        await syncSubscriptionStatus({ isPremium: true, selectedPlan: selectedFusionPlan || 'yearly' });
+        await withRestoreTimeout(
+          syncSubscriptionStatus({ isPremium: true, selectedPlan: selectedFusionPlan || 'yearly' }),
+          'Restore purchase sync'
+        );
         await hydrateSyncedUserData();
       } else {
         setSyncState({ status: 'offline', message: 'Saved on this device' });
@@ -3693,7 +3782,10 @@ export default function App() {
       ]));
     try {
       if (supabaseConfigured && isLoggedIn && !appleSessionRef.current) {
-        await syncSubscriptionStatus({ isPremium: false, selectedPlan: 'yearly' });
+        await withRestoreTimeout(
+          syncSubscriptionStatus({ isPremium: false, selectedPlan: 'yearly' }),
+          'Subscription cancellation sync'
+        );
         setSyncState({ status: 'synced', message: 'Synced to your account' });
       }
     } catch (error) {
@@ -4510,7 +4602,7 @@ export default function App() {
         setSyncState({ status: 'offline', message: 'Saved on this device' });
         await preloadReviewDemoData(profile);
       } else if (supabaseConfigured) {
-        await hydrateSyncedUserData();
+        await hydrateSyncedUserData(profile);
       }
     } catch (error) {
       // Keep auth usable even if local persistence temporarily fails.
