@@ -2637,7 +2637,19 @@ export default function App() {
     isPremium: false,
     selectedPlan: 'yearly',
     favoriteCount: 0,
-    recentCount: 0
+    recentCount: 0,
+    subscriptionCacheKey: '',
+    subscriptionCacheRaw: '',
+    supabaseSubscriptionRow: '',
+    favoritesCacheKey: '',
+    favoritesCacheRaw: '',
+    supabaseFavoritesRows: '',
+    recentsCacheKey: '',
+    recentsCacheRaw: '',
+    supabaseRecentRows: '',
+    lastRestoreFunction: '',
+    lastRestoreError: '',
+    restoreTimestamp: ''
   });
   const [qaChecklist, setQaChecklist] = useState({});
   const recipePagerRef = useRef(null);
@@ -2657,11 +2669,20 @@ export default function App() {
   }
 
   async function getCachedItem(key, userId = activeUserIdRef.current) {
-    return AsyncStorage.getItem(cacheKey(key, userId));
+    const exactKey = cacheKey(key, userId);
+    const value = await AsyncStorage.getItem(exactKey);
+    if ([PREMIUM_KEY, PREMIUM_PLAN_KEY, FAVORITES_KEY, HISTORY_KEY].includes(key)) {
+      console.log('[Account Debug] cache restored', { logicalKey: key, exactKey, userId, value });
+    }
+    return value;
   }
 
   async function setCachedItem(key, value) {
-    return AsyncStorage.setItem(cacheKey(key), value);
+    const exactKey = cacheKey(key);
+    if ([PREMIUM_KEY, PREMIUM_PLAN_KEY, FAVORITES_KEY, HISTORY_KEY].includes(key)) {
+      console.log('[Account Debug] cache saved', { logicalKey: key, exactKey, userId: activeUserIdRef.current, value });
+    }
+    return AsyncStorage.setItem(exactKey, value);
   }
 
   async function removeCachedItem(key) {
@@ -2677,7 +2698,29 @@ export default function App() {
   }
 
   async function multiSetCachedForUser(userId, pairs) {
+    pairs.forEach(([key, value]) => {
+      if ([PREMIUM_KEY, PREMIUM_PLAN_KEY, FAVORITES_KEY, HISTORY_KEY].includes(key)) {
+        console.log('[Account Debug] cache saved', {
+          logicalKey: key,
+          exactKey: scopedCacheKey(key, userId),
+          userId,
+          value
+        });
+      }
+    });
     return AsyncStorage.multiSet(pairs.map(([key, value]) => [scopedCacheKey(key, userId), value]));
+  }
+
+  function debugValue(value) {
+    try {
+      const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+      if (!serialized) {
+        return '';
+      }
+      return serialized.length > 900 ? `${serialized.slice(0, 900)}...` : serialized;
+    } catch {
+      return String(value || '');
+    }
   }
 
   function clearAccountRestoreLoading(reason, userId = activeUserIdRef.current) {
@@ -2945,6 +2988,75 @@ export default function App() {
     }
   }
 
+  async function refreshAccountDebugPanel(userId = activeUserIdRef.current, remote = null, meta = {}) {
+    const subscriptionCacheKey = scopedCacheKey(PREMIUM_KEY, userId);
+    const subscriptionPlanCacheKey = scopedCacheKey(PREMIUM_PLAN_KEY, userId);
+    const favoritesCacheKey = scopedCacheKey(FAVORITES_KEY, userId);
+    const recentsCacheKey = scopedCacheKey(HISTORY_KEY, userId);
+    const [
+      subscriptionRaw,
+      subscriptionPlanRaw,
+      favoritesRaw,
+      recentsRaw
+    ] = await Promise.all([
+      userId ? AsyncStorage.getItem(subscriptionCacheKey) : Promise.resolve(null),
+      userId ? AsyncStorage.getItem(subscriptionPlanCacheKey) : Promise.resolve(null),
+      userId ? AsyncStorage.getItem(favoritesCacheKey) : Promise.resolve(null),
+      userId ? AsyncStorage.getItem(recentsCacheKey) : Promise.resolve(null)
+    ]);
+    const favoriteRows = remote?.favorites || null;
+    const recentRows = remote ? [...(remote.savedRecipeHistory || []), ...(remote.scanHistory || [])] : null;
+    setAccountDiagnostics((current) => ({
+      ...current,
+      userId: userId || null,
+      isPremium: meta.isPremium ?? isPremium,
+      selectedPlan: meta.selectedPlan || selectedFusionPlan,
+      favoriteCount: meta.favoriteCount ?? favorites.length,
+      recentCount: meta.recentCount ?? mealHistory.length,
+      subscriptionCacheKey,
+      subscriptionCacheRaw: debugValue({ active: subscriptionRaw, plan: subscriptionPlanRaw }),
+      favoritesCacheKey,
+      favoritesCacheRaw: debugValue(favoritesRaw),
+      recentsCacheKey,
+      recentsCacheRaw: debugValue(recentsRaw),
+      supabaseSubscriptionRow: debugValue(remote?.subscription || meta.supabaseSubscriptionRow || ''),
+      supabaseFavoritesRows: debugValue(favoriteRows || meta.supabaseFavoritesRows || ''),
+      supabaseRecentRows: debugValue(recentRows || meta.supabaseRecentRows || ''),
+      lastRestoreFunction: meta.lastRestoreFunction || current.lastRestoreFunction,
+      lastRestoreError: meta.lastRestoreError || '',
+      restoreTimestamp: new Date().toLocaleString()
+    }));
+  }
+
+  async function runManualAccountRestore() {
+    const userId = activeUserIdRef.current;
+    if (!userId) {
+      await refreshAccountDebugPanel(null, null, {
+        lastRestoreFunction: 'runManualAccountRestore',
+        lastRestoreError: 'No active user ID'
+      });
+      return;
+    }
+    try {
+      setSyncState({ status: 'loading', message: 'Running account restore...' });
+      restoredUserIdRef.current = null;
+      resetAccountRestoreGuard({ clearCompleted: true });
+      beginAccountRestore(userId, 'manual QA restore');
+      await restoreAccountDataForUser(userId, userProfile);
+      await refreshAccountDebugPanel(userId, null, { lastRestoreFunction: 'runManualAccountRestore' });
+      setSyncState({ status: 'synced', message: 'Synced to your account' });
+    } catch (error) {
+      console.warn('[Account Debug] Manual restore failed:', error);
+      await refreshAccountDebugPanel(userId, null, {
+        lastRestoreFunction: 'runManualAccountRestore',
+        lastRestoreError: error?.message || String(error)
+      });
+      setSyncState({ status: 'error', message: 'Sync failed. Saved on this device.' });
+    } finally {
+      clearAccountRestoreLoading('manual restore complete', userId);
+    }
+  }
+
   async function restoreSubscriptionForUser(userId, options = {}) {
     console.log('[Subscription] restoring for userId', userId);
     const cachedAccount = options.cachedAccount || await withRestoreTimeout(
@@ -3009,6 +3121,13 @@ export default function App() {
       isPremium: finalActive,
       selectedPlan: finalPlan
     }));
+    await refreshAccountDebugPanel(userId, { subscription: remoteSubscription }, {
+      lastRestoreFunction: 'restoreSubscriptionForUser',
+      isPremium: finalActive,
+      selectedPlan: finalPlan
+    }).catch((error) => {
+      console.warn('[Account Debug] Subscription debug refresh deferred:', error?.message);
+    });
     console.log('[Subscription] final active state', { userId, active: finalActive, plan: finalPlan, source });
     console.log('[Subscription] saved to cache', { userId, active: finalActive, plan: finalPlan });
     return { isPremium: finalActive, selectedPlan: finalPlan, source };
@@ -3040,6 +3159,9 @@ export default function App() {
       remote = await withRestoreTimeout(loadSyncedUserData(), 'Supabase account restore');
       if (remote) {
         hydrationSource = 'Supabase';
+        console.log('[Account Debug] Supabase subscription row returned', remote.subscription || null);
+        console.log('[Account Debug] Supabase favorites rows returned', remote.favorites || []);
+        console.log('[Account Debug] Supabase recent rows returned', [...(remote.savedRecipeHistory || []), ...(remote.scanHistory || [])]);
       }
     } catch (error) {
       hydrationSource = 'Cache';
@@ -3140,6 +3262,13 @@ export default function App() {
       favoriteCount: (favoritesSnapshot || []).length,
       recentCount: restoredHistory.length
     }));
+    await refreshAccountDebugPanel(userId, remote, {
+      lastRestoreFunction: 'restoreAccountDataForUser',
+      favoriteCount: (favoritesSnapshot || []).length,
+      recentCount: restoredHistory.length
+    }).catch((error) => {
+      console.warn('[Account Debug] Account debug refresh deferred:', error?.message);
+    });
     console.log('[FoodFusion Restore] Account data restored:', {
       userId,
       hydrationSource,
@@ -3426,6 +3555,16 @@ export default function App() {
       clearTimeout(restoreFailsafeTimerRef.current);
     }
   }, []);
+
+  useEffect(() => {
+    if (screen === 'launchChecklist') {
+      refreshAccountDebugPanel(activeUserIdRef.current, null, {
+        lastRestoreFunction: accountDiagnostics.lastRestoreFunction || 'QA panel refresh'
+      }).catch((error) => {
+        console.warn('[Account Debug] QA panel refresh failed:', error?.message);
+      });
+    }
+  }, [screen]);
 
   useEffect(() => {
     const alertKey = useSoonItems.map((item) => `${item.id}:${item.expiresAt}`).join('|');
@@ -7785,20 +7924,33 @@ export default function App() {
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Account Diagnostics</Text>
             {[
+              ['Current logged-in email', userProfile?.email || 'Not signed in'],
               ['Current user ID', accountDiagnostics.userId || activeUserIdRef.current || 'Not signed in'],
-              ['Subscription source', accountDiagnostics.subscriptionSource],
-              ['Subscription status', accountDiagnostics.subscriptionStatus],
               ['isPremium', accountDiagnostics.isPremium ? 'true' : 'false'],
               ['Selected plan', accountDiagnostics.selectedPlan || selectedFusionPlan],
+              ['Subscription source', accountDiagnostics.subscriptionSource],
+              ['Subscription AsyncStorage key', accountDiagnostics.subscriptionCacheKey || scopedCacheKey(PREMIUM_KEY, activeUserIdRef.current)],
+              ['Subscription cache raw value', accountDiagnostics.subscriptionCacheRaw || 'Not read yet'],
+              ['Supabase subscription row returned', accountDiagnostics.supabaseSubscriptionRow || 'Not read yet'],
               ['Hydration source', accountDiagnostics.hydrationSource],
               ['Favorite count', `${favorites.length}`],
-              ['Recent count', `${mealHistory.length}`]
+              ['Favorites AsyncStorage key', accountDiagnostics.favoritesCacheKey || scopedCacheKey(FAVORITES_KEY, activeUserIdRef.current)],
+              ['Favorites cache raw value', accountDiagnostics.favoritesCacheRaw || 'Not read yet'],
+              ['Supabase favorites rows returned', accountDiagnostics.supabaseFavoritesRows || 'Not read yet'],
+              ['Recent count', `${mealHistory.length}`],
+              ['Recents AsyncStorage key', accountDiagnostics.recentsCacheKey || scopedCacheKey(HISTORY_KEY, activeUserIdRef.current)],
+              ['Recents cache raw value', accountDiagnostics.recentsCacheRaw || 'Not read yet'],
+              ['Supabase recent rows returned', accountDiagnostics.supabaseRecentRows || 'Not read yet'],
+              ['Last restore function called', accountDiagnostics.lastRestoreFunction || 'None'],
+              ['Last restore error', accountDiagnostics.lastRestoreError || 'None'],
+              ['Timestamp of restore', accountDiagnostics.restoreTimestamp || 'Not run yet']
             ].map(([label, value]) => (
               <View key={label} style={styles.launchRow}>
                 <Text style={styles.launchLabel}>{label}</Text>
                 <Text style={styles.launchValue}>{value}</Text>
               </View>
             ))}
+            <Button onPress={runManualAccountRestore}>Run Restore Now</Button>
           </View>
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>QA Checklist</Text>
@@ -10978,7 +11130,7 @@ const styles = StyleSheet.create({
     marginTop: 16
   },
   launchRow: {
-    alignItems: 'center',
+    alignItems: 'flex-start',
     borderBottomColor: palette.line,
     borderBottomWidth: 1,
     flexDirection: 'row',
@@ -10987,11 +11139,14 @@ const styles = StyleSheet.create({
   },
   launchLabel: {
     color: palette.muted,
+    flex: 0.42,
     fontSize: 14,
-    fontWeight: '800'
+    fontWeight: '800',
+    paddingRight: 10
   },
   launchValue: {
     color: palette.cream,
+    flex: 0.58,
     flexShrink: 1,
     fontSize: 14,
     fontWeight: '900',
