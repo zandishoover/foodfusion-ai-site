@@ -6382,20 +6382,32 @@ export default function App() {
                       placeholder="ingredient"
                       placeholderTextColor={palette.muted}
                       autoCapitalize="none"
+                      multiline
+                      numberOfLines={2}
                       style={styles.ingredientEditInput}
                     />
                   ) : (
-                    <View>
-                      <Text style={styles.detectedIngredientText}>{item}</Text>
+                    <View style={styles.ingredientEditContent}>
+                      <Text numberOfLines={2} style={styles.detectedIngredientText}>{item}</Text>
                       <Text style={styles.confidenceText}>{ingredientConfidence(item, index, scanDetections)}</Text>
                     </View>
                   )}
                   <View style={styles.ingredientActions}>
-                    <Pressable onPress={() => editingIngredient === item ? saveIngredientEdit() : startIngredientEdit(item)} style={styles.tinyAction}>
-                      <Text style={styles.tinyActionText}>{editingIngredient === item ? 'Save' : 'Edit'}</Text>
+                    <Pressable
+                      accessibilityLabel={editingIngredient === item ? 'Save ingredient' : 'Edit ingredient'}
+                      accessibilityRole="button"
+                      onPress={() => editingIngredient === item ? saveIngredientEdit() : startIngredientEdit(item)}
+                      style={styles.ingredientIconAction}
+                    >
+                      <Text style={styles.ingredientIconActionText}>{editingIngredient === item ? '✓' : '✎'}</Text>
                     </Pressable>
-                    <Pressable onPress={() => removeIngredient(item)} style={styles.tinyAction}>
-                      <Text style={styles.tinyActionText}>Remove</Text>
+                    <Pressable
+                      accessibilityLabel="Remove ingredient"
+                      accessibilityRole="button"
+                      onPress={() => removeIngredient(item)}
+                      style={styles.ingredientIconAction}
+                    >
+                      <Text style={styles.ingredientIconActionText}>×</Text>
                     </Pressable>
                   </View>
                 </View>
@@ -10167,21 +10179,50 @@ const styles = StyleSheet.create({
     padding: 12
   },
   ingredientEditTop: {
-    alignItems: 'center',
+    alignItems: 'flex-start',
     flexDirection: 'row',
     gap: 10,
     justifyContent: 'space-between'
   },
+  ingredientEditContent: {
+    flex: 1,
+    flexShrink: 1,
+    maxWidth: '76%',
+    minWidth: 0
+  },
   ingredientEditInput: {
     color: palette.cream,
     flex: 1,
+    flexShrink: 1,
     fontSize: 16,
     fontWeight: '900',
-    minHeight: 38
+    maxWidth: '76%',
+    minHeight: 38,
+    minWidth: 0
   },
   ingredientActions: {
+    alignItems: 'center',
     flexDirection: 'row',
-    gap: 8
+    flexShrink: 0,
+    gap: 6,
+    justifyContent: 'flex-end',
+    width: 70
+  },
+  ingredientIconAction: {
+    alignItems: 'center',
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 12,
+    borderWidth: 1,
+    height: 32,
+    justifyContent: 'center',
+    width: 32
+  },
+  ingredientIconActionText: {
+    color: palette.green,
+    fontSize: 17,
+    fontWeight: '900',
+    lineHeight: 20
   },
   tinyAction: {
     backgroundColor: palette.panel,
@@ -10209,8 +10250,10 @@ const styles = StyleSheet.create({
     borderColor: palette.line,
     borderRadius: 999,
     borderWidth: 1,
-    paddingHorizontal: 10,
-    paddingVertical: 7
+    flexShrink: 1,
+    maxWidth: '100%',
+    paddingHorizontal: 8,
+    paddingVertical: 6
   },
   activeFreshnessChip: {
     backgroundColor: palette.greenDeep,
@@ -10218,8 +10261,10 @@ const styles = StyleSheet.create({
   },
   freshnessText: {
     color: palette.muted,
-    fontSize: 11,
+    flexShrink: 1,
+    fontSize: 10,
     fontWeight: '900',
+    textAlign: 'center',
     textTransform: 'capitalize'
   },
   activeFreshnessText: {
@@ -10236,7 +10281,9 @@ const styles = StyleSheet.create({
   detectedIngredientText: {
     color: palette.cream,
     fontSize: 14,
-    fontWeight: '900'
+    fontWeight: '900',
+    flexShrink: 1,
+    maxWidth: '100%'
   },
   confidenceText: {
     color: palette.muted,

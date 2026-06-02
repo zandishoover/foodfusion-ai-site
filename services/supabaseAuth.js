@@ -10,6 +10,13 @@ const supabaseKey =
   process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
   process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
 const authRedirectUrl = process.env.EXPO_PUBLIC_SUPABASE_REDIRECT_URL;
+const hostedAuthBaseUrl = 'https://foodfusion-ai-site.onrender.com';
+const authConfirmationRedirectUrl =
+  process.env.EXPO_PUBLIC_SUPABASE_CONFIRM_REDIRECT_URL ||
+  `${hostedAuthBaseUrl}/confirm`;
+const passwordResetRedirectUrl =
+  process.env.EXPO_PUBLIC_SUPABASE_PASSWORD_RESET_REDIRECT_URL ||
+  `${hostedAuthBaseUrl}/reset-password`;
 
 const usesSetupPlaceholder =
   supabaseUrl?.includes('your-project.supabase.co') ||
@@ -24,6 +31,8 @@ export const supabaseAuthConfig = {
   redirectUrlLoaded: Boolean(authRedirectUrl),
   supabaseUrl: supabaseUrl || '',
   redirectUrl: authRedirectUrl || '',
+  authConfirmationRedirectUrl,
+  passwordResetRedirectUrl,
   persistSession: true,
   autoRefreshToken: true,
   detectSessionInUrl: false
@@ -145,10 +154,14 @@ export async function signUpWithSupabase(name, email, password) {
   if (!supabase) {
     throw new Error('Supabase auth is not configured in this build.');
   }
+  console.log('[Auth] signup confirmation redirect', authConfirmationRedirectUrl);
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
-    options: { data: { name } }
+    options: {
+      data: { name },
+      emailRedirectTo: authConfirmationRedirectUrl
+    }
   });
   if (error) {
     console.warn('[Supabase Auth] signUp error:', error);
@@ -167,16 +180,16 @@ export async function signUpWithSupabase(name, email, password) {
 }
 
 export async function resetSupabasePassword(email) {
-  if (!authRedirectUrl) {
-    console.warn('[Supabase Auth] reset password requested without redirect URI');
-  }
+  console.log('[Auth] password reset redirect', passwordResetRedirectUrl);
   const { error } = await supabase.auth.resetPasswordForEmail(
     email,
-    authRedirectUrl ? { redirectTo: authRedirectUrl } : undefined
+    { redirectTo: passwordResetRedirectUrl }
   );
   if (error) {
+    console.warn('[Auth] reset email sent failed:', error);
     throw error;
   }
+  console.log('[Auth] reset email sent', { email, redirectTo: passwordResetRedirectUrl });
 }
 
 export async function signOutOfSupabase() {

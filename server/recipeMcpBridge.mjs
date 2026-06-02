@@ -19,6 +19,12 @@ const maxJsonBodyBytes = Number(process.env.FOODFUSION_MAX_JSON_BODY_BYTES || 8 
 const spoonacularApiKey = process.env.SPOONACULAR_API_KEY?.trim();
 const edamamAppId = process.env.EDAMAM_APP_ID?.trim();
 const edamamAppKey = process.env.EDAMAM_APP_KEY?.trim();
+const publicSupabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
+const publicSupabaseKey =
+  process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
+  process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  '';
 
 if (process.env.EXPO_PUBLIC_OPENAI_API_KEY) {
   throw new Error('Remove EXPO_PUBLIC_OPENAI_API_KEY. OpenAI credentials must never be exposed to the mobile app.');
@@ -505,6 +511,259 @@ function send(response, statusCode, payload) {
   response.end(JSON.stringify(payload));
 }
 
+function escapeHtml(value = '') {
+  return `${value}`
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function sendHtml(response, statusCode, html) {
+  response.writeHead(statusCode, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+  response.end(html);
+}
+
+function authPageShell({ title, subtitle, body, script = '' }) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(title)} | FoodFusion AI</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #070b12;
+      --panel: #111b29;
+      --line: #223247;
+      --text: #f7fbff;
+      --muted: #9fb0c7;
+      --blue: #6ca8ff;
+      --blue-deep: #173f70;
+      --danger: #ff7d7d;
+      --success: #7cf0c2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background:
+        radial-gradient(circle at 20% 10%, rgba(108, 168, 255, 0.18), transparent 34%),
+        linear-gradient(145deg, #070b12 0%, #0b111d 52%, #07101a 100%);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+    }
+    .card {
+      width: min(100%, 460px);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      padding: 28px;
+      background: rgba(17, 27, 41, 0.92);
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+    }
+    .mark {
+      width: 58px;
+      height: 58px;
+      display: grid;
+      place-items: center;
+      border-radius: 18px;
+      background: var(--blue-deep);
+      border: 1px solid var(--blue);
+      color: var(--text);
+      font-weight: 900;
+      font-size: 26px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 30px;
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+    p {
+      color: var(--muted);
+      line-height: 1.55;
+      margin: 12px 0 0;
+      font-size: 15px;
+    }
+    form {
+      margin-top: 24px;
+      display: grid;
+      gap: 12px;
+    }
+    label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    input {
+      width: 100%;
+      min-height: 48px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      padding: 0 14px;
+      color: var(--text);
+      background: #0a111c;
+      font-size: 16px;
+      outline: none;
+    }
+    input:focus {
+      border-color: var(--blue);
+      box-shadow: 0 0 0 3px rgba(108, 168, 255, 0.16);
+    }
+    button {
+      min-height: 50px;
+      border: 0;
+      border-radius: 999px;
+      background: var(--blue);
+      color: #07101a;
+      font-weight: 900;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    .message {
+      margin-top: 16px;
+      padding: 12px 14px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      background: #0a111c;
+      display: none;
+    }
+    .message.success {
+      color: var(--success);
+      border-color: rgba(124, 240, 194, 0.35);
+    }
+    .message.error {
+      color: var(--danger);
+      border-color: rgba(255, 125, 125, 0.35);
+    }
+    .footer {
+      margin-top: 22px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="mark">F</div>
+    <h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(subtitle)}</p>
+    ${body}
+    <div class="footer">FoodFusion AI · Scan. Match. Cook.</div>
+  </main>
+  ${script}
+</body>
+</html>`;
+}
+
+function confirmationPage() {
+  return authPageShell({
+    title: 'Email Confirmed',
+    subtitle: 'Your email has been confirmed. You can return to FoodFusion AI and log in.',
+    body: '<div id="message" class="message success" style="display:block;">Your account is ready.</div>'
+  });
+}
+
+function resetPasswordPage() {
+  const supabaseUrl = escapeHtml(publicSupabaseUrl);
+  const supabaseKey = escapeHtml(publicSupabaseKey);
+  return authPageShell({
+    title: 'Reset Password',
+    subtitle: 'Enter a new password for your FoodFusion AI account.',
+    body: `
+      <form id="reset-form">
+        <div>
+          <label for="password">New password</label>
+          <input id="password" name="password" type="password" minlength="6" autocomplete="new-password" required />
+        </div>
+        <div>
+          <label for="confirm-password">Confirm new password</label>
+          <input id="confirm-password" name="confirm-password" type="password" minlength="6" autocomplete="new-password" required />
+        </div>
+        <button id="submit-button" type="submit">Update Password</button>
+      </form>
+      <div id="message" class="message"></div>
+    `,
+    script: `
+      <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+      <script>
+        const SUPABASE_URL = "${supabaseUrl}";
+        const SUPABASE_KEY = "${supabaseKey}";
+        const form = document.getElementById('reset-form');
+        const message = document.getElementById('message');
+        const button = document.getElementById('submit-button');
+
+        function showMessage(text, type) {
+          message.textContent = text;
+          message.className = 'message ' + type;
+          message.style.display = 'block';
+        }
+
+        if (!SUPABASE_URL || !SUPABASE_KEY) {
+          form.style.display = 'none';
+          showMessage('Password reset is temporarily unavailable. Please contact FoodFusion AI support.', 'error');
+        } else {
+          const client = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+            auth: {
+              detectSessionInUrl: true,
+              persistSession: true
+            }
+          });
+
+          client.auth.onAuthStateChange((event) => {
+            if (event === 'PASSWORD_RECOVERY') {
+              showMessage('Enter your new password below.', 'success');
+            }
+          });
+
+          form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const password = document.getElementById('password').value;
+            const confirmPassword = document.getElementById('confirm-password').value;
+
+            if (password !== confirmPassword) {
+              showMessage('Passwords must match.', 'error');
+              return;
+            }
+
+            button.disabled = true;
+            button.textContent = 'Updating...';
+
+            try {
+              const { error } = await client.auth.updateUser({ password });
+              if (error) {
+                console.warn('[Auth] password update fail', error);
+                showMessage(error.message || 'Password update failed.', 'error');
+                return;
+              }
+              console.log('[Auth] password update success');
+              form.style.display = 'none';
+              showMessage('Password updated. You can now return to FoodFusion AI and log in.', 'success');
+            } catch (error) {
+              console.warn('[Auth] password update fail', error);
+              showMessage('Password update failed. Please request a new reset link.', 'error');
+            } finally {
+              button.disabled = false;
+              button.textContent = 'Update Password';
+            }
+          });
+        }
+      </script>
+    `
+  });
+}
+
 async function handleJsonRpc(body) {
   const method = body.method;
   const params = body.params || {};
@@ -566,6 +825,16 @@ const server = http.createServer(async (request, response) => {
     }
 
     const url = new URL(request.url, `http://localhost:${port}`);
+
+    if (request.method === 'GET' && url.pathname === '/confirm') {
+      sendHtml(response, 200, confirmationPage());
+      return;
+    }
+
+    if (request.method === 'GET' && url.pathname === '/reset-password') {
+      sendHtml(response, 200, resetPasswordPage());
+      return;
+    }
 
     if (request.method === 'GET' && url.pathname === '/health') {
       const recipeMcp = await getRecipeMcpHealth();
