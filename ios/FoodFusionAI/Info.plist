@@ -52,7 +52,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>FoodFusion AI uses fridge and pantry photos to suggest meals.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>FoodFusion AI uses your location to find nearby grocery stores and shopping options.</string>
+	<string>FoodFusion AI uses your location to find nearby grocery stores for your cart.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>FoodFusion AI connects to your nearby analysis service while testing photo scans.</string>
 	<key>NSMicrophoneUsageDescription</key>
