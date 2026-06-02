@@ -43,6 +43,7 @@ import {
   getSupabaseSessionProfile,
   manageSupabaseAutoRefresh,
   observeSupabaseAuth,
+  resendSupabaseConfirmation,
   resetSupabasePassword,
   signInWithSupabase,
   signOutOfSupabase,
@@ -1874,6 +1875,31 @@ function mealArtColors(title) {
   return options[index];
 }
 
+const STRONG_PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{10,}$/;
+
+function passwordValidationItems(password = '') {
+  return [
+    { label: '10+ characters', valid: password.length >= 10 },
+    { label: 'Uppercase letter', valid: /[A-Z]/.test(password) },
+    { label: 'Lowercase letter', valid: /[a-z]/.test(password) },
+    { label: 'Number', valid: /\d/.test(password) },
+    { label: 'Special character', valid: /[^A-Za-z\d]/.test(password) }
+  ];
+}
+
+function isStrongPassword(password = '') {
+  return STRONG_PASSWORD_REGEX.test(password);
+}
+
+function PasswordEyeIcon({ visible }) {
+  return (
+    <View style={styles.eyeIcon}>
+      <View style={styles.eyePupil} />
+      {visible ? <View style={styles.eyeSlash} /> : null}
+    </View>
+  );
+}
+
 function Button({ children, onPress, variant = 'primary', disabled, accent }) {
   return (
     <Pressable
@@ -2481,13 +2507,21 @@ function AuthScreen({
   onSignUp,
   onContinueWithApple,
   onResetPassword,
+  onResendConfirmation,
   onShowLogin,
   onShowSignUp,
-  onShowForgotPassword
+  onShowForgotPassword,
+  needsConfirmation
 }) {
   const isWelcome = mode === 'welcome';
   const isSignUp = mode === 'signup';
   const isForgotPassword = mode === 'forgotPassword';
+  const [showPassword, setShowPassword] = useState(false);
+  const passwordItems = passwordValidationItems(form.password);
+  const passwordStrong = isStrongPassword(form.password);
+  const confirmPasswordMatches = !isSignUp || !form.confirmPassword || form.password === form.confirmPassword;
+  const submitDisabled = isSignUp && (!passwordStrong || !form.confirmPassword || !confirmPasswordMatches);
+  const passwordToggleLabel = showPassword ? 'Hide password' : 'Show password';
 
   return (
     <Screen>
@@ -2525,30 +2559,79 @@ function AuthScreen({
               style={styles.authInput}
             />
             {!isForgotPassword ? (
-              <TextInput
-                value={form.password}
-                onChangeText={(value) => onChange('password', value)}
-                placeholder="Password"
-                placeholderTextColor={palette.muted}
-                secureTextEntry
-                style={styles.authInput}
-              />
+              <>
+                <View style={styles.passwordInputWrap}>
+                  <TextInput
+                    value={form.password}
+                    onChangeText={(value) => onChange('password', value)}
+                    placeholder="Password"
+                    placeholderTextColor={palette.muted}
+                    secureTextEntry={!showPassword}
+                    textContentType={isSignUp ? 'newPassword' : 'password'}
+                    autoComplete={isSignUp ? 'new-password' : 'password'}
+                    style={styles.passwordInput}
+                  />
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={passwordToggleLabel}
+                    onPress={() => setShowPassword((current) => !current)}
+                    style={({ pressed }) => [styles.passwordToggle, pressed && styles.pressed]}
+                  >
+                    <PasswordEyeIcon visible={showPassword} />
+                  </Pressable>
+                </View>
+                {isSignUp ? (
+                  <View style={styles.passwordChecklist}>
+                    {passwordItems.map((item) => (
+                      <Text
+                        key={item.label}
+                        style={[styles.passwordChecklistItem, item.valid && styles.passwordChecklistItemValid]}
+                      >
+                        {item.valid ? '✓' : '•'} {item.label}
+                      </Text>
+                    ))}
+                  </View>
+                ) : null}
+              </>
             ) : null}
             {isSignUp ? (
-              <TextInput
-                value={form.confirmPassword}
-                onChangeText={(value) => onChange('confirmPassword', value)}
-                placeholder="Confirm Password"
-                placeholderTextColor={palette.muted}
-                secureTextEntry
-                style={styles.authInput}
-              />
+              <>
+                <View style={styles.passwordInputWrap}>
+                  <TextInput
+                    value={form.confirmPassword}
+                    onChangeText={(value) => onChange('confirmPassword', value)}
+                    placeholder="Confirm Password"
+                    placeholderTextColor={palette.muted}
+                    secureTextEntry={!showPassword}
+                    textContentType="newPassword"
+                    autoComplete="new-password"
+                    style={styles.passwordInput}
+                  />
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={passwordToggleLabel}
+                    onPress={() => setShowPassword((current) => !current)}
+                    style={({ pressed }) => [styles.passwordToggle, pressed && styles.pressed]}
+                  >
+                    <PasswordEyeIcon visible={showPassword} />
+                  </Pressable>
+                </View>
+                {!confirmPasswordMatches ? <Text style={styles.authError}>Passwords must match.</Text> : null}
+              </>
             ) : null}
             {error ? <Text style={styles.authError}>{error}</Text> : null}
             {message ? <Text style={styles.authMessage}>{message}</Text> : null}
-            <Button onPress={isForgotPassword ? onResetPassword : isSignUp ? onSignUp : onLogin}>
+            <Button
+              disabled={submitDisabled}
+              onPress={isForgotPassword ? onResetPassword : isSignUp ? onSignUp : onLogin}
+            >
               {isForgotPassword ? 'Send Reset Link' : isSignUp ? 'Create Account' : 'Log In'}
             </Button>
+            {needsConfirmation ? (
+              <Pressable onPress={onResendConfirmation} style={styles.authSwitch}>
+                <Text style={styles.authSwitchText}>Resend confirmation email</Text>
+              </Pressable>
+            ) : null}
             {!isForgotPassword ? (
               <>
                 <View style={styles.authDividerRow}>
@@ -2625,6 +2708,7 @@ export default function App() {
   });
   const [authError, setAuthError] = useState('');
   const [authMessage, setAuthMessage] = useState('');
+  const [authNeedsConfirmation, setAuthNeedsConfirmation] = useState(false);
   const [authDebug, setAuthDebug] = useState({
     authState: 'Booting',
     sessionExists: false,
@@ -5235,6 +5319,7 @@ export default function App() {
     setAuthScreen(nextMode);
     setAuthError('');
     setAuthMessage('');
+    setAuthNeedsConfirmation(false);
   }
 
   async function finishAuth(profile, options = {}) {
@@ -5254,6 +5339,7 @@ export default function App() {
     setAuthForm({ name: '', email: '', password: '', confirmPassword: '' });
     setAuthError('');
     setAuthMessage('');
+    setAuthNeedsConfirmation(false);
     try {
       console.log('[FoodFusion Auth] AsyncStorage session writes starting:', { nextUserId, appleSession });
       await Promise.all([
@@ -5318,7 +5404,7 @@ export default function App() {
         return;
       }
       await finishAuth({
-        name: email.split('@')[0] || 'FoodFusion User',
+        name: email.split('@')[0] || 'FoodFusion Member',
         email
       });
       setAuthMessage('');
@@ -5346,6 +5432,12 @@ export default function App() {
       setAuthError('Passwords must match.');
       return;
     }
+    if (!isStrongPassword(authForm.password)) {
+      console.log('[Auth] password validation fail');
+      setAuthError('Password must contain at least 10 characters, including uppercase, lowercase, number, and special character.');
+      return;
+    }
+    console.log('[Auth] password validation pass');
 
     try {
       setAuthError('');
@@ -5361,7 +5453,8 @@ export default function App() {
         if (result.confirmationRequired) {
           setAuthScreen('login');
           setAuthError('');
-          setAuthMessage('Check your email to confirm your account, then log in.');
+          setAuthNeedsConfirmation(true);
+          setAuthMessage('Account created. Please check your email to confirm your account.');
           return;
         }
         await finishAuth(result.profile);
@@ -5370,7 +5463,7 @@ export default function App() {
         return;
       }
       await finishAuth({
-        name: name || email.split('@')[0] || 'FoodFusion User',
+        name: name || email.split('@')[0] || 'FoodFusion Member',
         email
       });
       setAuthMessage('');
@@ -5407,6 +5500,7 @@ export default function App() {
     setAuthScreen('forgotPassword');
     setAuthError('');
     setAuthMessage('');
+    setAuthNeedsConfirmation(false);
   }
 
   async function handleResetPassword() {
@@ -5429,6 +5523,26 @@ export default function App() {
     }
   }
 
+  async function handleResendConfirmation() {
+    const email = authForm.email.trim();
+    if (!email) {
+      setAuthError('Email is required.');
+      return;
+    }
+
+    try {
+      setAuthError('');
+      setAuthMessage('Sending confirmation email...');
+      await resendSupabaseConfirmation(email);
+      setAuthMessage('Confirmation email sent. Please check your inbox.');
+    } catch (error) {
+      const readable = readableAuthError(error);
+      setAuthMessage('');
+      setAuthError(readable);
+      setAuthDebug((current) => ({ ...current, lastAuthError: readable }));
+    }
+  }
+
   async function logout() {
     console.log('[FoodFusion Auth] Logout requested');
     appleSessionRef.current = false;
@@ -5441,6 +5555,7 @@ export default function App() {
     setAuthForm({ name: '', email: '', password: '', confirmPassword: '' });
     setAuthError('');
     setAuthMessage('');
+    setAuthNeedsConfirmation(false);
     try {
       if (supabaseConfigured) {
         await signOutOfSupabase();
@@ -6000,9 +6115,11 @@ export default function App() {
         onSignUp={handleSignUp}
         onContinueWithApple={handleContinueWithApple}
         onResetPassword={handleResetPassword}
+        onResendConfirmation={handleResendConfirmation}
         onShowLogin={() => showAuthMode('login')}
         onShowSignUp={() => showAuthMode('signup')}
         onShowForgotPassword={handleForgotPassword}
+        needsConfirmation={authNeedsConfirmation}
       />
     );
   }
@@ -6800,7 +6917,7 @@ export default function App() {
         <AppHeader eyebrow="Profile" onSettings={() => setScreen('settings')} accent={flowColors.profile.accent} />
         <ScrollView showsVerticalScrollIndicator={false} style={styles.tabScroll} contentContainerStyle={styles.tabScrollContent}>
           <View style={styles.profileHero}>
-            <Text style={styles.profileTitle}>{userProfile?.name || 'FoodFusion User'}</Text>
+            <Text style={styles.profileTitle}>{userProfile?.name || userProfile?.email?.split('@')[0] || 'FoodFusion Member'}</Text>
             <Text style={styles.profileMeta}>{userProfile?.email || 'Signed in'}</Text>
             <Text style={styles.profileMeta}>{fusionStatusLoading ? 'Checking Fusion+ status...' : isPremium ? `Fusion+ • ${plan.name} plan` : 'Fusion Free'}</Text>
           </View>
@@ -8748,6 +8865,73 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     paddingHorizontal: 14,
     paddingVertical: 14
+  },
+  passwordInputWrap: {
+    alignItems: 'center',
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 16,
+    borderWidth: 1,
+    flexDirection: 'row',
+    marginBottom: 12,
+    minHeight: 52,
+    overflow: 'hidden'
+  },
+  passwordInput: {
+    color: palette.cream,
+    flex: 1,
+    fontSize: 15,
+    fontWeight: '800',
+    minWidth: 0,
+    paddingHorizontal: 14,
+    paddingVertical: 14
+  },
+  passwordToggle: {
+    alignItems: 'center',
+    alignSelf: 'stretch',
+    justifyContent: 'center',
+    minWidth: 48,
+    paddingHorizontal: 12
+  },
+  eyeIcon: {
+    alignItems: 'center',
+    borderColor: palette.green,
+    borderRadius: 999,
+    borderWidth: 1.5,
+    height: 13,
+    justifyContent: 'center',
+    transform: [{ scaleX: 1.55 }],
+    width: 20
+  },
+  eyePupil: {
+    backgroundColor: palette.green,
+    borderRadius: 999,
+    height: 5,
+    transform: [{ scaleX: 0.65 }],
+    width: 5
+  },
+  eyeSlash: {
+    backgroundColor: palette.green,
+    borderRadius: 999,
+    height: 2,
+    position: 'absolute',
+    transform: [{ rotate: '-35deg' }, { scaleX: 0.75 }],
+    width: 24
+  },
+  passwordChecklist: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 12,
+    marginTop: -2
+  },
+  passwordChecklistItem: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '800'
+  },
+  passwordChecklistItemValid: {
+    color: palette.green
   },
   authError: {
     color: palette.warning,

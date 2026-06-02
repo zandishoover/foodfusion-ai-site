@@ -60,16 +60,111 @@ export const supabase = supabaseConfigured
 
 let sessionRequest = null;
 
-function profileFromUser(user) {
+function userMetadataName(user) {
+  return user?.user_metadata?.full_name || user?.user_metadata?.name || '';
+}
+
+function emailPrefix(user) {
+  return user?.email?.split('@')[0] || '';
+}
+
+async function loadProfileTableName(user) {
+  if (!supabase || !user?.id) {
+    return { name: '', source: '' };
+  }
+
+  const attempts = [
+    { label: 'profile table user_id', query: () => supabase.from('profiles').select('name, full_name, email').eq('user_id', user.id).maybeSingle() },
+    { label: 'profile table id', query: () => supabase.from('profiles').select('name, full_name, email').eq('id', user.id).maybeSingle() },
+    { label: 'profile table user_id name', query: () => supabase.from('profiles').select('name, email').eq('user_id', user.id).maybeSingle() },
+    { label: 'profile table id name', query: () => supabase.from('profiles').select('name, email').eq('id', user.id).maybeSingle() }
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const { data, error } = await attempt.query();
+      if (error) {
+        console.warn('[Profile] profile table load skipped:', { source: attempt.label, message: error.message });
+        continue;
+      }
+      const name = data?.name || data?.full_name || '';
+      if (name) {
+        return { name, source: attempt.label };
+      }
+    } catch (error) {
+      console.warn('[Profile] profile table load failed:', { source: attempt.label, message: error?.message || String(error) });
+    }
+  }
+
+  return { name: '', source: '' };
+}
+
+async function saveProfileTableName(profile) {
+  if (!supabase || !profile?.id || !profile?.name) {
+    return false;
+  }
+
+  const rowWithBothIds = {
+    id: profile.id,
+    user_id: profile.id,
+    name: profile.name,
+    full_name: profile.name,
+    email: profile.email || ''
+  };
+  const attempts = [
+    { label: 'profiles id + user_id', payload: rowWithBothIds, options: { onConflict: 'id' } },
+    { label: 'profiles id', payload: { id: profile.id, name: profile.name, full_name: profile.name, email: profile.email || '' }, options: { onConflict: 'id' } },
+    { label: 'profiles user_id', payload: { user_id: profile.id, name: profile.name, full_name: profile.name, email: profile.email || '' }, options: { onConflict: 'user_id' } },
+    { label: 'profiles id name', payload: { id: profile.id, name: profile.name, email: profile.email || '' }, options: { onConflict: 'id' } },
+    { label: 'profiles user_id name', payload: { user_id: profile.id, name: profile.name, email: profile.email || '' }, options: { onConflict: 'user_id' } }
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const { error } = await supabase.from('profiles').upsert(attempt.payload, attempt.options);
+      if (!error) {
+        console.log('[Profile] saved display name to profile table:', { source: attempt.label, userId: profile.id });
+        return true;
+      }
+      console.warn('[Profile] profile table save skipped:', { source: attempt.label, message: error.message });
+    } catch (error) {
+      console.warn('[Profile] profile table save failed:', { source: attempt.label, message: error?.message || String(error) });
+    }
+  }
+
+  return false;
+}
+
+function profileFromUser(user, profileTableName = '') {
   if (!user) {
     return null;
   }
 
+  const metadataName = userMetadataName(user);
+  const prefix = emailPrefix(user);
+  const name = profileTableName || metadataName || prefix || 'FoodFusion Member';
+  const source = profileTableName
+    ? 'profile table name'
+    : metadataName
+      ? (user.user_metadata?.full_name ? 'auth full_name metadata' : 'auth name metadata')
+      : prefix
+        ? 'email prefix'
+        : 'fallback';
+  console.log('[Profile] loaded display name source', { source, userId: user.id });
+
   return {
     id: user.id,
-    name: user.user_metadata?.name || user.email?.split('@')[0] || 'FoodFusion Member',
+    name,
     email: user.email || ''
   };
+}
+
+async function profileFromUserWithRemote(user) {
+  if (!user) {
+    return null;
+  }
+  const profileTable = await loadProfileTableName(user);
+  return profileFromUser(user, profileTable.name);
 }
 
 async function getSupabaseSession() {
@@ -101,7 +196,7 @@ async function getSupabaseSession() {
 
 export async function getSupabaseSessionProfile() {
   const session = await getSupabaseSession();
-  return profileFromUser(session?.user);
+  return profileFromUserWithRemote(session?.user);
 }
 
 export async function getSupabaseAccessToken() {
@@ -146,7 +241,7 @@ export async function signInWithSupabase(email, password) {
     sessionExists: Boolean(data.session),
     expiresAt: data.session?.expires_at || null
   });
-  return profileFromUser(data.user);
+  return profileFromUserWithRemote(data.user);
 }
 
 export async function signUpWithSupabase(name, email, password) {
@@ -154,27 +249,37 @@ export async function signUpWithSupabase(name, email, password) {
   if (!supabase) {
     throw new Error('Supabase auth is not configured in this build.');
   }
+  const cleanName = name?.trim() || email.split('@')[0] || 'FoodFusion Member';
+  console.log('[Auth] signup metadata name', { name: cleanName });
   console.log('[Auth] signup confirmation redirect', authConfirmationRedirectUrl);
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
     options: {
-      data: { name },
+      data: { name: cleanName, full_name: cleanName },
       emailRedirectTo: authConfirmationRedirectUrl
     }
   });
   if (error) {
+    console.warn('[Auth] email confirmation error', error);
     console.warn('[Supabase Auth] signUp error:', error);
     throw error;
   }
-  console.log('[Supabase Auth] signUp response:', {
+  console.log('[Auth] signup response', {
     hasUser: Boolean(data.user),
     hasSession: Boolean(data.session),
     userId: data.user?.id || null,
     email: data.user?.email || null
   });
+  const profile = await profileFromUserWithRemote(data.user);
+  if (profile) {
+    await saveProfileTableName({ ...profile, name: cleanName });
+  }
+  if (data.user && !data.session) {
+    console.log('[Auth] email confirmation sent', { email, redirectTo: authConfirmationRedirectUrl });
+  }
   return {
-    profile: profileFromUser(data.user),
+    profile,
     confirmationRequired: Boolean(data.user && !data.session)
   };
 }
@@ -190,6 +295,25 @@ export async function resetSupabasePassword(email) {
     throw error;
   }
   console.log('[Auth] reset email sent', { email, redirectTo: passwordResetRedirectUrl });
+}
+
+export async function resendSupabaseConfirmation(email) {
+  if (!supabase) {
+    throw new Error('Supabase auth is not configured in this build.');
+  }
+  console.log('[Auth] signup confirmation redirect', authConfirmationRedirectUrl);
+  const { error } = await supabase.auth.resend({
+    type: 'signup',
+    email,
+    options: {
+      emailRedirectTo: authConfirmationRedirectUrl
+    }
+  });
+  if (error) {
+    console.warn('[Auth] email confirmation error', error);
+    throw error;
+  }
+  console.log('[Auth] email confirmation sent', { email, redirectTo: authConfirmationRedirectUrl });
 }
 
 export async function signOutOfSupabase() {
@@ -213,7 +337,12 @@ export function observeSupabaseAuth(onChange) {
       userId: session?.user?.id || null,
       email: session?.user?.email || null
     });
-    onChange(profileFromUser(session?.user));
+    profileFromUserWithRemote(session?.user)
+      .then(onChange)
+      .catch((error) => {
+        console.warn('[Profile] auth state profile load failed:', error);
+        onChange(profileFromUser(session?.user));
+      });
   });
   return () => data.subscription.unsubscribe();
 }

@@ -620,6 +620,48 @@ function authPageShell({ title, subtitle, body, script = '' }) {
       border-color: var(--blue);
       box-shadow: 0 0 0 3px rgba(108, 168, 255, 0.16);
     }
+    .password-row {
+      display: flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: #0a111c;
+      overflow: hidden;
+    }
+    .password-row:focus-within {
+      border-color: var(--blue);
+      box-shadow: 0 0 0 3px rgba(108, 168, 255, 0.16);
+    }
+    .password-row input {
+      border: 0;
+      box-shadow: none;
+      min-width: 0;
+    }
+    .password-row input:focus {
+      border-color: transparent;
+      box-shadow: none;
+    }
+    .password-toggle {
+      min-height: 48px;
+      min-width: 64px;
+      border-radius: 0;
+      background: transparent;
+      color: var(--blue);
+      font-size: 18px;
+      line-height: 1;
+    }
+    .password-rules {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .password-rules span.valid {
+      color: var(--success);
+    }
     button {
       min-height: 50px;
       border: 0;
@@ -685,13 +727,20 @@ function resetPasswordPage() {
       <form id="reset-form">
         <div>
           <label for="password">New password</label>
-          <input id="password" name="password" type="password" minlength="6" autocomplete="new-password" required />
+          <div class="password-row">
+            <input id="password" name="password" type="password" minlength="10" autocomplete="new-password" required />
+            <button class="password-toggle" type="button" data-target="password" aria-label="Show password">⊙</button>
+          </div>
+          <div id="password-rules" class="password-rules"></div>
         </div>
         <div>
           <label for="confirm-password">Confirm new password</label>
-          <input id="confirm-password" name="confirm-password" type="password" minlength="6" autocomplete="new-password" required />
+          <div class="password-row">
+            <input id="confirm-password" name="confirm-password" type="password" minlength="10" autocomplete="new-password" required />
+            <button class="password-toggle" type="button" data-target="confirm-password" aria-label="Show password">⊙</button>
+          </div>
         </div>
-        <button id="submit-button" type="submit">Update Password</button>
+        <button id="submit-button" type="submit" disabled>Update Password</button>
       </form>
       <div id="message" class="message"></div>
     `,
@@ -703,6 +752,17 @@ function resetPasswordPage() {
         const form = document.getElementById('reset-form');
         const message = document.getElementById('message');
         const button = document.getElementById('submit-button');
+        const passwordInput = document.getElementById('password');
+        const confirmPasswordInput = document.getElementById('confirm-password');
+        const rulesWrap = document.getElementById('password-rules');
+        const strongPasswordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[^A-Za-z\\d]).{10,}$/;
+        const passwordRules = [
+          { label: '10+ characters', test: (value) => value.length >= 10 },
+          { label: 'Uppercase letter', test: (value) => /[A-Z]/.test(value) },
+          { label: 'Lowercase letter', test: (value) => /[a-z]/.test(value) },
+          { label: 'Number', test: (value) => /\\d/.test(value) },
+          { label: 'Special character', test: (value) => /[^A-Za-z\\d]/.test(value) }
+        ];
 
         function showMessage(text, type) {
           message.textContent = text;
@@ -714,6 +774,33 @@ function resetPasswordPage() {
           form.style.display = 'none';
           showMessage('Password reset is temporarily unavailable. Please contact FoodFusion AI support.', 'error');
         } else {
+          function renderPasswordRules() {
+            const value = passwordInput.value || '';
+            const isStrong = strongPasswordRegex.test(value);
+            rulesWrap.innerHTML = passwordRules.map((rule) => {
+              const valid = rule.test(value);
+              return '<span class="' + (valid ? 'valid' : '') + '">' + (valid ? '✓' : '•') + ' ' + rule.label + '</span>';
+            }).join('');
+            button.disabled = !isStrong || !confirmPasswordInput.value || value !== confirmPasswordInput.value;
+            if (value) {
+              console.log(isStrong ? '[Auth] password validation pass' : '[Auth] password validation fail');
+            }
+          }
+
+          document.querySelectorAll('.password-toggle').forEach((toggle) => {
+            toggle.addEventListener('click', () => {
+              const input = document.getElementById(toggle.dataset.target);
+              const visible = input.type === 'text';
+              input.type = visible ? 'password' : 'text';
+              toggle.textContent = visible ? '⊙' : '⊘';
+              toggle.setAttribute('aria-label', visible ? 'Show password' : 'Hide password');
+            });
+          });
+
+          passwordInput.addEventListener('input', renderPasswordRules);
+          confirmPasswordInput.addEventListener('input', renderPasswordRules);
+          renderPasswordRules();
+
           const client = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
             auth: {
               detectSessionInUrl: true,
@@ -731,6 +818,13 @@ function resetPasswordPage() {
             event.preventDefault();
             const password = document.getElementById('password').value;
             const confirmPassword = document.getElementById('confirm-password').value;
+
+            if (!strongPasswordRegex.test(password)) {
+              console.log('[Auth] password validation fail');
+              showMessage('Password must contain at least 10 characters, including uppercase, lowercase, number, and special character.', 'error');
+              return;
+            }
+            console.log('[Auth] password validation pass');
 
             if (password !== confirmPassword) {
               showMessage('Passwords must match.', 'error');
