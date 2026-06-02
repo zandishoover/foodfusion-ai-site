@@ -24,6 +24,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
 import * as Clipboard from 'expo-clipboard';
+import * as Location from 'expo-location';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import {
   checkRecipeMcpStatus,
@@ -550,10 +551,17 @@ function normalizeRealStore(element, coordinates, mode = 'Delivery') {
   const lat = element.lat || element.center?.lat;
   const lon = element.lon || element.center?.lon;
   const distanceMiles = lat && lon ? distanceInMiles(coordinates.latitude, coordinates.longitude, lat, lon) : null;
+  const driveMinutes = distanceMiles == null ? null : Math.max(3, Math.round(distanceMiles * 4));
+  const walkMinutes = distanceMiles == null ? null : Math.max(5, Math.round(distanceMiles * 20));
+  const minutes = driveMinutes && walkMinutes ? `${driveMinutes} min drive • ${walkMinutes} min walk` : '';
   return {
     id: `${element.type}-${element.id}`,
     name,
+    address: formatStoreAddress(tags),
+    category: formatStoreCategory(tags),
     distance: distanceMiles == null ? '' : `${distanceMiles.toFixed(1)} mi`,
+    distanceMiles,
+    minutes,
     eta: mode === 'Pickup' ? 'Pickup today' : distanceMiles != null && distanceMiles < 3 ? 'Delivery 30-50 min' : 'Delivery 45-75 min',
     fee: mode === 'Pickup' ? 'No pickup fee' : distanceMiles != null && distanceMiles < 4 ? '$3.99' : '$5.99',
     status: tags.opening_hours ? 'Hours vary' : 'Open',
@@ -561,6 +569,22 @@ function normalizeRealStore(element, coordinates, mode = 'Delivery') {
     longitude: lon,
     source: 'OpenStreetMap'
   };
+}
+
+function formatStoreAddress(tags = {}) {
+  if (tags['addr:full']) return tags['addr:full'];
+  const streetLine = [tags['addr:housenumber'], tags['addr:street']].filter(Boolean).join(' ');
+  const cityLine = [tags['addr:city'], tags['addr:state'], tags['addr:postcode']].filter(Boolean).join(', ');
+  return [streetLine, cityLine].filter(Boolean).join(' • ') || 'Address unavailable';
+}
+
+function formatStoreCategory(tags = {}) {
+  const raw = tags.shop || tags.amenity || 'grocery';
+  return raw
+    .split(/[_-]/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
 }
 
 function distanceInMiles(lat1, lon1, lat2, lon2) {
@@ -615,7 +639,7 @@ async function lookupNearbyGroceryStores(coordinates, mode = 'Delivery') {
     .map((element) => normalizeRealStore(element, coordinates, mode))
     .filter((store) => store.name && store.latitude && store.longitude)
     .filter((store, index, all) => all.findIndex((candidate) => candidate.name === store.name) === index)
-    .sort((a, b) => storePriority(a.name) - storePriority(b.name) || parseFloat(a.distance || '999') - parseFloat(b.distance || '999'))
+    .sort((a, b) => parseFloat(a.distance || '999') - parseFloat(b.distance || '999') || storePriority(a.name) - storePriority(b.name))
     .slice(0, 12);
   return stores;
 }
@@ -2738,9 +2762,12 @@ export default function App() {
   const [nearbyStores, setNearbyStores] = useState([]);
   const [shoppingConnectionStatus, setShoppingConnectionStatus] = useState('Not Connected');
   const [isNearbyStoresLoading, setIsNearbyStoresLoading] = useState(false);
+  const [locationPermissionStatus, setLocationPermissionStatus] = useState('unknown');
   const [storeLookupDebug, setStoreLookupDebug] = useState({
     mode: 'fallback',
+    permissionStatus: 'unknown',
     lastAddress: '',
+    currentCoordinates: '',
     coordinates: '',
     count: 0,
     error: ''
@@ -4552,20 +4579,81 @@ export default function App() {
         setShoppingConnectionStatus('Not Connected');
         setShoppingNotice(nearbyStores.length > 0
           ? 'Live item availability unavailable. Showing products matched to nearby stores.'
-          : 'Couldn’t find stores near this address.');
+          : 'Couldn’t find stores near this location.');
       }
     } catch {
       setShoppingResults(nearbyStores.length > 0 ? localShoppingSearch(query) : []);
       setShoppingConnectionStatus('Not Connected');
       setShoppingNotice(nearbyStores.length > 0
         ? 'Live item availability unavailable. Showing products matched to nearby stores.'
-        : 'Couldn’t find stores near this address.');
+        : 'Couldn’t find stores near this location.');
     } finally {
       setIsShoppingLoading(false);
     }
   }
 
+  async function loadStoresFromCoordinates(coordinates, location, mode = fulfillmentMode, source = 'manual', permissionStatus = locationPermissionStatus) {
+    setIsNearbyStoresLoading(true);
+    setShoppingNotice('');
+    try {
+      console.log('[Store Lookup] source =', source);
+      console.log('[Store Lookup] current lat/lng', coordinates);
+      console.log('[Store Lookup] API/source used', 'Overpass grocery store lookup');
+      let stores = await lookupNearbyGroceryStores(coordinates, mode);
+      if (stores.length === 0) {
+        const result = await findInstacartStores({ ...location, coordinates }, mode);
+        stores = result.connected ? result.stores : [];
+        console.log('[Store Lookup] API/source used', result.connected ? 'Instacart MCP' : 'No store source');
+      }
+      console.log('[Store Lookup] stores returned count', stores.length);
+      console.log('[Store Lookup] distance/miles calculated', stores.map((store) => ({
+        name: store.name,
+        distance: store.distance,
+        minutes: store.minutes
+      })));
+      if (stores.length > 0) {
+        setNearbyStores(stores);
+        setShoppingConnectionStatus('Connected');
+        setStoreLookupDebug({
+          mode: source,
+          permissionStatus,
+          lastAddress: location?.address || coordinates.label || '',
+          currentCoordinates: source === 'GPS' ? `${coordinates.latitude.toFixed(5)}, ${coordinates.longitude.toFixed(5)}` : '',
+          coordinates: `${coordinates.latitude.toFixed(5)}, ${coordinates.longitude.toFixed(5)}`,
+          count: stores.length,
+          error: ''
+        });
+      } else {
+        throw new Error('Couldn’t find stores near this location.');
+      }
+      setShoppingResults([]);
+    } catch (error) {
+      const message = error?.message || 'Couldn’t find stores near this location.';
+      console.warn('[Store Lookup] lookup error:', message);
+      console.log('[Store Lookup] stores returned count', 0);
+      setNearbyStores([]);
+      setShoppingConnectionStatus('Not Connected');
+      setShoppingNotice(message);
+      setStoreLookupDebug({
+        mode: 'fallback',
+        permissionStatus,
+        lastAddress: location?.address || coordinates?.label || '',
+        currentCoordinates: source === 'GPS' && coordinates ? `${coordinates.latitude.toFixed(5)}, ${coordinates.longitude.toFixed(5)}` : '',
+        coordinates: coordinates ? `${coordinates.latitude.toFixed(5)}, ${coordinates.longitude.toFixed(5)}` : '',
+        count: 0,
+        error: message
+      });
+      setShoppingResults([]);
+    } finally {
+      setIsNearbyStoresLoading(false);
+    }
+  }
+
   async function loadNearbyStores(location = shoppingLocation, mode = fulfillmentMode) {
+    if (location?.coordinates?.latitude && location?.coordinates?.longitude) {
+      await loadStoresFromCoordinates(location.coordinates, location, mode, location.source === 'GPS' ? 'GPS' : 'manual');
+      return;
+    }
     const fields = compactAddressFields(location?.addressFields || shoppingAddressFields);
     if (!fields.fullAddress) {
       return;
@@ -4576,43 +4664,90 @@ export default function App() {
       console.log('[Store Lookup] address fields', fields);
       console.log('[Store Lookup] API/source used', 'Nominatim geocode');
       const geocode = await geocodeShoppingLocation(fields);
-      console.log('[Store Lookup] API/source used', 'Overpass grocery store lookup');
-      let stores = await lookupNearbyGroceryStores(geocode, mode);
-      if (stores.length === 0) {
-        const result = await findInstacartStores({ ...location, coordinates: geocode }, mode);
-        stores = result.connected ? result.stores : [];
-        console.log('[Store Lookup] API/source used', result.connected ? 'Instacart MCP' : 'No store source');
-      }
-      console.log('[Store Lookup] stores returned count', stores.length);
-      if (stores.length > 0) {
-        setNearbyStores(stores);
-        setShoppingConnectionStatus('Connected');
-        setStoreLookupDebug({
-          mode: 'production',
-          lastAddress: fields.fullAddress,
-          coordinates: `${geocode.latitude.toFixed(5)}, ${geocode.longitude.toFixed(5)}`,
-          count: stores.length,
-          error: ''
-        });
-      } else {
-        throw new Error('Couldn’t find stores near this address');
-      }
-      setShoppingResults([]);
+      await loadStoresFromCoordinates(geocode, { ...location, address: fields.fullAddress, addressFields: fields }, mode, 'manual');
     } catch (error) {
-      const message = error?.message || 'Couldn’t find stores near this address';
-      console.warn('[Store Lookup] failed:', message);
+      const message = error?.message || 'Couldn’t find stores near this address.';
+      console.warn('[Store Lookup] lookup error:', message);
       console.log('[Store Lookup] stores returned count', 0);
       setNearbyStores([]);
       setShoppingConnectionStatus('Not Connected');
-      setShoppingNotice('Couldn’t find stores near this address');
+      setShoppingNotice(message);
       setStoreLookupDebug({
         mode: 'fallback',
+        permissionStatus: locationPermissionStatus,
         lastAddress: fields.fullAddress,
+        currentCoordinates: '',
         coordinates: '',
         count: 0,
         error: message
       });
       setShoppingResults([]);
+      setIsNearbyStoresLoading(false);
+    }
+  }
+
+  async function useCurrentLocationForStores() {
+    setIsNearbyStoresLoading(true);
+    setShoppingNotice('');
+    let permissionStatus = locationPermissionStatus;
+    try {
+      const permission = await Location.requestForegroundPermissionsAsync();
+      console.log('[Store Lookup] permission status', permission.status);
+      permissionStatus = permission.status;
+      setLocationPermissionStatus(permission.status);
+      if (permission.status !== 'granted') {
+        const message = 'Location permission is needed to find nearby stores. You can still search by ZIP code or city.';
+        setNearbyStores([]);
+        setShoppingConnectionStatus('Not Connected');
+        setShoppingNotice(message);
+        setStoreLookupDebug({
+          mode: 'fallback',
+          permissionStatus: permission.status,
+          lastAddress: 'Current Location',
+          currentCoordinates: '',
+          coordinates: '',
+          count: 0,
+          error: message
+        });
+        console.log('[Store Lookup] lookup error', message);
+        return;
+      }
+      const position = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      const coordinates = {
+        latitude: position.coords.latitude,
+        longitude: position.coords.longitude,
+        label: 'Current Location'
+      };
+      console.log('[Store Lookup] current lat/lng', coordinates);
+      const nextLocation = {
+        address: 'Current Location',
+        addressFields: { street: '', zip: '', city: '', state: '', fullAddress: 'Current Location' },
+        source: 'GPS',
+        coordinates,
+        fulfillmentMode
+      };
+      setShoppingLocation(nextLocation);
+      setShoppingLocationDraft('Current Location');
+      setShoppingStoreFilter('All Stores');
+      await updateOfflineCache(setCachedItem(SHOPPING_LOCATION_KEY, JSON.stringify(nextLocation)));
+      syncQuietly('shopping location', () => syncUserPreferences(preferenceSnapshot({ shoppingLocation: nextLocation })));
+      await loadStoresFromCoordinates(coordinates, nextLocation, fulfillmentMode, 'GPS', permission.status);
+      setScreen('shoppingStores');
+    } catch (error) {
+      const message = error?.message || 'Couldn’t find stores from your current location.';
+      console.warn('[Store Lookup] lookup error:', message);
+      setNearbyStores([]);
+      setShoppingConnectionStatus('Not Connected');
+      setShoppingNotice(message);
+      setStoreLookupDebug({
+        mode: 'fallback',
+        permissionStatus,
+        lastAddress: 'Current Location',
+        currentCoordinates: '',
+        coordinates: '',
+        count: 0,
+        error: message
+      });
     } finally {
       setIsNearbyStoresLoading(false);
     }
@@ -7040,7 +7175,11 @@ export default function App() {
           <FlowProgress steps={['Location', 'Stores', 'Cart']} current={0} tone={flowColors.shopping} />
           <View style={[styles.shopSearchCard, { borderColor: flowColors.shopping.tint }]}>
             <Text style={[styles.shopTitle, { color: flowColors.shopping.accent }]}>Find Stores Near You</Text>
-            <Text style={styles.settingsSubtitle}>Enter a full address, ZIP code, or city and state to see nearby real grocery stores.</Text>
+            <Text style={styles.settingsSubtitle}>Use your current location for the most reliable nearby grocery results.</Text>
+            <Button accent={flowColors.shopping.accent} onPress={useCurrentLocationForStores} disabled={isNearbyStoresLoading}>
+              {isNearbyStoresLoading ? 'Finding Stores...' : 'Use My Current Location'}
+            </Button>
+            <Text style={styles.settingsSubtitle}>Or search manually by street address, ZIP code, or city and state.</Text>
             {[
               ['street', 'Street Address', '123 Main Street'],
               ['zip', 'ZIP Code', '85001'],
@@ -7078,7 +7217,7 @@ export default function App() {
             </View>
           </View>
           <Button accent={flowColors.shopping.accent} onPress={saveShoppingLocation} disabled={isNearbyStoresLoading}>
-            {isNearbyStoresLoading ? 'Finding Stores...' : 'Save Location'}
+            {isNearbyStoresLoading ? 'Finding Stores...' : 'Search Manually'}
           </Button>
           {shoppingNotice ? (
             <View style={styles.noticeCard}>
@@ -7119,7 +7258,9 @@ export default function App() {
                 <Text style={styles.listTitle}>{store.name}</Text>
                 <Text style={[styles.storeStatus, store.status !== 'Open' && styles.storeStatusClosing]}>{store.status}</Text>
               </View>
-              <Text style={styles.shopItemMeta}>{[store.distance, store.eta, store.fee].filter(Boolean).join(' • ')}</Text>
+              <Text style={styles.shopItemMeta}>{store.address}</Text>
+              <Text style={styles.shopItemMeta}>{[store.category, store.distance, store.minutes].filter(Boolean).join(' • ')}</Text>
+              <Text style={styles.shopItemMeta}>{[store.eta, store.fee].filter(Boolean).join(' • ')}</Text>
               <Text style={[styles.orderHistoryText, { color: flowColors.shopping.accent }]}>Shop this store</Text>
             </Pressable>
           ))}
@@ -8318,8 +8459,10 @@ export default function App() {
               ['Current AI mode', aiScanMode],
               ['Development bridge', scanEndpointIsDevelopment ? 'In use' : 'Not in use'],
               ['Store lookup mode', storeLookupDebug.mode],
-              ['Last searched address', storeLookupDebug.lastAddress || 'None'],
-              ['Last geocode coordinates', storeLookupDebug.coordinates || 'None'],
+              ['Location permission status', storeLookupDebug.permissionStatus || locationPermissionStatus],
+              ['Last current coordinates', storeLookupDebug.currentCoordinates || 'None'],
+              ['Last searched location', storeLookupDebug.lastAddress || 'None'],
+              ['Last lookup coordinates', storeLookupDebug.coordinates || 'None'],
               ['Store count returned', `${storeLookupDebug.count}`],
               ['Last store lookup error', storeLookupDebug.error || 'None'],
               ['Support email', SUPPORT_EMAIL]

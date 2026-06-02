@@ -16,6 +16,7 @@
       "buildNumber": "1",
       "infoPlist": {
         "NSCameraUsageDescription": "FoodFusion AI uses fridge and pantry photos to suggest meals.",
+        "NSLocationWhenInUseUsageDescription": "FoodFusion AI uses your location to find nearby grocery stores and shopping options.",
         "NSLocalNetworkUsageDescription": "FoodFusion AI connects to your nearby analysis service while testing photo scans."
       }
     },
@@ -31,6 +32,12 @@
         "expo-image-picker",
         {
           "cameraPermission": "FoodFusion AI uses fridge and pantry photos to suggest meals."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "FoodFusion AI uses your location to find nearby grocery stores and shopping options."
         }
       ],
       "expo-status-bar",
