@@ -16,6 +16,9 @@ const openAiModel = process.env.OPENAI_VISION_MODEL || 'gpt-4.1-mini';
 const scanAccessToken = process.env.FOODFUSION_SCAN_ACCESS_TOKEN?.trim();
 const isNetworkExposed = !['127.0.0.1', 'localhost', '::1'].includes(host);
 const maxJsonBodyBytes = Number(process.env.FOODFUSION_MAX_JSON_BODY_BYTES || 8 * 1024 * 1024);
+const spoonacularApiKey = process.env.SPOONACULAR_API_KEY?.trim();
+const edamamAppId = process.env.EDAMAM_APP_ID?.trim();
+const edamamAppKey = process.env.EDAMAM_APP_KEY?.trim();
 
 if (process.env.EXPO_PUBLIC_OPENAI_API_KEY) {
   throw new Error('Remove EXPO_PUBLIC_OPENAI_API_KEY. OpenAI credentials must never be exposed to the mobile app.');
@@ -275,6 +278,118 @@ function normalizeRecipe(recipe, fallbackIngredients = []) {
   };
 }
 
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function recipesFromSpoonacular(ingredients, options = {}) {
+  if (!spoonacularApiKey) {
+    throw new Error('Spoonacular is not configured');
+  }
+  const query = encodeURIComponent(ingredients.slice(0, 6).join(','));
+  const data = await fetchJsonWithTimeout(`https://api.spoonacular.com/recipes/findByIngredients?ingredients=${query}&number=3&ranking=1&ignorePantry=true&apiKey=${encodeURIComponent(spoonacularApiKey)}`);
+  const recipes = Array.isArray(data) ? data : [];
+  if (recipes.length === 0) {
+    throw new Error('Spoonacular returned no recipes');
+  }
+  return recipes.map((recipe) => normalizeRecipe({
+    title: recipe.title,
+    ingredients: [
+      ...(recipe.usedIngredients || []).map((item) => item.name),
+      ...(recipe.missedIngredients || []).map((item) => item.name)
+    ].filter(Boolean),
+    missingIngredients: (recipe.missedIngredients || []).map((item) => item.name).filter(Boolean),
+    time: '25 min'
+  }, ingredients)).slice(0, 3);
+}
+
+async function recipesFromMealDb(ingredients, options = {}) {
+  const primary = encodeURIComponent(ingredients[0] || 'chicken');
+  const data = await fetchJsonWithTimeout(`https://www.themealdb.com/api/json/v1/1/filter.php?i=${primary}`);
+  const meals = Array.isArray(data?.meals) ? data.meals.slice(0, 3) : [];
+  if (meals.length === 0) {
+    throw new Error('TheMealDB returned no recipes');
+  }
+  const detailed = await Promise.all(meals.map(async (meal) => {
+    try {
+      const detail = await fetchJsonWithTimeout(`https://www.themealdb.com/api/json/v1/1/lookup.php?i=${meal.idMeal}`);
+      const fullMeal = detail?.meals?.[0] || meal;
+      const mealIngredients = Array.from({ length: 20 }, (_, index) => fullMeal[`strIngredient${index + 1}`])
+        .filter(Boolean)
+        .map((item) => item.trim())
+        .filter(Boolean);
+      return normalizeRecipe({
+        title: fullMeal.strMeal || meal.strMeal,
+        ingredients: mealIngredients,
+        instructions: fullMeal.strInstructions || 'Cook according to taste.',
+        time: '30 min'
+      }, ingredients);
+    } catch {
+      return normalizeRecipe({ title: meal.strMeal, ingredients, time: '30 min' }, ingredients);
+    }
+  }));
+  return detailed.filter(Boolean);
+}
+
+async function recipesFromEdamam(ingredients, options = {}) {
+  if (!edamamAppId || !edamamAppKey) {
+    throw new Error('Edamam is not configured');
+  }
+  const query = encodeURIComponent(ingredients.slice(0, 6).join(' '));
+  const data = await fetchJsonWithTimeout(`https://api.edamam.com/api/recipes/v2?type=public&q=${query}&app_id=${encodeURIComponent(edamamAppId)}&app_key=${encodeURIComponent(edamamAppKey)}`);
+  const recipes = Array.isArray(data?.hits) ? data.hits.map((hit) => hit.recipe).slice(0, 3) : [];
+  if (recipes.length === 0) {
+    throw new Error('Edamam returned no recipes');
+  }
+  return recipes.map((recipe) => normalizeRecipe({
+    title: recipe.label,
+    ingredients: recipe.ingredientLines,
+    time: recipe.totalTime ? `${recipe.totalTime} min` : '25 min',
+    macros: {
+      calories: Math.round(recipe.calories || 480),
+      protein: Math.round(recipe.totalNutrients?.PROCNT?.quantity || 24),
+      carbs: Math.round(recipe.totalNutrients?.CHOCDF?.quantity || 52),
+      fat: Math.round(recipe.totalNutrients?.FAT?.quantity || 18)
+    }
+  }, ingredients));
+}
+
+async function recipesFromFallbackSources(ingredients = [], options = {}) {
+  const sources = [
+    ['spoonacular', recipesFromSpoonacular],
+    ['themealdb', recipesFromMealDb],
+    ['edamam', recipesFromEdamam],
+    ['internal', async () => fallbackRecipes(ingredients, options)]
+  ];
+  const chain = [];
+  for (const [source, loader] of sources) {
+    try {
+      const recipes = await loader(ingredients, options);
+      if (recipes.length > 0) {
+        console.log('[Recipe MCP] source used', source);
+        console.log('[Recipe MCP] fallback chain', [...chain, source].join(' -> '));
+        return { recipes, source, fallbackChain: [...chain, source] };
+      }
+      throw new Error(`${source} returned no recipes`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      chain.push(`${source}: ${message}`);
+      console.warn('[Recipe MCP] source failed', { source, error: message });
+    }
+  }
+  return { recipes: fallbackRecipes(ingredients, options), source: 'internal', fallbackChain: chain };
+}
+
 async function ensureClient() {
   if (clientPromise) {
     return clientPromise;
@@ -343,10 +458,13 @@ async function recipesFromIngredients({
       protein: preferences.some((preference) => `${preference}`.toLowerCase().includes('protein')) ? '40' : '30'
     });
     const normalized = normalizeRecipe(recipe, ingredients);
-    return [normalized, ...fallbackRecipes(ingredients, { recipeType, preferences }).filter((item) => item.title !== normalized.title)].slice(0, 3);
+    const recipes = [normalized, ...fallbackRecipes(ingredients, { recipeType, preferences }).filter((item) => item.title !== normalized.title)].slice(0, 3);
+    console.log('[Recipe MCP] source used', 'hosted');
+    return { recipes, source: 'hosted', fallbackChain: ['hosted'] };
   } catch (error) {
-    console.error('[recipe-bridge] Falling back to saved recipes:', error.message);
-    return fallbackRecipes(ingredients, { recipeType, preferences });
+    console.error('[Recipe MCP] source failed', { source: 'hosted', error: error.message });
+    console.log('[Recipe MCP] fallback reason', error.message);
+    return recipesFromFallbackSources(ingredients, { recipeType, preferences, equipment, servings });
   }
 }
 
@@ -397,7 +515,7 @@ async function handleJsonRpc(body) {
   }
 
   if (method === 'recipes/fromIngredients' || method === 'getRecipesFromIngredients') {
-    return { recipes: await recipesFromIngredients(params) };
+    return await recipesFromIngredients(params);
   }
 
   if (method === 'getRecipeDetails') {
@@ -470,7 +588,7 @@ const server = http.createServer(async (request, response) => {
         return;
       }
       const body = await readBody(request);
-      send(response, 200, { recipes: await recipesFromIngredients(body) });
+      send(response, 200, await recipesFromIngredients(body));
       return;
     }
 

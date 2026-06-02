@@ -28,6 +28,7 @@ import * as Location from 'expo-location';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import {
   checkRecipeMcpStatus,
+  getRecipeMcpDebug,
   getRecipesFromMcp
 } from './services/recipeMcp';
 import {
@@ -327,7 +328,7 @@ const kitchenEquipmentOptions = [
 ];
 const moodOptions = ['Comfort', 'Light', 'Filling', 'Post-Workout', 'Lazy', 'Sweet'];
 const servingOptions = [1, 2, 4];
-const recipeSourceOptions = ['On-device Recipes', 'Recipe MCP Server', 'Hybrid Mode'];
+const recipeSourceOptions = ['Hosted Recipe Intelligence', 'Hybrid Mode'];
 const freshnessOptions = ['fresh', 'use soon', 'almost expired'];
 const APP_VERSION = '1.0.0';
 const APP_BUILD_NUMBER = '1';
@@ -2732,6 +2733,7 @@ export default function App() {
     { role: 'assistant', text: 'Ask me what to cook, what to buy, or how to use leftovers.' }
   ]);
   const [recipeMcpStatus, setRecipeMcpStatus] = useState({ connected: false, status: 'Not Connected' });
+  const [recipeMcpDebug, setRecipeMcpDebug] = useState(getRecipeMcpDebug());
   const [recipeSource, setRecipeSource] = useState('Hybrid Mode');
   const [recipeNotice, setRecipeNotice] = useState('');
   const [isScanningPhoto, setIsScanningPhoto] = useState(false);
@@ -3649,8 +3651,12 @@ export default function App() {
   }, [authBootstrapped]);
 
   useEffect(() => {
-    checkRecipeMcpStatus().then(setRecipeMcpStatus).catch(() => {
+    checkRecipeMcpStatus().then((status) => {
+      setRecipeMcpStatus(status);
+      setRecipeMcpDebug(getRecipeMcpDebug());
+    }).catch(() => {
       setRecipeMcpStatus({ connected: false, status: 'Not Connected' });
+      setRecipeMcpDebug(getRecipeMcpDebug());
     });
   }, []);
 
@@ -5812,30 +5818,31 @@ export default function App() {
     }, budgetGoals, macroLock);
     const mealLimit = isPremium ? 6 : 3;
     let mcpMeals = [];
-    let matchingNotice = 'Smart Matching is using your saved recipe library.';
+    let matchingNotice = 'Recipe intelligence is temporarily unavailable. Showing saved recipe options.';
 
-    if (recipeSource !== 'On-device Recipes') {
-      try {
-        const status = await checkRecipeMcpStatus();
-        setRecipeMcpStatus(status);
-        if (status.connected) {
-          mcpMeals = await getRecipesFromMcp({
-            ingredients,
-            recipeType: selectedRecipeType,
-            preferences: mealSettings.preferences,
-            equipment,
-            servings
-          });
-          matchingNotice = mcpMeals.length > 0
-            ? 'Smart Matching connected. Recipes generated through Recipe Intelligence.'
-            : 'Recipe Intelligence returned no matches. Smart Matching is using your saved recipe library.';
-        } else {
-          matchingNotice = 'Recipe Intelligence unavailable. Smart Matching is using your saved recipe library.';
-        }
-      } catch {
-        mcpMeals = [];
-        matchingNotice = 'Recipe Intelligence unavailable. Smart Matching is using your saved recipe library.';
-      }
+    try {
+      mcpMeals = await getRecipesFromMcp({
+        ingredients,
+        recipeType: selectedRecipeType,
+        preferences: mealSettings.preferences,
+        equipment,
+        servings
+      });
+      const debug = getRecipeMcpDebug();
+      setRecipeMcpDebug(debug);
+      setRecipeMcpStatus({
+        connected: debug.mode === 'hosted',
+        status: debug.mode === 'hosted' ? 'Connected' : 'Temporarily Unavailable',
+        source: debug.mode === 'hosted' ? 'Recipe MCP' : 'Saved recipe options',
+        ...debug
+      });
+      matchingNotice = debug.mode === 'hosted'
+        ? 'Smart Matching connected. Recipes generated through Recipe Intelligence.'
+        : 'Recipe intelligence is temporarily unavailable. Showing saved recipe options.';
+    } catch (error) {
+      mcpMeals = [];
+      setRecipeMcpDebug(getRecipeMcpDebug());
+      matchingNotice = 'Recipe intelligence is temporarily unavailable. Showing saved recipe options.';
     }
 
     const localMeals = buildMeals(ingredients, isPremium, selectedMode, mealSettings);
@@ -5970,6 +5977,7 @@ export default function App() {
   async function testRecipeMcpConnection() {
     const status = await checkRecipeMcpStatus();
     setRecipeMcpStatus(status);
+    setRecipeMcpDebug(getRecipeMcpDebug());
   }
 
   if (!startupComplete || onboardingCompleted === null) {
@@ -8296,6 +8304,11 @@ export default function App() {
               ['MCP endpoint value', RECIPE_MCP_ENDPOINT || 'Missing'],
               ['Current AI mode', aiScanMode],
               ['Development bridge', scanEndpointIsDevelopment ? 'In use' : 'Not in use'],
+              ['Recipe MCP endpoint used', recipeMcpDebug.endpointUsed || RECIPE_MCP_ENDPOINT || 'Missing'],
+              ['Recipe MCP mode', recipeMcpDebug.mode || 'hosted'],
+              ['Last MCP error', recipeMcpDebug.lastError || 'None'],
+              ['Last MCP response status', recipeMcpDebug.lastStatus || 'None'],
+              ['Recipe source used', recipeMcpDebug.sourceUsed || 'hosted'],
               ['Store lookup mode', storeLookupDebug.mode],
               ['Location permission status', storeLookupDebug.permissionStatus || locationPermissionStatus],
               ['Last GPS coordinates', storeLookupDebug.currentCoordinates || 'None'],
