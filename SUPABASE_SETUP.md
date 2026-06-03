@@ -8,7 +8,12 @@ FoodFusion can use Supabase authentication once environment values are provided.
 2. Copy `.env.example` to `.env.local`.
 3. Set `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY`.
 4. Add `https://foodfusion-ai-site.onrender.com/reset-password` to your Supabase Auth redirect URL allow list for password resets. Keep mobile deep links only for app auth flows that explicitly need them.
-5. Deploy the tracked database migrations through the Supabase CLI:
+5. In Render, set the hosted reset page public client values:
+   - `SUPABASE_URL` or `EXPO_PUBLIC_SUPABASE_URL`
+   - `SUPABASE_ANON_KEY` or `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY`
+
+   Use the publishable/anon client key only. Do not use the `service_role` key for the hosted reset page.
+6. Deploy the tracked database migrations through the Supabase CLI:
 
 ```bash
 cd /Users/zandishoover/Downloads/FF
@@ -18,7 +23,7 @@ npx --yes supabase@latest db push
 ```
 
 This applies `supabase/migrations/001_auth_foundation.sql` and `supabase/migrations/002_foodfusion_data_model.sql`. The app-facing tables use Row Level Security and authenticated ownership policies; never place a Supabase `service_role` or secret key in Expo environment variables.
-6. Restart Expo so environment values are bundled.
+7. Restart Expo so environment values are bundled.
 
 Do not put a Supabase `service_role` key in this mobile app.
 

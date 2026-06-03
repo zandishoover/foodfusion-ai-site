@@ -1202,6 +1202,17 @@ function authPageShell({ title, subtitle, body, script = '' }) {
       color: var(--danger);
       border-color: rgba(255, 125, 125, 0.35);
     }
+    .return-link {
+      min-height: 48px;
+      display: none;
+      place-items: center;
+      margin-top: 16px;
+      border-radius: 999px;
+      background: var(--blue);
+      color: #07101a;
+      font-weight: 900;
+      text-decoration: none;
+    }
     .footer {
       margin-top: 22px;
       font-size: 13px;
@@ -1256,6 +1267,7 @@ function resetPasswordPage() {
         <button id="submit-button" type="submit" disabled>Update Password</button>
       </form>
       <div id="message" class="message"></div>
+      <a id="return-link" class="return-link" href="foodfusion://auth/callback">Return to FoodFusion</a>
     `,
     script: `
       <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -1268,6 +1280,7 @@ function resetPasswordPage() {
         const passwordInput = document.getElementById('password');
         const confirmPasswordInput = document.getElementById('confirm-password');
         const rulesWrap = document.getElementById('password-rules');
+        const returnLink = document.getElementById('return-link');
         const strongPasswordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[^A-Za-z\\d]).{10,}$/;
         console.log('[Auth] hosted reset page loaded');
         const passwordRules = [
@@ -1284,6 +1297,11 @@ function resetPasswordPage() {
           message.style.display = 'block';
         }
 
+        function showInvalidResetLink() {
+          form.style.display = 'none';
+          showMessage('Reset link expired or invalid.', 'error');
+        }
+
         if (!SUPABASE_URL || !SUPABASE_KEY) {
           form.style.display = 'none';
           showMessage('Password reset is temporarily unavailable. Please contact FoodFusion AI support.', 'error');
@@ -1295,6 +1313,8 @@ function resetPasswordPage() {
               accessToken: hashParams.get('access_token') || queryParams.get('access_token'),
               refreshToken: hashParams.get('refresh_token') || queryParams.get('refresh_token'),
               type: hashParams.get('type') || queryParams.get('type'),
+              error: hashParams.get('error') || queryParams.get('error'),
+              errorDescription: hashParams.get('error_description') || queryParams.get('error_description'),
               code: queryParams.get('code') || hashParams.get('code')
             };
           }
@@ -1334,14 +1354,17 @@ function resetPasswordPage() {
           });
 
           const recoveryParams = readRecoveryParams();
-          if (recoveryParams.accessToken && recoveryParams.refreshToken) {
+          if (recoveryParams.error) {
+            console.warn('[Auth] password update fail', recoveryParams.errorDescription || recoveryParams.error);
+            showInvalidResetLink();
+          } else if (recoveryParams.accessToken && recoveryParams.refreshToken) {
             client.auth.setSession({
               access_token: recoveryParams.accessToken,
               refresh_token: recoveryParams.refreshToken
             }).then(({ error }) => {
               if (error) {
                 console.warn('[Auth] password update fail', error);
-                showMessage('Password reset link could not be verified. Please request a new reset link.', 'error');
+                showInvalidResetLink();
                 return;
               }
               showMessage('Enter your new password below.', 'success');
@@ -1350,13 +1373,13 @@ function resetPasswordPage() {
             client.auth.exchangeCodeForSession(recoveryParams.code).then(({ error }) => {
               if (error) {
                 console.warn('[Auth] password update fail', error);
-                showMessage('Password reset link could not be verified. Please request a new reset link.', 'error');
+                showInvalidResetLink();
                 return;
               }
               showMessage('Enter your new password below.', 'success');
             });
-          } else if (recoveryParams.type !== 'recovery') {
-            showMessage('Open this page from your password reset email to update your password.', 'error');
+          } else {
+            showInvalidResetLink();
           }
 
           client.auth.onAuthStateChange((event) => {
@@ -1394,7 +1417,8 @@ function resetPasswordPage() {
               }
               console.log('[Auth] password update success');
               form.style.display = 'none';
-              showMessage('Password updated. You can now return to FoodFusion AI and log in.', 'success');
+              showMessage('Password updated successfully.', 'success');
+              returnLink.style.display = 'grid';
             } catch (error) {
               console.warn('[Auth] password update fail', error);
               showMessage('Password update failed. Please request a new reset link.', 'error');
@@ -1470,18 +1494,19 @@ const server = http.createServer(async (request, response) => {
     }
 
     const url = new URL(request.url, `http://localhost:${port}`);
+    const pathname = url.pathname.replace(/\/+$/, '') || '/';
 
-    if (request.method === 'GET' && url.pathname === '/confirm') {
+    if (request.method === 'GET' && pathname === '/confirm') {
       sendHtml(response, 200, confirmationPage());
       return;
     }
 
-    if (request.method === 'GET' && url.pathname === '/reset-password') {
+    if (request.method === 'GET' && pathname === '/reset-password') {
       sendHtml(response, 200, resetPasswordPage());
       return;
     }
 
-    if (request.method === 'GET' && url.pathname === '/health') {
+    if (request.method === 'GET' && pathname === '/health') {
       const recipeMcp = await getRecipeMcpHealth();
       send(response, 200, {
         connected: true,
@@ -1496,7 +1521,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === 'POST' && (url.pathname === '/recipes/from-ingredients' || url.pathname === '/recipes')) {
+    if (request.method === 'POST' && (pathname === '/recipes/from-ingredients' || pathname === '/recipes')) {
       if (!hasValidBridgeToken(request)) {
         send(response, 401, { error: 'Bridge authorization failed.' });
         return;
@@ -1506,7 +1531,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === 'POST' && url.pathname === '/scan-food') {
+    if (request.method === 'POST' && pathname === '/scan-food') {
       if (!hasValidBridgeToken(request)) {
         console.error('[FoodScan Bridge] Unauthorized scan request rejected.');
         send(response, 401, { error: 'Scan authorization failed.' });
@@ -1523,7 +1548,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === 'POST' && url.pathname === '/recipe/details') {
+    if (request.method === 'POST' && pathname === '/recipe/details') {
       if (!hasValidBridgeToken(request)) {
         send(response, 401, { error: 'Bridge authorization failed.' });
         return;
@@ -1533,7 +1558,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === 'GET' && url.pathname.startsWith('/recipes/')) {
+    if (request.method === 'GET' && pathname.startsWith('/recipes/')) {
       if (!hasValidBridgeToken(request)) {
         send(response, 401, { error: 'Bridge authorization failed.' });
         return;
@@ -1542,7 +1567,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === 'POST' && url.pathname === '/substitutions') {
+    if (request.method === 'POST' && pathname === '/substitutions') {
       if (!hasValidBridgeToken(request)) {
         send(response, 401, { error: 'Bridge authorization failed.' });
         return;
@@ -1552,7 +1577,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === 'POST' && url.pathname === '/nutrition/estimate') {
+    if (request.method === 'POST' && pathname === '/nutrition/estimate') {
       if (!hasValidBridgeToken(request)) {
         send(response, 401, { error: 'Bridge authorization failed.' });
         return;
@@ -1562,7 +1587,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === 'POST' && url.pathname === '/nutrition/macros') {
+    if (request.method === 'POST' && pathname === '/nutrition/macros') {
       if (!hasValidBridgeToken(request)) {
         send(response, 401, { error: 'Bridge authorization failed.' });
         return;
@@ -1582,7 +1607,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === 'POST' && url.pathname === '/mcp') {
+    if (request.method === 'POST' && pathname === '/mcp') {
       if (!hasValidBridgeToken(request)) {
         send(response, 401, { error: 'Bridge authorization failed.' });
         return;
