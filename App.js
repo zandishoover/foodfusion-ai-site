@@ -7,6 +7,7 @@ import {
   Image,
   KeyboardAvoidingView,
   Linking,
+  LogBox,
   Platform,
   Pressable,
   SafeAreaView,
@@ -73,16 +74,29 @@ import {
   purchaseYearlySubscription,
   restoreRevenueCatPurchases,
   revenueCatConfigured,
-  revenueCatDebugConfig
+  revenueCatDebugConfig,
+  revenueCatSetupPaused,
+  isKnownRevenueCatSetupError
 } from './services/revenueCat';
 import { PremiumProvider, usePremium } from './contexts/PremiumContext';
+
+if (__DEV__) {
+  LogBox.ignoreLogs([
+    'There was a problem with the App Store',
+    'products could not be fetched',
+    'offerings are empty',
+    'OfferingsManager',
+    "couldn't be completed",
+    'couldn’t be completed',
+    'could not be completed'
+  ]);
+}
 
 const SCAN_KEY = 'foodfusion:lastScanDate';
 const PREMIUM_KEY = 'foodfusion:fusionPlus';
 const PREMIUM_PLAN_KEY = 'foodfusion:fusionPlusPlan';
 const AUTH_KEY = 'foodfusion:isLoggedIn';
 const USER_PROFILE_KEY = 'foodfusion:userProfile';
-const APPLE_AUTH_KEY = 'foodfusion:appleAuthSession';
 const HISTORY_KEY = 'foodfusion:mealHistory';
 const FAVORITES_KEY = 'foodfusion:favorites';
 const GROCERY_KEY = 'foodfusion:groceryList';
@@ -199,7 +213,7 @@ function readableAuthError(error) {
 
 function isReviewDemoProfile(profile) {
   const email = profile?.email?.toLowerCase() || '';
-  return profile?.provider === 'apple' || email.includes('demo') || email.includes('review') || email.includes('privaterelay.appleid.com');
+  return email.includes('demo') || email.includes('review');
 }
 
 const palette = {
@@ -2423,7 +2437,8 @@ function FusionPlusScreen({
   onSelectPlan,
   onManage,
   selectedPlan,
-  premiumAccess
+  premiumAccess,
+  setupPaused
 }) {
   const currentPlan = fusionPlanById(selectedPlan);
 
@@ -2506,6 +2521,8 @@ function FusionPlusScreen({
 
         {premiumAccess.status === 'loading' ? (
           <Text style={styles.authMessage}>Checking Fusion+ access...</Text>
+        ) : setupPaused ? (
+          <Text style={styles.authMessage}>Purchases are paused for Apple setup. App testing can continue.</Text>
         ) : premiumAccess.error ? (
           <Text style={styles.authError}>{premiumAccess.error}</Text>
         ) : null}
@@ -2531,7 +2548,6 @@ function AuthScreen({
   onChange,
   onLogin,
   onSignUp,
-  onContinueWithApple,
   onResetPassword,
   onResendConfirmation,
   onShowLogin,
@@ -2657,23 +2673,6 @@ function AuthScreen({
               <Pressable onPress={onResendConfirmation} style={styles.authSwitch}>
                 <Text style={styles.authSwitchText}>Resend confirmation email</Text>
               </Pressable>
-            ) : null}
-            {!isForgotPassword ? (
-              <>
-                <View style={styles.authDividerRow}>
-                  <View style={styles.authDivider} />
-                  <Text style={styles.authDividerText}>OR</Text>
-                  <View style={styles.authDivider} />
-                </View>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Continue with Apple"
-                  onPress={onContinueWithApple}
-                  style={({ pressed }) => [styles.appleAuthButton, pressed && styles.pressed]}
-                >
-                  <Text style={styles.appleAuthText}>Continue with Apple</Text>
-                </Pressable>
-              </>
             ) : null}
             {!isSignUp && !isForgotPassword ? (
               <Pressable onPress={onShowForgotPassword} style={styles.authSwitch}>
@@ -2904,7 +2903,6 @@ function FoodFusionApp() {
   const manualIngredientInputRef = useRef(null);
   const toastTimeoutRef = useRef(null);
   const expiryAlertKeyRef = useRef('');
-  const appleSessionRef = useRef(false);
   const syncQueueRef = useRef(Promise.resolve());
   const activeUserIdRef = useRef(null);
   const accountHydrateRef = useRef(0);
@@ -3300,7 +3298,7 @@ function FoodFusionApp() {
     ]), 'Subscription cache save', 2500).catch((error) => {
       console.warn('[Subscription] Cache save deferred:', error?.message);
     });
-    if (supabaseConfigured && isLoggedIn && !appleSessionRef.current && activeUserIdRef.current === userId) {
+    if (supabaseConfigured && isLoggedIn && activeUserIdRef.current === userId) {
       await withRestoreTimeout(
         syncSubscriptionStatus({
           isPremium: active,
@@ -3366,7 +3364,7 @@ function FoodFusionApp() {
 
   async function restoreSubscriptionForUser(userId, options = {}) {
     console.log('[Subscription] restoring for userId', userId);
-    if (revenueCatConfigured() && userId && !appleSessionRef.current) {
+    if (revenueCatConfigured() && userId) {
       try {
         const revenueCatSubscription = await withRestoreTimeout(
           getRevenueCatSubscription(userId),
@@ -3388,7 +3386,11 @@ function FoodFusionApp() {
         });
         return applySubscriptionResultForUser(userId, revenueCatSubscription, 'RevenueCat');
       } catch (error) {
-        console.warn('[Subscription] RevenueCat restore failed, using offline fallback:', error?.message || String(error));
+        if (isKnownRevenueCatSetupError(error) || revenueCatSetupPaused()) {
+          console.log('[RevenueCat] setup paused:', error?.message || String(error));
+        } else {
+          console.warn('[Subscription] RevenueCat restore failed, using offline fallback:', error?.message || String(error));
+        }
         setRevenueCatDebug(revenueCatDebugConfig());
       }
     }
@@ -3400,7 +3402,7 @@ function FoodFusionApp() {
     ).catch(() => emptyAccountRestoreSnapshot());
 
     let remoteSubscription = options.remoteSubscription;
-    if (options.fetchRemote && supabaseConfigured && !appleSessionRef.current) {
+    if (options.fetchRemote && supabaseConfigured) {
       try {
         const remote = await withRestoreTimeout(loadSyncedUserData(), 'Subscription Supabase restore');
         remoteSubscription = remote?.subscription || null;
@@ -3424,7 +3426,7 @@ function FoodFusionApp() {
       finalActive = true;
       finalPlan = cachedAccount.subscription.selectedPlan || 'yearly';
       source = 'Cache';
-      if (options.syncCacheToSupabase && supabaseConfigured && !appleSessionRef.current && activeUserIdRef.current === userId) {
+      if (options.syncCacheToSupabase && supabaseConfigured && activeUserIdRef.current === userId) {
         try {
           await withRestoreTimeout(
             syncSubscriptionStatus({ isPremium: true, selectedPlan: finalPlan }),
@@ -3622,6 +3624,8 @@ function FoodFusionApp() {
   }
 
   const fusionStatusLoading = Boolean(isLoggedIn && subscriptionLoading);
+  const revenueCatSetupPausedForDev = __DEV__ && Boolean(revenueCatDebug.setupPaused);
+  const devForceFusionPlusEnabled = __DEV__ && Boolean(revenueCatDebug.devForceFusionPlus);
   const scansLeft = fusionStatusLoading || isPremium || scanDate !== todayKey();
   const recentRecipes = useMemo(() => {
     const seen = new Set();
@@ -3720,10 +3724,9 @@ function FoodFusionApp() {
   }, [currentPantryIngredients, favorites, globalSearchQuery, recentRecipes]);
   useEffect(() => {
     async function loadState() {
-      const [storedLoggedIn, storedUserProfile, storedAppleSession, storedOnboarding, storedCameraPermissionIntro, storedQaChecklist] = await Promise.all([
+      const [storedLoggedIn, storedUserProfile, storedOnboarding, storedCameraPermissionIntro, storedQaChecklist] = await Promise.all([
         AsyncStorage.getItem(AUTH_KEY),
         AsyncStorage.getItem(USER_PROFILE_KEY),
-        AsyncStorage.getItem(APPLE_AUTH_KEY),
         AsyncStorage.getItem(ONBOARDING_KEY),
         AsyncStorage.getItem(CAMERA_PERMISSION_INTRO_KEY),
         AsyncStorage.getItem(QA_CHECKLIST_KEY)
@@ -3738,10 +3741,7 @@ function FoodFusionApp() {
           sessionProfile = null;
         }
       }
-      const localAppleProfile = storedAppleSession === 'true' && storedUserProfile
-        ? JSON.parse(storedUserProfile)
-        : null;
-      const activeProfile = localAppleProfile || (supabaseConfigured ? sessionProfile : storedUserProfile ? JSON.parse(storedUserProfile) : null);
+      const activeProfile = supabaseConfigured ? sessionProfile : storedUserProfile ? JSON.parse(storedUserProfile) : null;
       const activeUserId = stableUserId(activeProfile);
       activeUserIdRef.current = activeUserId;
       const cachedAccount = await withRestoreTimeout(
@@ -3749,9 +3749,8 @@ function FoodFusionApp() {
         'Startup account cache restore',
         2500
       ).catch(() => emptyAccountRestoreSnapshot());
-      const needsRemoteRestore = Boolean(sessionProfile) && !localAppleProfile;
-      appleSessionRef.current = Boolean(localAppleProfile);
-      setIsLoggedIn(localAppleProfile ? true : supabaseConfigured ? Boolean(sessionProfile) : storedLoggedIn === 'true');
+      const needsRemoteRestore = Boolean(sessionProfile);
+      setIsLoggedIn(supabaseConfigured ? Boolean(sessionProfile) : storedLoggedIn === 'true');
       setUserProfile(activeProfile);
       setAuthDebug((current) => ({
         ...current,
@@ -3779,8 +3778,6 @@ function FoodFusionApp() {
       setQaChecklist(storedQaChecklist ? JSON.parse(storedQaChecklist) : {});
       if (needsRemoteRestore) {
         await hydrateSyncedUserData(activeProfile);
-      } else if (localAppleProfile && isReviewDemoProfile(localAppleProfile) && cachedAccount.history.length === 0) {
-        await preloadReviewDemoData(localAppleProfile);
       } else {
         clearAccountRestoreLoading('startup complete', activeUserId);
       }
@@ -3804,13 +3801,6 @@ function FoodFusionApp() {
     const stopRefresh = manageSupabaseAutoRefresh();
     const stopObserving = observeSupabaseAuth((profile) => {
       console.log('[FoodFusion Auth] observeSupabaseAuth profile:', profile);
-      if (!profile && appleSessionRef.current) {
-        return;
-      }
-      if (profile) {
-        appleSessionRef.current = false;
-        AsyncStorage.removeItem(APPLE_AUTH_KEY);
-      }
       const nextUserId = stableUserId(profile);
       if (nextUserId !== activeUserIdRef.current) {
         activeUserIdRef.current = nextUserId;
@@ -3865,9 +3855,13 @@ function FoodFusionApp() {
         setRevenueCatDebug(revenueCatDebugConfig());
       })
       .catch((error) => {
-        console.warn('[RevenueCat] initialization failed:', error?.message || String(error));
+        if (isKnownRevenueCatSetupError(error) || revenueCatSetupPaused()) {
+          console.log('[RevenueCat] setup paused:', error?.message || String(error));
+        } else {
+          console.warn('[RevenueCat] initialization failed:', error?.message || String(error));
+        }
         premiumAccess.setPremiumState({
-          status: 'error',
+          status: revenueCatSetupPaused() ? 'setup_paused' : 'error',
           error: error?.message || 'RevenueCat initialization failed'
         });
       });
@@ -4180,11 +4174,11 @@ function FoodFusionApp() {
   }
 
   function syncQuietly(label, operation) {
-    if (!supabaseConfigured || !isLoggedIn || appleSessionRef.current) {
-      if (!supabaseConfigured || appleSessionRef.current) {
+    if (!supabaseConfigured || !isLoggedIn) {
+      if (!supabaseConfigured) {
         setSyncState({
           status: 'offline',
-          message: supabaseConfigured ? 'Saved on this device' : 'Account sync unavailable. Saved on this device.'
+          message: 'Account sync unavailable. Saved on this device.'
         });
       }
       return;
@@ -4226,7 +4220,7 @@ function FoodFusionApp() {
   }
 
   async function hydrateSyncedUserData(profileOverride = userProfile) {
-    if (!supabaseConfigured || appleSessionRef.current) {
+    if (!supabaseConfigured) {
       clearAccountRestoreLoading('remote restore skipped');
       return;
     }
@@ -4497,6 +4491,13 @@ function FoodFusionApp() {
       Alert.alert('Subscriptions Unavailable', 'Fusion+ checkout is not available in this build.');
       return;
     }
+    if (__DEV__ && revenueCatSetupPaused()) {
+      const message = 'Purchases are paused for Apple setup. App testing can continue.';
+      setRevenueCatDebug(revenueCatDebugConfig());
+      premiumAccess.setPremiumState({ status: 'setup_paused', error: message });
+      showToast(message);
+      return;
+    }
 
     setIsProcessingPayment(true);
     try {
@@ -4510,14 +4511,25 @@ function FoodFusionApp() {
       showToast('Fusion+ Activated');
       setScreen('fusionSuccess');
     } catch (error) {
-      console.warn('[RevenueCat] purchase failed', error);
+      setRevenueCatDebug(revenueCatDebugConfig());
+      const setupPaused = __DEV__ && revenueCatSetupPaused();
+      const message = setupPaused
+        ? 'Purchases are paused for Apple setup. App testing can continue.'
+        : error?.message || 'Fusion+ checkout could not be completed.';
+      if (setupPaused || isKnownRevenueCatSetupError(error)) {
+        console.log('[RevenueCat] setup paused:', message);
+      } else {
+        console.warn('[RevenueCat] purchase failed:', message);
+      }
       premiumAccess.setPremiumState({
-        status: 'error',
-        error: error?.message || 'Fusion+ checkout could not be completed.'
+        status: setupPaused ? 'setup_paused' : 'error',
+        error: message
       });
       const userCancelled = Boolean(error?.userCancelled || error?.code === 'PURCHASE_CANCELLED');
-      if (!userCancelled) {
-        Alert.alert('Purchase Unavailable', error?.message || 'Fusion+ checkout could not be completed.');
+      if (setupPaused) {
+        showToast(message);
+      } else if (!userCancelled) {
+        Alert.alert('Purchase Unavailable', message);
       }
     } finally {
       setIsProcessingPayment(false);
@@ -4540,6 +4552,7 @@ function FoodFusionApp() {
       premiumAccess.setPremiumState({ status: 'loading', error: '' });
       const result = await restoreRevenueCatPurchases(userId);
       await applySubscriptionResultForUser(userId, result, 'RevenueCat');
+      setRevenueCatDebug(revenueCatDebugConfig());
       setSyncState({ status: 'synced', message: 'Synced to your account' });
       if (result.isPremium) {
         hapticSuccess();
@@ -4549,13 +4562,29 @@ function FoodFusionApp() {
         showToast('No active Fusion+ purchase found');
       }
     } catch (error) {
-      console.warn('[RevenueCat] restore failed', error);
+      setRevenueCatDebug(revenueCatDebugConfig());
+      const setupPaused = __DEV__ && revenueCatSetupPaused();
+      const message = setupPaused
+        ? 'Purchases are paused for Apple setup. App testing can continue.'
+        : error?.message || 'Restore purchases failed.';
+      if (setupPaused || isKnownRevenueCatSetupError(error)) {
+        console.log('[RevenueCat] setup paused:', message);
+      } else {
+        console.warn('[RevenueCat] restore failed:', message);
+      }
       premiumAccess.setPremiumState({
-        status: 'error',
-        error: error?.message || 'Restore purchases failed.'
+        status: setupPaused ? 'setup_paused' : 'error',
+        error: message
       });
+      if (setupPaused) {
+        showToast(message);
+      } else {
+        Alert.alert('Restore Unavailable', message);
+      }
       if (userId) {
-        await restoreSubscriptionForUser(userId).catch(() => {});
+        if (!setupPaused) {
+          await restoreSubscriptionForUser(userId).catch(() => {});
+        }
       }
       setSyncState({ status: 'error', message: 'Sync failed. Saved on this device.' });
     } finally {
@@ -5469,15 +5498,13 @@ function FoodFusionApp() {
     setAuthNeedsConfirmation(false);
   }
 
-  async function finishAuth(profile, options = {}) {
-    const appleSession = Boolean(options.appleSession);
+  async function finishAuth(profile) {
     const nextUserId = stableUserId(profile);
-    console.log('[FoodFusion Auth] finishAuth starting:', { nextUserId, email: profile?.email, appleSession });
+    console.log('[FoodFusion Auth] finishAuth starting:', { nextUserId, email: profile?.email });
     if (nextUserId !== activeUserIdRef.current) {
       resetSessionStateForAccountSwitch();
     }
     activeUserIdRef.current = nextUserId;
-    appleSessionRef.current = appleSession;
     setUserProfile(profile);
     setIsLoggedIn(true);
     setOnboardingCompleted(true);
@@ -5488,14 +5515,11 @@ function FoodFusionApp() {
     setAuthMessage('');
     setAuthNeedsConfirmation(false);
     try {
-      console.log('[FoodFusion Auth] AsyncStorage session writes starting:', { nextUserId, appleSession });
+      console.log('[FoodFusion Auth] AsyncStorage session writes starting:', { nextUserId });
       await Promise.all([
         AsyncStorage.setItem(AUTH_KEY, 'true'),
         AsyncStorage.setItem(USER_PROFILE_KEY, JSON.stringify(profile)),
-        AsyncStorage.setItem(ONBOARDING_KEY, 'true'),
-        appleSession
-          ? AsyncStorage.setItem(APPLE_AUTH_KEY, 'true')
-          : AsyncStorage.removeItem(APPLE_AUTH_KEY)
+        AsyncStorage.setItem(ONBOARDING_KEY, 'true')
       ]);
       console.log('[FoodFusion Auth] AsyncStorage session writes complete');
       setAuthDebug((current) => ({
@@ -5506,10 +5530,7 @@ function FoodFusionApp() {
         sessionEmail: profile?.email || '',
         lastAuthError: ''
       }));
-      if (appleSession) {
-        setSyncState({ status: 'offline', message: 'Saved on this device' });
-        await preloadReviewDemoData(profile);
-      } else if (supabaseConfigured) {
+      if (supabaseConfigured) {
         await hydrateSyncedUserData(profile);
       }
     } catch (error) {
@@ -5623,26 +5644,6 @@ function FoodFusionApp() {
     }
   }
 
-  async function handleContinueWithApple() {
-    try {
-      setAuthError('');
-      setAuthMessage('Signing in...');
-      console.log('[FoodFusion Auth] Apple local demo sign-in requested');
-      await finishAuth({
-        id: 'review-demo-apple-user',
-        name: 'Apple User',
-        email: 'apple.user@privaterelay.appleid.com',
-        provider: 'apple'
-      }, { appleSession: true });
-      setAuthMessage('');
-    } catch (error) {
-      const readable = readableAuthError(error);
-      setAuthMessage('');
-      setAuthError(readable);
-      setAuthDebug((current) => ({ ...current, authState: 'Apple sign in failed', lastAuthError: readable }));
-    }
-  }
-
   function handleForgotPassword() {
     setAuthScreen('forgotPassword');
     setAuthError('');
@@ -5692,7 +5693,6 @@ function FoodFusionApp() {
 
   async function logout() {
     console.log('[FoodFusion Auth] Logout requested');
-    appleSessionRef.current = false;
     activeUserIdRef.current = null;
     resetSessionStateForAccountSwitch({ loading: false });
     setIsLoggedIn(false);
@@ -5712,7 +5712,7 @@ function FoodFusionApp() {
       });
       console.log('[FoodFusion Auth] AsyncStorage logout writes starting');
       await AsyncStorage.multiSet([[AUTH_KEY, 'false']]);
-      await AsyncStorage.multiRemove([APPLE_AUTH_KEY, USER_PROFILE_KEY]);
+      await AsyncStorage.multiRemove([USER_PROFILE_KEY]);
       console.log('[FoodFusion Auth] AsyncStorage logout writes complete');
       setAuthDebug((current) => ({
         ...current,
@@ -5903,7 +5903,6 @@ function FoodFusionApp() {
     const userScopedKeysToClear = Array.from(USER_SCOPED_CACHE_KEYS);
     await AsyncStorage.multiRemove(userScopedKeysToClear.map((key) => scopedCacheKey(key, userId)));
     accountHydrateRef.current += 1;
-    appleSessionRef.current = false;
     activeUserIdRef.current = null;
     setSubscriptionLoading(false);
     setHistoryLoading(false);
@@ -5932,7 +5931,6 @@ function FoodFusionApp() {
     setSelectedMeal(null);
     setSelectedMode('Basic');
     setSelectedFusionPlan('yearly');
-    setPaymentForm({ cardNumber: '', expiration: '', cvv: '', name: '', zip: '' });
     setFridgePersonality('');
     setMealHistory([]);
     setFavoriteScanIds([]);
@@ -5994,7 +5992,6 @@ function FoodFusionApp() {
     await AsyncStorage.multiRemove([
       AUTH_KEY,
       USER_PROFILE_KEY,
-      APPLE_AUTH_KEY,
       SCAN_KEY,
       PREMIUM_KEY,
       PREMIUM_PLAN_KEY,
@@ -6259,7 +6256,6 @@ function FoodFusionApp() {
         onChange={updateAuthField}
         onLogin={handleLogin}
         onSignUp={handleSignUp}
-        onContinueWithApple={handleContinueWithApple}
         onResetPassword={handleResetPassword}
         onResendConfirmation={handleResendConfirmation}
         onShowLogin={() => showAuthMode('login')}
@@ -8629,6 +8625,10 @@ function FoodFusionApp() {
               ['Premium entitlement', revenueCatDebug.entitlement],
               ['Monthly product ID', revenueCatDebug.monthlyProductId || 'Missing'],
               ['Yearly product ID', revenueCatDebug.yearlyProductId || 'Missing'],
+              ['RevenueCat offerings loaded', revenueCatDebug.offeringsLoaded ? 'true' : 'false'],
+              ['RevenueCat setup paused', revenueCatDebug.setupPaused ? 'true' : 'false'],
+              ['Last RevenueCat error', revenueCatDebug.lastError || 'None'],
+              ['Dev force Fusion+', devForceFusionPlusEnabled ? 'true' : 'false'],
               ['Active subscription status', isPremium ? 'Fusion+ Active' : 'Fusion Free'],
               ['Subscription source', accountDiagnostics.subscriptionSource || 'Not restored yet'],
               ['Management URL', subscriptionManagementUrl || 'None'],
@@ -8794,10 +8794,12 @@ function FoodFusionApp() {
           </View>
 
           <Button accent={flowColors.fusion.accent} onPress={startFusionPlus} disabled={isProcessingPayment}>
-            {isProcessingPayment ? 'Opening checkout...' : `Subscribe ${plan.price}${plan.cadence}`}
+            {revenueCatSetupPausedForDev ? 'Unavailable during setup' : isProcessingPayment ? 'Opening checkout...' : `Subscribe ${plan.price}${plan.cadence}`}
           </Button>
           {premiumAccess.status === 'loading' ? (
             <Text style={styles.authMessage}>Opening secure App Store checkout...</Text>
+          ) : revenueCatSetupPausedForDev ? (
+            <Text style={styles.authMessage}>Purchases are paused for Apple setup. App testing can continue.</Text>
           ) : premiumAccess.error ? (
             <Text style={styles.authError}>{premiumAccess.error}</Text>
           ) : null}
@@ -8884,6 +8886,7 @@ function FoodFusionApp() {
         onManage={() => setScreen('manageSubscription')}
         selectedPlan={selectedFusionPlan}
         premiumAccess={premiumAccess}
+        setupPaused={revenueCatSetupPausedForDev}
       />
     );
   }
@@ -9117,36 +9120,6 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     lineHeight: 18,
     marginBottom: 2
-  },
-  authDividerRow: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    marginTop: 16
-  },
-  authDivider: {
-    backgroundColor: palette.line,
-    flex: 1,
-    height: 1
-  },
-  authDividerText: {
-    color: palette.muted,
-    fontSize: 11,
-    fontWeight: '800',
-    marginHorizontal: 12
-  },
-  appleAuthButton: {
-    alignItems: 'center',
-    backgroundColor: '#FFFFFF',
-    borderRadius: 16,
-    justifyContent: 'center',
-    marginTop: 16,
-    minHeight: 52,
-    paddingHorizontal: 16
-  },
-  appleAuthText: {
-    color: '#050505',
-    fontSize: 15,
-    fontWeight: '800'
   },
   authSwitch: {
     alignItems: 'center',
@@ -11489,17 +11462,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     marginBottom: 14,
     padding: 18
-  },
-  paymentFormCard: {
-    backgroundColor: palette.card,
-    borderColor: palette.line,
-    borderRadius: 24,
-    borderWidth: 1,
-    marginBottom: 14,
-    padding: 16
-  },
-  paymentField: {
-    marginBottom: 12
   },
   trackingHero: {
     backgroundColor: palette.greenDeep,

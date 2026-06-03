@@ -7,7 +7,7 @@ FoodFusion can use Supabase authentication once environment values are provided.
 1. Create a Supabase project.
 2. Copy `.env.example` to `.env.local`.
 3. Set `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY`.
-4. Add `foodfusion://reset-password` to your Supabase Auth redirect URL allow list.
+4. Add `https://foodfusion-ai-site.onrender.com/reset-password` to your Supabase Auth redirect URL allow list for password resets. Keep mobile deep links only for app auth flows that explicitly need them.
 5. Deploy the tracked database migrations through the Supabase CLI:
 
 ```bash

@@ -756,6 +756,7 @@ function resetPasswordPage() {
         const confirmPasswordInput = document.getElementById('confirm-password');
         const rulesWrap = document.getElementById('password-rules');
         const strongPasswordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[^A-Za-z\\d]).{10,}$/;
+        console.log('[Auth] hosted reset page loaded');
         const passwordRules = [
           { label: '10+ characters', test: (value) => value.length >= 10 },
           { label: 'Uppercase letter', test: (value) => /[A-Z]/.test(value) },
@@ -774,6 +775,17 @@ function resetPasswordPage() {
           form.style.display = 'none';
           showMessage('Password reset is temporarily unavailable. Please contact FoodFusion AI support.', 'error');
         } else {
+          function readRecoveryParams() {
+            const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+            const queryParams = new URLSearchParams(window.location.search);
+            return {
+              accessToken: hashParams.get('access_token') || queryParams.get('access_token'),
+              refreshToken: hashParams.get('refresh_token') || queryParams.get('refresh_token'),
+              type: hashParams.get('type') || queryParams.get('type'),
+              code: queryParams.get('code') || hashParams.get('code')
+            };
+          }
+
           function renderPasswordRules() {
             const value = passwordInput.value || '';
             const isStrong = strongPasswordRegex.test(value);
@@ -807,6 +819,32 @@ function resetPasswordPage() {
               persistSession: true
             }
           });
+
+          const recoveryParams = readRecoveryParams();
+          if (recoveryParams.accessToken && recoveryParams.refreshToken) {
+            client.auth.setSession({
+              access_token: recoveryParams.accessToken,
+              refresh_token: recoveryParams.refreshToken
+            }).then(({ error }) => {
+              if (error) {
+                console.warn('[Auth] password update fail', error);
+                showMessage('Password reset link could not be verified. Please request a new reset link.', 'error');
+                return;
+              }
+              showMessage('Enter your new password below.', 'success');
+            });
+          } else if (recoveryParams.code) {
+            client.auth.exchangeCodeForSession(recoveryParams.code).then(({ error }) => {
+              if (error) {
+                console.warn('[Auth] password update fail', error);
+                showMessage('Password reset link could not be verified. Please request a new reset link.', 'error');
+                return;
+              }
+              showMessage('Enter your new password below.', 'success');
+            });
+          } else if (recoveryParams.type !== 'recovery') {
+            showMessage('Open this page from your password reset email to update your password.', 'error');
+          }
 
           client.auth.onAuthStateChange((event) => {
             if (event === 'PASSWORD_RECOVERY') {

@@ -15,6 +15,7 @@ const authConfirmationRedirectUrl =
   process.env.EXPO_PUBLIC_SUPABASE_CONFIRM_REDIRECT_URL ||
   `${hostedAuthBaseUrl}/confirm`;
 const passwordResetRedirectUrl =
+  process.env.EXPO_PUBLIC_SUPABASE_RESET_REDIRECT_URL ||
   process.env.EXPO_PUBLIC_SUPABASE_PASSWORD_RESET_REDIRECT_URL ||
   `${hostedAuthBaseUrl}/reset-password`;
 
