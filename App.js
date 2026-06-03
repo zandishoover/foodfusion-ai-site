@@ -78,6 +78,10 @@ import {
   revenueCatSetupPaused,
   isKnownRevenueCatSetupError
 } from './services/revenueCat';
+import {
+  getMacroNutritionDebug,
+  lookupHostedMacros
+} from './services/macroNutrition';
 import { PremiumProvider, usePremium } from './contexts/PremiumContext';
 
 if (__DEV__) {
@@ -881,6 +885,54 @@ const macroEstimates = {
   'Three-Day Pantry Bowls': { calories: 620, protein: 39, carbs: 76, fat: 17 }
 };
 
+const macroSourcePriority = {
+  usda: 'USDA FoodData Central',
+  verified: 'Verified internal database',
+  ai: 'AI estimate'
+};
+
+const ingredientMacroDatabase = {
+  chicken: { amount: '4 oz cooked', source: 'usda', calories: 185, protein: 35, carbs: 0, fat: 4 },
+  'chicken breast': { amount: '4 oz cooked', source: 'usda', calories: 185, protein: 35, carbs: 0, fat: 4 },
+  eggs: { amount: '2 large', source: 'usda', calories: 140, protein: 12, carbs: 1, fat: 10 },
+  egg: { amount: '1 large', source: 'usda', calories: 70, protein: 6, carbs: 0, fat: 5 },
+  rice: { amount: '1 cup cooked', source: 'usda', calories: 205, protein: 4, carbs: 45, fat: 0 },
+  yogurt: { amount: '3/4 cup', source: 'usda', calories: 110, protein: 16, carbs: 7, fat: 0 },
+  'greek yogurt': { amount: '3/4 cup', source: 'usda', calories: 110, protein: 16, carbs: 7, fat: 0 },
+  cucumber: { amount: '1 cup sliced', source: 'usda', calories: 15, protein: 1, carbs: 4, fat: 0 },
+  lemon: { amount: '1 medium', source: 'usda', calories: 15, protein: 0, carbs: 5, fat: 0 },
+  tofu: { amount: '4 oz', source: 'usda', calories: 95, protein: 10, carbs: 3, fat: 6 },
+  noodles: { amount: '1 cup cooked', source: 'verified', calories: 220, protein: 7, carbs: 40, fat: 3 },
+  pasta: { amount: '1 cup cooked', source: 'verified', calories: 220, protein: 8, carbs: 43, fat: 1 },
+  oats: { amount: '1/2 cup dry', source: 'usda', calories: 150, protein: 5, carbs: 27, fat: 3 },
+  oatmeal: { amount: '1 packet', source: 'verified', calories: 160, protein: 4, carbs: 32, fat: 2 },
+  spinach: { amount: '2 cups raw', source: 'usda', calories: 15, protein: 2, carbs: 2, fat: 0 },
+  broccoli: { amount: '1 cup', source: 'usda', calories: 55, protein: 4, carbs: 11, fat: 1 },
+  avocado: { amount: '1/2 medium', source: 'usda', calories: 120, protein: 2, carbs: 6, fat: 11 },
+  beans: { amount: '1/2 cup', source: 'usda', calories: 115, protein: 8, carbs: 20, fat: 1 },
+  'black beans': { amount: '1/2 cup', source: 'usda', calories: 115, protein: 8, carbs: 20, fat: 1 },
+  corn: { amount: '1/2 cup', source: 'usda', calories: 70, protein: 2, carbs: 16, fat: 1 },
+  salmon: { amount: '4 oz cooked', source: 'usda', calories: 235, protein: 25, carbs: 0, fat: 14 },
+  tuna: { amount: '4 oz', source: 'usda', calories: 130, protein: 28, carbs: 0, fat: 1 },
+  milk: { amount: '1 cup', source: 'usda', calories: 120, protein: 8, carbs: 12, fat: 5 },
+  'almond milk': { amount: '1 cup', source: 'verified', calories: 40, protein: 1, carbs: 2, fat: 3 },
+  banana: { amount: '1 medium', source: 'usda', calories: 105, protein: 1, carbs: 27, fat: 0 },
+  berries: { amount: '1 cup', source: 'usda', calories: 70, protein: 1, carbs: 17, fat: 0 },
+  'protein powder': { amount: '1 scoop', source: 'verified', calories: 120, protein: 24, carbs: 3, fat: 2 },
+  'liquid iv hydration powder': { amount: '1 stick', source: 'verified', calories: 45, protein: 0, carbs: 11, fat: 0 },
+  'greens superfoods raspberry lemonade': { amount: '1 scoop', source: 'verified', calories: 30, protein: 1, carbs: 5, fat: 0 },
+  'herbal tea or tea bags': { amount: '1 cup brewed', source: 'verified', calories: 0, protein: 0, carbs: 0, fat: 0 }
+};
+
+const macroPortionOptions = [
+  { label: 'Small', multiplier: 0.6, confirmed: true },
+  { label: 'Medium', multiplier: 1, confirmed: true },
+  { label: 'Large', multiplier: 1.5, confirmed: true },
+  { label: '1 serving', multiplier: 1, confirmed: true },
+  { label: '2 servings', multiplier: 2, confirmed: true },
+  { label: 'Custom amount', multiplier: 1, confirmed: true, custom: true }
+];
+
 const smoothieBank = [
   {
     title: 'Berry Recovery Smoothie',
@@ -1257,6 +1309,158 @@ function ingredientConfidence(item, index, detections = []) {
     return '82% Medium';
   }
   return '63% Low';
+}
+
+function roundCalories(value) {
+  return Math.round(Number(value || 0) / 10) * 10;
+}
+
+function roundGram(value) {
+  return Math.round(Number(value || 0));
+}
+
+function findMacroBase(ingredient) {
+  const normalized = `${ingredient}`.toLowerCase().trim();
+  if (ingredientMacroDatabase[normalized]) {
+    return { ...ingredientMacroDatabase[normalized], matchedName: normalized };
+  }
+  const matchedKey = Object.keys(ingredientMacroDatabase).find((key) => normalized.includes(key) || key.includes(normalized));
+  if (matchedKey) {
+    return { ...ingredientMacroDatabase[matchedKey], matchedName: matchedKey };
+  }
+  return {
+    amount: '1 serving',
+    source: 'ai',
+    calories: 120,
+    protein: 4,
+    carbs: 18,
+    fat: 4,
+    matchedName: normalized
+  };
+}
+
+function detectionConfidencePercent(ingredient, index, detections = []) {
+  const detection = detections.find((candidate) => candidate.name === ingredient);
+  if (Number.isFinite(detection?.confidence)) {
+    return detection.confidence <= 1
+      ? Math.round(detection.confidence * 100)
+      : Math.round(detection.confidence);
+  }
+  if (index === 0 || ['chicken', 'eggs', 'rice', 'tofu', 'noodles'].includes(ingredient)) {
+    return 94;
+  }
+  if (index <= 3) {
+    return 82;
+  }
+  return 63;
+}
+
+function macroConfidenceLabel({ detectionPercent, portionConfirmed, source }) {
+  if (detectionPercent >= 80 && portionConfirmed && source !== 'ai') {
+    return 'High';
+  }
+  if (detectionPercent >= 55 && source !== 'ai') {
+    return portionConfirmed ? 'High' : 'Medium';
+  }
+  if (detectionPercent >= 55 && portionConfirmed) {
+    return 'Medium';
+  }
+  return 'Low';
+}
+
+function estimateIngredientMacros(ingredient, index, detections = [], portionSelections = {}) {
+  const base = findMacroBase(ingredient);
+  const selectedPortion = portionSelections[ingredient];
+  const detection = detections.find((candidate) => candidate.name === ingredient);
+  const detectionPercent = detectionConfidencePercent(ingredient, index, detections);
+  const hasQuantity = Boolean(detection?.estimatedQuantity || detection?.estimated_quantity);
+  const portionConfirmed = Boolean(selectedPortion?.confirmed);
+  const multiplier = Number(selectedPortion?.multiplier || (hasQuantity ? 1 : 1));
+  const confidence = macroConfidenceLabel({
+    detectionPercent,
+    portionConfirmed: portionConfirmed || hasQuantity,
+    source: base.source
+  });
+  const amount = selectedPortion?.label || detection?.estimatedQuantity || detection?.estimated_quantity || base.amount;
+
+  return {
+    name: ingredient,
+    amount,
+    calories: roundCalories(base.calories * multiplier),
+    protein: roundGram(base.protein * multiplier),
+    carbs: roundGram(base.carbs * multiplier),
+    fat: roundGram(base.fat * multiplier),
+    confidence,
+    source: macroSourcePriority[base.source] || macroSourcePriority.ai,
+    needsConfirmation: !portionConfirmed && !hasQuantity,
+    detectionPercent
+  };
+}
+
+function buildMacroBreakdown(ingredients = [], detections = [], portionSelections = {}) {
+  const rows = ingredients.map((ingredient, index) => estimateIngredientMacros(ingredient, index, detections, portionSelections));
+  const totals = rows.reduce(
+    (sum, row) => ({
+      calories: sum.calories + row.calories,
+      protein: sum.protein + row.protein,
+      carbs: sum.carbs + row.carbs,
+      fat: sum.fat + row.fat
+    }),
+    { calories: 0, protein: 0, carbs: 0, fat: 0 }
+  );
+  const confidenceRank = { Low: 1, Medium: 2, High: 3 };
+  const lowestConfidence = rows.reduce((lowest, row) => (
+    confidenceRank[row.confidence] < confidenceRank[lowest] ? row.confidence : lowest
+  ), rows.length ? rows[0].confidence : 'Low');
+  const sources = [...new Set(rows.map((row) => row.source))];
+
+  return {
+    rows,
+    totals: {
+      calories: roundCalories(totals.calories),
+      protein: roundGram(totals.protein),
+      carbs: roundGram(totals.carbs),
+      fat: roundGram(totals.fat)
+    },
+    confidence: rows.length ? lowestConfidence : 'Low',
+    source: sources[0] || macroSourcePriority.ai,
+    sources,
+    needingConfirmation: rows.filter((row) => row.needsConfirmation).map((row) => row.name)
+  };
+}
+
+function normalizeHostedMacroSummary(payload = {}, localSummary = {}) {
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const localRows = localSummary.rows || [];
+  const rows = items.map((item) => {
+    const localRow = localRows.find((row) => row.name === item.name) || {};
+    return {
+      name: item.name,
+      amount: item.amount || localRow.amount || '1 serving',
+      calories: roundCalories(item.calories),
+      protein: roundGram(item.protein),
+      carbs: roundGram(item.carbs),
+      fat: roundGram(item.fat),
+      confidence: item.confidence || localRow.confidence || 'Low',
+      source: item.source || payload.source || 'Hosted nutrition',
+      needsConfirmation: Boolean(localRow.needsConfirmation),
+      detectionPercent: localRow.detectionPercent || 0
+    };
+  });
+  const source = payload.source || rows[0]?.source || 'Hosted nutrition';
+  return {
+    rows,
+    totals: {
+      calories: roundCalories(payload.totals?.calories),
+      protein: roundGram(payload.totals?.protein),
+      carbs: roundGram(payload.totals?.carbs),
+      fat: roundGram(payload.totals?.fat)
+    },
+    confidence: payload.confidence || localSummary.confidence || 'Low',
+    source,
+    sources: [...new Set(rows.map((row) => row.source || source))],
+    needingConfirmation: localSummary.needingConfirmation || []
+  };
 }
 
 function stepSeconds(step) {
@@ -2814,6 +3018,17 @@ function FoodFusionApp() {
   const [pendingScan, setPendingScan] = useState(null);
   const [scanDetections, setScanDetections] = useState([]);
   const [scanSource, setScanSource] = useState('');
+  const [macroPortions, setMacroPortions] = useState({});
+  const [macroDebug, setMacroDebug] = useState({
+    source: 'Not calculated',
+    confidence: 'Not calculated',
+    needsConfirmation: 'None',
+    recalculationStatus: 'Not run',
+    endpointUsed: 'Not requested',
+    lookupStatus: 'Not requested',
+    lastError: ''
+  });
+  const [hostedMacroSummary, setHostedMacroSummary] = useState(null);
   const [analysisStep, setAnalysisStep] = useState(0);
   const [recipeStepIndex, setRecipeStepIndex] = useState(0);
   const [preferences, setPreferences] = useState([]);
@@ -3670,6 +3885,11 @@ function FoodFusionApp() {
     () => ({ ...ingredientStatuses, ...pantryFreshness }),
     [ingredientStatuses, pantryFreshness]
   );
+  const macroSummary = useMemo(
+    () => buildMacroBreakdown(ingredients, scanDetections, macroPortions),
+    [ingredients, scanDetections, macroPortions]
+  );
+  const displayedMacroSummary = hostedMacroSummary || macroSummary;
   const useSoonItems = pantryItems.filter((item) => ['use soon', 'almost expired'].includes(expirationStatus(item.expiresAt)));
   const timeBasedSuggestion = timeSuggestion();
   const shoppingIdeas = smartShoppingSuggestions(currentPantryIngredients);
@@ -3722,6 +3942,72 @@ function FoodFusionApp() {
     const groceries = localShoppingSearch(query).slice(0, 6);
     return { recipes, ingredients, groceries };
   }, [currentPantryIngredients, favorites, globalSearchQuery, recentRecipes]);
+
+  useEffect(() => {
+    setMacroDebug({
+      ...getMacroNutritionDebug(),
+      source: displayedMacroSummary.sources.join(' / ') || 'Not calculated',
+      confidence: displayedMacroSummary.confidence,
+      needsConfirmation: displayedMacroSummary.needingConfirmation.length ? displayedMacroSummary.needingConfirmation.join(', ') : 'None',
+      recalculationStatus: ingredients.length ? `Recalculated ${new Date().toLocaleTimeString()}` : 'Not run',
+      endpointUsed: getMacroNutritionDebug().endpointUsed,
+      lookupStatus: getMacroNutritionDebug().status,
+      lastError: getMacroNutritionDebug().lastError
+    });
+  }, [ingredients.length, displayedMacroSummary.confidence, displayedMacroSummary.needingConfirmation, displayedMacroSummary.sources]);
+
+  useEffect(() => {
+    if (ingredients.length === 0 || screen !== 'ingredients') {
+      setHostedMacroSummary(null);
+      return;
+    }
+
+    let cancelled = false;
+    const timeoutId = setTimeout(async () => {
+      const requestIngredients = macroSummary.rows.map((row) => ({
+        name: row.name,
+        amount: row.amount,
+        confidence: row.detectionPercent ? row.detectionPercent / 100 : 0.65,
+        portionConfirmed: !row.needsConfirmation
+      }));
+      try {
+        const hosted = await lookupHostedMacros(requestIngredients);
+        if (cancelled) {
+          return;
+        }
+        setHostedMacroSummary(normalizeHostedMacroSummary(hosted, macroSummary));
+        const debug = getMacroNutritionDebug();
+        setMacroDebug((current) => ({
+          ...current,
+          endpointUsed: debug.endpointUsed,
+          source: hosted.source || debug.sourceUsed || current.source,
+          lookupStatus: debug.status,
+          lastError: debug.lastError,
+          recalculationStatus: 'Hosted macro lookup synced'
+        }));
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setHostedMacroSummary(null);
+        const debug = getMacroNutritionDebug();
+        setMacroDebug((current) => ({
+          ...current,
+          endpointUsed: debug.endpointUsed,
+          source: macroSummary.sources.join(' / ') || current.source,
+          lookupStatus: debug.status,
+          lastError: debug.lastError || error?.message || 'Hosted macro lookup unavailable',
+          recalculationStatus: 'Using local macro estimate'
+        }));
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
+  }, [ingredients, macroPortions, scanDetections, screen]);
+
   useEffect(() => {
     async function loadState() {
       const [storedLoggedIn, storedUserProfile, storedOnboarding, storedCameraPermissionIntro, storedQaChecklist] = await Promise.all([
@@ -4426,6 +4712,7 @@ function FoodFusionApp() {
     setIngredients(pendingScan.ingredients);
     setScanDetections(pendingScan.detections || []);
     setScanSource(pendingScan.source || 'local');
+    setMacroPortions({});
     setMeals(generatedMeals);
     setHasLoadedMoreMeals(false);
     setFridgePersonality(personality);
@@ -6047,6 +6334,7 @@ function FoodFusionApp() {
     setIngredients([...new Set([...ingredients, nextIngredient])]);
     const nextStatuses = { ...ingredientStatuses, [nextIngredient]: ingredientStatuses[nextIngredient] || 'fresh' };
     setIngredientStatuses(nextStatuses);
+    setMacroPortions((current) => ({ ...current, [nextIngredient]: current[nextIngredient] || null }));
     setCachedItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
     rememberSearch(nextIngredient, 'ingredient');
     setManualIngredient('');
@@ -6057,9 +6345,74 @@ function FoodFusionApp() {
   function removeIngredient(item) {
     const nextStatuses = { ...ingredientStatuses };
     delete nextStatuses[item];
+    const nextPortions = { ...macroPortions };
+    delete nextPortions[item];
     setIngredientStatuses(nextStatuses);
+    setMacroPortions(nextPortions);
     setCachedItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
     setIngredients(ingredients.filter((ingredient) => ingredient !== item));
+  }
+
+  function updateIngredientPortion(ingredient, option) {
+    if (option.custom && Platform.OS === 'ios' && Alert.prompt) {
+      Alert.prompt(
+        'Custom amount',
+        `Enter the amount for ${ingredient}.`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Save',
+            onPress: (value) => {
+              const label = value?.trim() || 'Custom amount';
+              setMacroPortions((current) => ({
+                ...current,
+                [ingredient]: { label, multiplier: 1, confirmed: true }
+              }));
+              setMacroDebug((current) => ({ ...current, recalculationStatus: 'Custom amount saved' }));
+              hapticTap();
+              showToast('Macros updated');
+            }
+          }
+        ],
+        'plain-text'
+      );
+      return;
+    }
+    setMacroPortions((current) => ({
+      ...current,
+      [ingredient]: {
+        label: option.label,
+        multiplier: option.multiplier,
+        confirmed: true
+      }
+    }));
+    setMacroDebug((current) => ({ ...current, recalculationStatus: 'Portion updated' }));
+    hapticTap();
+    showToast('Macros updated');
+  }
+
+  function improveMacroAccuracy(ingredient) {
+    const row = displayedMacroSummary.rows.find((item) => item.name === ingredient) ||
+      macroSummary.rows.find((item) => item.name === ingredient);
+    const prompt = ingredient.includes('chicken')
+      ? `How much ${ingredient}?`
+      : ingredient.includes('egg')
+      ? `How many ${ingredient}?`
+      : ingredient.includes('rice')
+      ? `About how many cups of ${ingredient}?`
+      : `How much ${ingredient}?`;
+    Alert.alert(
+      'Improve Accuracy',
+      `${prompt}\nCurrent estimate: ${row?.amount || '1 serving'}`,
+      [
+        ...macroPortionOptions.slice(0, 5).map((option) => ({
+          text: option.label,
+          onPress: () => updateIngredientPortion(ingredient, option)
+        })),
+        { text: 'Custom amount', onPress: () => updateIngredientPortion(ingredient, macroPortionOptions[5]) },
+        { text: 'Cancel', style: 'cancel' }
+      ]
+    );
   }
 
   async function regenerateMealsFromIngredients() {
@@ -6202,12 +6555,18 @@ function FoodFusionApp() {
     }
     const nextIngredients = ingredients.map((ingredient) => ingredient === editingIngredient ? nextValue : ingredient);
     const nextStatuses = { ...ingredientStatuses };
+    const nextPortions = { ...macroPortions };
     if (nextStatuses[editingIngredient]) {
       nextStatuses[nextValue] = nextStatuses[editingIngredient];
       delete nextStatuses[editingIngredient];
     }
+    if (nextPortions[editingIngredient]) {
+      nextPortions[nextValue] = nextPortions[editingIngredient];
+      delete nextPortions[editingIngredient];
+    }
     setIngredients([...new Set(nextIngredients)]);
     setIngredientStatuses(nextStatuses);
+    setMacroPortions(nextPortions);
     setEditingIngredient(null);
     setIngredientEditValue('');
     setCachedItem(INGREDIENT_STATUS_KEY, JSON.stringify(nextStatuses));
@@ -6686,6 +7045,89 @@ function FoodFusionApp() {
               </View>
             ))}
           </View>
+
+          {ingredients.length > 0 ? (
+            <View style={styles.macroBreakdownCard}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.identifiedTitle}>Macro estimate</Text>
+                <Text style={styles.sectionMeta}>{displayedMacroSummary.confidence} confidence</Text>
+              </View>
+              <Text style={styles.identifiedMeta}>Macros are estimates and improve when portions are confirmed.</Text>
+              <View style={styles.macroTotalRow}>
+                {[
+                  ['Calories', displayedMacroSummary.totals.calories],
+                  ['Protein', `${displayedMacroSummary.totals.protein}g`],
+                  ['Carbs', `${displayedMacroSummary.totals.carbs}g`],
+                  ['Fat', `${displayedMacroSummary.totals.fat}g`]
+                ].map(([label, value]) => (
+                  <View key={label} style={styles.macroTotalTile}>
+                    <Text style={styles.macroValue}>{value}</Text>
+                    <Text style={styles.macroLabel}>{label}</Text>
+                  </View>
+                ))}
+              </View>
+              <View style={styles.macroIngredientList}>
+                {displayedMacroSummary.rows.map((row) => (
+                  <View key={`macro-${row.name}`} style={styles.macroIngredientRow}>
+                    <View style={styles.macroIngredientHeader}>
+                      <View style={styles.macroIngredientTitleWrap}>
+                        <Text numberOfLines={2} style={styles.macroIngredientName}>{row.name}</Text>
+                        <Text style={styles.macroIngredientAmount}>{row.amount} • {row.confidence}</Text>
+                      </View>
+                      <Pressable
+                        accessibilityLabel={`Improve macro accuracy for ${row.name}`}
+                        accessibilityRole="button"
+                        onPress={() => improveMacroAccuracy(row.name)}
+                        style={styles.improveMacroButton}
+                      >
+                        <Text style={styles.improveMacroButtonText}>Improve</Text>
+                      </Pressable>
+                    </View>
+                    <View style={styles.macroMiniRow}>
+                      <Text style={styles.macroMiniText}>{row.calories} cal</Text>
+                      <Text style={styles.macroMiniText}>{row.protein}g P</Text>
+                      <Text style={styles.macroMiniText}>{row.carbs}g C</Text>
+                      <Text style={styles.macroMiniText}>{row.fat}g F</Text>
+                    </View>
+                    {row.needsConfirmation ? (
+                      <View style={styles.portionPrompt}>
+                        <Text style={styles.portionPromptText}>
+                          {row.name.includes('chicken')
+                            ? `How much ${row.name}?`
+                            : row.name.includes('egg')
+                            ? `How many ${row.name}?`
+                            : row.name.includes('rice')
+                            ? `About how many cups of ${row.name}?`
+                            : `Confirm portion for ${row.name}`}
+                        </Text>
+                        <View style={styles.portionChipRow}>
+                          {macroPortionOptions.map((option) => (
+                            <Pressable
+                              key={`${row.name}-${option.label}`}
+                              onPress={() => updateIngredientPortion(row.name, option)}
+                              style={[
+                                styles.portionChip,
+                                macroPortions[row.name]?.label === option.label && styles.activePortionChip
+                              ]}
+                            >
+                              <Text
+                                style={[
+                                  styles.portionChipText,
+                                  macroPortions[row.name]?.label === option.label && styles.activePortionChipText
+                                ]}
+                              >
+                                {option.label}
+                              </Text>
+                            </Pressable>
+                          ))}
+                        </View>
+                      </View>
+                    ) : null}
+                  </View>
+                ))}
+              </View>
+            </View>
+          ) : null}
 
           <View style={styles.manualCard}>
             <Text style={styles.scanOptionsTitle}>Edit Ingredients</Text>
@@ -8585,6 +9027,13 @@ function FoodFusionApp() {
               ['Last GPS coordinates', storeLookupDebug.currentCoordinates || 'None'],
               ['Store count returned', `${storeLookupDebug.count}`],
               ['Last store lookup error', storeLookupDebug.error || 'None'],
+              ['Hosted macro endpoint used', macroDebug.endpointUsed || 'Not requested'],
+              ['Macro source used', macroDebug.source],
+              ['Macro lookup status', macroDebug.lookupStatus || 'Not requested'],
+              ['Last macro lookup error', macroDebug.lastError || 'None'],
+              ['Macro confidence', macroDebug.confidence],
+              ['Ingredients needing portion confirmation', macroDebug.needsConfirmation],
+              ['Last macro recalculation status', macroDebug.recalculationStatus],
               ['Support email', SUPPORT_EMAIL]
             ].map(([label, value]) => (
               <View key={label} style={styles.launchRow}>
@@ -10884,6 +11333,129 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     paddingHorizontal: 10,
     paddingVertical: 6
+  },
+  macroBreakdownCard: {
+    backgroundColor: palette.card,
+    borderColor: palette.line,
+    borderRadius: 24,
+    borderWidth: 1,
+    marginTop: 16,
+    padding: 16
+  },
+  macroTotalRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 14
+  },
+  macroTotalTile: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 14,
+    borderWidth: 1,
+    flex: 1,
+    minHeight: 58,
+    paddingHorizontal: 8,
+    paddingVertical: 10
+  },
+  macroIngredientList: {
+    gap: 10
+  },
+  macroIngredientRow: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 16,
+    borderWidth: 1,
+    padding: 12
+  },
+  macroIngredientHeader: {
+    alignItems: 'flex-start',
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'space-between'
+  },
+  macroIngredientTitleWrap: {
+    flex: 1,
+    flexShrink: 1,
+    minWidth: 0
+  },
+  macroIngredientName: {
+    color: palette.cream,
+    flexShrink: 1,
+    fontSize: 15,
+    fontWeight: '900',
+    lineHeight: 20
+  },
+  macroIngredientAmount: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '800',
+    lineHeight: 17,
+    marginTop: 3
+  },
+  improveMacroButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(106, 166, 255, 0.14)',
+    borderColor: 'rgba(106, 166, 255, 0.35)',
+    borderRadius: 999,
+    borderWidth: 1,
+    flexShrink: 0,
+    justifyContent: 'center',
+    minHeight: 34,
+    paddingHorizontal: 10
+  },
+  improveMacroButtonText: {
+    color: palette.green,
+    fontSize: 11,
+    fontWeight: '900'
+  },
+  macroMiniRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 10
+  },
+  macroMiniText: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '800'
+  },
+  portionPrompt: {
+    borderTopColor: palette.line,
+    borderTopWidth: 1,
+    marginTop: 10,
+    paddingTop: 10
+  },
+  portionPromptText: {
+    color: palette.cream,
+    fontSize: 12,
+    fontWeight: '900',
+    marginBottom: 8
+  },
+  portionChipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8
+  },
+  portionChip: {
+    backgroundColor: palette.card,
+    borderColor: palette.line,
+    borderRadius: 999,
+    borderWidth: 1,
+    minHeight: 32,
+    paddingHorizontal: 10,
+    paddingVertical: 7
+  },
+  activePortionChip: {
+    backgroundColor: 'rgba(106, 166, 255, 0.18)',
+    borderColor: palette.green
+  },
+  portionChipText: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '900'
+  },
+  activePortionChipText: {
+    color: palette.cream
   },
   macroPanel: {
     borderTopColor: palette.line,

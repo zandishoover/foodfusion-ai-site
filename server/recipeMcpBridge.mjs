@@ -19,6 +19,7 @@ const maxJsonBodyBytes = Number(process.env.FOODFUSION_MAX_JSON_BODY_BYTES || 8 
 const spoonacularApiKey = process.env.SPOONACULAR_API_KEY?.trim();
 const edamamAppId = process.env.EDAMAM_APP_ID?.trim();
 const edamamAppKey = process.env.EDAMAM_APP_KEY?.trim();
+const usdaApiKey = process.env.USDA_API_KEY?.trim();
 const publicSupabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
 const publicSupabaseKey =
   process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
@@ -141,6 +142,205 @@ function fallbackRecipes(ingredients = [], options = {}) {
 
 function titleCase(value) {
   return `${value}`.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function roundCalories(value) {
+  return Math.round(Number(value || 0) / 10) * 10;
+}
+
+function roundGram(value) {
+  return Math.round(Number(value || 0));
+}
+
+function normalizeIngredientName(value = '') {
+  return `${value}`.toLowerCase().trim();
+}
+
+const internalMacroDatabase = {
+  chicken: { amount: '4 oz cooked', calories: 185, protein: 35, carbs: 0, fat: 4 },
+  'chicken breast': { amount: '4 oz cooked', calories: 185, protein: 35, carbs: 0, fat: 4 },
+  eggs: { amount: '2 large', calories: 140, protein: 12, carbs: 1, fat: 10 },
+  egg: { amount: '1 large', calories: 70, protein: 6, carbs: 0, fat: 5 },
+  rice: { amount: '1 cup cooked', calories: 205, protein: 4, carbs: 45, fat: 0 },
+  yogurt: { amount: '3/4 cup', calories: 110, protein: 16, carbs: 7, fat: 0 },
+  'greek yogurt': { amount: '3/4 cup', calories: 110, protein: 16, carbs: 7, fat: 0 },
+  cucumber: { amount: '1 cup sliced', calories: 15, protein: 1, carbs: 4, fat: 0 },
+  lemon: { amount: '1 medium', calories: 15, protein: 0, carbs: 5, fat: 0 },
+  tofu: { amount: '4 oz', calories: 95, protein: 10, carbs: 3, fat: 6 },
+  noodles: { amount: '1 cup cooked', calories: 220, protein: 7, carbs: 40, fat: 3 },
+  pasta: { amount: '1 cup cooked', calories: 220, protein: 8, carbs: 43, fat: 1 },
+  oats: { amount: '1/2 cup dry', calories: 150, protein: 5, carbs: 27, fat: 3 },
+  oatmeal: { amount: '1 packet', calories: 160, protein: 4, carbs: 32, fat: 2 },
+  spinach: { amount: '2 cups raw', calories: 15, protein: 2, carbs: 2, fat: 0 },
+  broccoli: { amount: '1 cup', calories: 55, protein: 4, carbs: 11, fat: 1 },
+  avocado: { amount: '1/2 medium', calories: 120, protein: 2, carbs: 6, fat: 11 },
+  beans: { amount: '1/2 cup', calories: 115, protein: 8, carbs: 20, fat: 1 },
+  'black beans': { amount: '1/2 cup', calories: 115, protein: 8, carbs: 20, fat: 1 },
+  corn: { amount: '1/2 cup', calories: 70, protein: 2, carbs: 16, fat: 1 },
+  salmon: { amount: '4 oz cooked', calories: 235, protein: 25, carbs: 0, fat: 14 },
+  tuna: { amount: '4 oz', calories: 130, protein: 28, carbs: 0, fat: 1 },
+  milk: { amount: '1 cup', calories: 120, protein: 8, carbs: 12, fat: 5 },
+  'almond milk': { amount: '1 cup', calories: 40, protein: 1, carbs: 2, fat: 3 },
+  banana: { amount: '1 medium', calories: 105, protein: 1, carbs: 27, fat: 0 },
+  berries: { amount: '1 cup', calories: 70, protein: 1, carbs: 17, fat: 0 },
+  'protein powder': { amount: '1 scoop', calories: 120, protein: 24, carbs: 3, fat: 2 },
+  'liquid iv hydration powder': { amount: '1 stick', calories: 45, protein: 0, carbs: 11, fat: 0 },
+  'greens superfoods raspberry lemonade': { amount: '1 scoop', calories: 30, protein: 1, carbs: 5, fat: 0 },
+  'herbal tea or tea bags': { amount: '1 cup brewed', calories: 0, protein: 0, carbs: 0, fat: 0 }
+};
+
+function findInternalMacroBase(name) {
+  const normalized = normalizeIngredientName(name);
+  if (internalMacroDatabase[normalized]) {
+    return internalMacroDatabase[normalized];
+  }
+  const matchedKey = Object.keys(internalMacroDatabase).find((key) => normalized.includes(key) || key.includes(normalized));
+  return matchedKey ? internalMacroDatabase[matchedKey] : null;
+}
+
+function amountMultiplier(amount = '', baseAmount = '') {
+  const value = `${amount || baseAmount}`.toLowerCase();
+  const numberMatch = value.match(/(\d+(?:\.\d+)?)/);
+  const number = numberMatch ? Number(numberMatch[1]) : 1;
+  if (value.includes('2 serving')) return 2;
+  if (value.includes('large')) return 1.5;
+  if (value.includes('small')) return 0.6;
+  if (value.includes('oz')) {
+    const baseOz = `${baseAmount}`.match(/(\d+(?:\.\d+)?)\s*oz/i);
+    return baseOz ? number / Number(baseOz[1]) : number / 4;
+  }
+  if (value.includes('cup')) {
+    const baseCup = `${baseAmount}`.match(/(\d+(?:\.\d+)?)\s*cup/i);
+    return baseCup ? number / Number(baseCup[1]) : number;
+  }
+  if (value.includes('scoop') || value.includes('stick') || value.includes('packet')) return number;
+  return 1;
+}
+
+function macroConfidence({ ingredientConfidence = 0, portionConfirmed = false, source = 'internal' }) {
+  const percent = Number(ingredientConfidence) <= 1
+    ? Number(ingredientConfidence) * 100
+    : Number(ingredientConfidence);
+  if (percent >= 80 && portionConfirmed && source === 'USDA FoodData Central') return 'High';
+  if (percent >= 80 && portionConfirmed) return 'High';
+  if (percent >= 55) return portionConfirmed ? 'High' : 'Medium';
+  return 'Low';
+}
+
+function scaleMacroBase({ name, amount, confidence, portionConfirmed, base, source }) {
+  const multiplier = amountMultiplier(amount, base.amount);
+  const rowConfidence = macroConfidence({ ingredientConfidence: confidence, portionConfirmed, source });
+  return {
+    name,
+    amount: amount || base.amount || '1 serving',
+    calories: roundCalories(base.calories * multiplier),
+    protein: roundGram(base.protein * multiplier),
+    carbs: roundGram(base.carbs * multiplier),
+    fat: roundGram(base.fat * multiplier),
+    source,
+    confidence: rowConfidence
+  };
+}
+
+function nutrientValue(food = {}, nutrientName = '') {
+  const nutrient = (food.foodNutrients || []).find((item) =>
+    `${item.nutrientName || item.name}`.toLowerCase().includes(nutrientName)
+  );
+  return Number(nutrient?.value || nutrient?.amount || 0);
+}
+
+async function lookupUsdaMacroBase(name) {
+  if (!usdaApiKey) {
+    return null;
+  }
+  const url = new URL('https://api.nal.usda.gov/fdc/v1/foods/search');
+  url.searchParams.set('api_key', usdaApiKey);
+  url.searchParams.set('query', name);
+  url.searchParams.set('pageSize', '1');
+  url.searchParams.set('dataType', 'Foundation,SR Legacy');
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`USDA FoodData Central returned ${response.status}`);
+  }
+  const payload = await response.json();
+  const food = payload.foods?.[0];
+  if (!food) {
+    return null;
+  }
+  return {
+    amount: '100 g',
+    calories: nutrientValue(food, 'energy'),
+    protein: nutrientValue(food, 'protein'),
+    carbs: nutrientValue(food, 'carbohydrate'),
+    fat: nutrientValue(food, 'total lipid')
+  };
+}
+
+async function macroRowForIngredient(ingredient = {}) {
+  const name = normalizeIngredientName(ingredient.name);
+  const amount = ingredient.amount || '';
+  const confidence = Number.isFinite(Number(ingredient.confidence)) ? Number(ingredient.confidence) : 0.65;
+  const portionConfirmed = Boolean(ingredient.portionConfirmed);
+  if (!name) {
+    return null;
+  }
+
+  try {
+    const usdaBase = await lookupUsdaMacroBase(name);
+    if (usdaBase) {
+      return scaleMacroBase({ name, amount, confidence, portionConfirmed, base: usdaBase, source: 'USDA FoodData Central' });
+    }
+  } catch (error) {
+    console.warn('[Nutrition] USDA lookup failed:', { name, error: error.message });
+  }
+
+  const internalBase = findInternalMacroBase(name);
+  if (internalBase) {
+    return scaleMacroBase({ name, amount, confidence, portionConfirmed, base: internalBase, source: 'internal' });
+  }
+
+  return scaleMacroBase({
+    name,
+    amount,
+    confidence,
+    portionConfirmed,
+    base: { amount: '1 serving', calories: 120, protein: 4, carbs: 18, fat: 4 },
+    source: 'ai_estimate'
+  });
+}
+
+async function macrosForIngredients(body = {}) {
+  const input = Array.isArray(body.ingredients) ? body.ingredients : [];
+  const items = (await Promise.all(input.map((ingredient) => macroRowForIngredient(ingredient)))).filter(Boolean);
+  const totals = items.reduce(
+    (sum, item) => ({
+      calories: sum.calories + item.calories,
+      protein: sum.protein + item.protein,
+      carbs: sum.carbs + item.carbs,
+      fat: sum.fat + item.fat
+    }),
+    { calories: 0, protein: 0, carbs: 0, fat: 0 }
+  );
+  const confidenceRank = { Low: 1, Medium: 2, High: 3 };
+  const confidence = items.reduce((lowest, item) => (
+    confidenceRank[item.confidence] < confidenceRank[lowest] ? item.confidence : lowest
+  ), items.length ? items[0].confidence : 'Low');
+  const source = items.some((item) => item.source === 'USDA FoodData Central')
+    ? 'USDA FoodData Central'
+    : items.some((item) => item.source === 'internal')
+    ? 'internal'
+    : 'ai_estimate';
+  return {
+    source,
+    confidence,
+    items,
+    totals: {
+      calories: roundCalories(totals.calories),
+      protein: roundGram(totals.protein),
+      carbs: roundGram(totals.carbs),
+      fat: roundGram(totals.fat)
+    }
+  };
 }
 
 function extractJsonObject(text) {
@@ -1046,6 +1246,26 @@ const server = http.createServer(async (request, response) => {
       }
       const body = await readBody(request);
       send(response, 200, nutritionFor(body.recipe || {}));
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/nutrition/macros') {
+      if (!hasValidBridgeToken(request)) {
+        send(response, 401, { error: 'Bridge authorization failed.' });
+        return;
+      }
+      const body = await readBody(request);
+      console.log('[Nutrition] POST /nutrition/macros received:', {
+        ingredientCount: Array.isArray(body.ingredients) ? body.ingredients.length : 0,
+        usdaConfigured: Boolean(usdaApiKey)
+      });
+      const macros = await macrosForIngredients(body);
+      console.log('[Nutrition] POST /nutrition/macros success:', {
+        source: macros.source,
+        confidence: macros.confidence,
+        itemCount: macros.items.length
+      });
+      send(response, 200, macros);
       return;
     }
 
