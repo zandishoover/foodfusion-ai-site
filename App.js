@@ -1444,7 +1444,11 @@ function normalizeHostedMacroSummary(payload = {}, localSummary = {}) {
       confidence: item.confidence || localRow.confidence || 'Low',
       source: item.source || payload.source || 'Hosted nutrition',
       needsConfirmation: Boolean(localRow.needsConfirmation),
-      detectionPercent: localRow.detectionPercent || 0
+      detectionPercent: localRow.detectionPercent || 0,
+      normalizedName: item.normalizedName || localRow.normalizedName || item.name,
+      barcodeMatched: Boolean(item.barcodeMatched),
+      gramsEstimated: item.gramsEstimated,
+      portionAssumption: item.portionAssumption || ''
     };
   });
   const source = payload.source || rows[0]?.source || 'Hosted nutrition';
@@ -3026,7 +3030,11 @@ function FoodFusionApp() {
     recalculationStatus: 'Not run',
     endpointUsed: 'Not requested',
     lookupStatus: 'Not requested',
-    lastError: ''
+    lastError: '',
+    normalizedIngredients: '',
+    barcodeMatched: 'false',
+    gramsEstimated: '',
+    portionAssumption: ''
   });
   const [hostedMacroSummary, setHostedMacroSummary] = useState(null);
   const [analysisStep, setAnalysisStep] = useState(0);
@@ -3944,15 +3952,16 @@ function FoodFusionApp() {
   }, [currentPantryIngredients, favorites, globalSearchQuery, recentRecipes]);
 
   useEffect(() => {
+    const debug = getMacroNutritionDebug();
     setMacroDebug({
-      ...getMacroNutritionDebug(),
+      ...debug,
       source: displayedMacroSummary.sources.join(' / ') || 'Not calculated',
       confidence: displayedMacroSummary.confidence,
       needsConfirmation: displayedMacroSummary.needingConfirmation.length ? displayedMacroSummary.needingConfirmation.join(', ') : 'None',
       recalculationStatus: ingredients.length ? `Recalculated ${new Date().toLocaleTimeString()}` : 'Not run',
-      endpointUsed: getMacroNutritionDebug().endpointUsed,
-      lookupStatus: getMacroNutritionDebug().status,
-      lastError: getMacroNutritionDebug().lastError
+      endpointUsed: debug.endpointUsed,
+      lookupStatus: debug.status,
+      lastError: debug.lastError
     });
   }, [ingredients.length, displayedMacroSummary.confidence, displayedMacroSummary.needingConfirmation, displayedMacroSummary.sources]);
 
@@ -3979,6 +3988,10 @@ function FoodFusionApp() {
         const debug = getMacroNutritionDebug();
         setMacroDebug((current) => ({
           ...current,
+          normalizedIngredients: debug.normalizedIngredients,
+          barcodeMatched: debug.barcodeMatched,
+          gramsEstimated: debug.gramsEstimated,
+          portionAssumption: debug.portionAssumption,
           endpointUsed: debug.endpointUsed,
           source: hosted.source || debug.sourceUsed || current.source,
           lookupStatus: debug.status,
@@ -3993,6 +4006,10 @@ function FoodFusionApp() {
         const debug = getMacroNutritionDebug();
         setMacroDebug((current) => ({
           ...current,
+          normalizedIngredients: debug.normalizedIngredients || '',
+          barcodeMatched: debug.barcodeMatched || 'false',
+          gramsEstimated: debug.gramsEstimated || '',
+          portionAssumption: debug.portionAssumption || '',
           endpointUsed: debug.endpointUsed,
           source: macroSummary.sources.join(' / ') || current.source,
           lookupStatus: debug.status,
@@ -9031,6 +9048,10 @@ function FoodFusionApp() {
               ['Macro source used', macroDebug.source],
               ['Macro lookup status', macroDebug.lookupStatus || 'Not requested'],
               ['Last macro lookup error', macroDebug.lastError || 'None'],
+              ['Normalized ingredient name', macroDebug.normalizedIngredients || 'None'],
+              ['Barcode matched', macroDebug.barcodeMatched || 'false'],
+              ['Grams estimated', macroDebug.gramsEstimated || 'None'],
+              ['Portion assumption', macroDebug.portionAssumption || 'None'],
               ['Macro confidence', macroDebug.confidence],
               ['Ingredients needing portion confirmation', macroDebug.needsConfirmation],
               ['Last macro recalculation status', macroDebug.recalculationStatus],

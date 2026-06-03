@@ -152,13 +152,106 @@ function roundGram(value) {
   return Math.round(Number(value || 0));
 }
 
+const ingredientNormalizationMap = [
+  [/boneless skinless chicken breast/g, 'chicken breast'],
+  [/skinless boneless chicken breast/g, 'chicken breast'],
+  [/instant oatmeal maple (and |& )?brown sugar/g, 'oatmeal'],
+  [/maple (and |& )?brown sugar instant oatmeal/g, 'oatmeal'],
+  [/egg whites/g, 'egg white'],
+  [/greek yogurt/g, 'yogurt greek plain'],
+  [/plain greek yogurt/g, 'yogurt greek plain'],
+  [/liquid iv hydration powder/g, 'drink mix electrolyte'],
+  [/greens superfoods raspberry lemonade/g, 'greens drink mix'],
+  [/herbal tea or tea bags/g, 'herbal tea']
+];
+
+const brandFillerWords = [
+  'great value',
+  'kirkland',
+  'signature',
+  'market pantry',
+  'good gather',
+  'simple truth',
+  'private selection',
+  'trader joe',
+  'trader joes',
+  'whole foods',
+  '365',
+  'frys',
+  'kroger',
+  'safeway',
+  'target',
+  'walmart'
+];
+
+const packagingWords = [
+  'organic',
+  'fresh',
+  'raw',
+  'cooked',
+  'frozen',
+  'bag',
+  'box',
+  'bottle',
+  'package',
+  'pack',
+  'carton',
+  'can',
+  'canned'
+];
+
+const packagedFoodWords = [
+  'bar',
+  'cereal',
+  'oatmeal',
+  'protein powder',
+  'drink mix',
+  'chips',
+  'sauce',
+  'yogurt',
+  'shake',
+  'powder',
+  'snack',
+  'granola',
+  'cracker',
+  'cookies',
+  'bread',
+  'tortilla'
+];
+
+function cleanWords(value, words) {
+  return words.reduce((text, word) => text.replace(new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'), ' '), value);
+}
+
 function normalizeIngredientName(value = '') {
-  return `${value}`.toLowerCase().trim();
+  let normalized = `${value}`
+    .toLowerCase()
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9\s&/-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  ingredientNormalizationMap.forEach(([pattern, replacement]) => {
+    normalized = normalized.replace(pattern, replacement);
+  });
+  normalized = cleanWords(normalized, brandFillerWords);
+  normalized = cleanWords(normalized, packagingWords);
+  return normalized.replace(/\s+/g, ' ').trim();
+}
+
+function looksPackagedFood(name = '') {
+  const normalized = `${name}`.toLowerCase();
+  return packagedFoodWords.some((word) => normalized.includes(word));
+}
+
+function normalizeBarcode(value = '') {
+  const digits = `${value}`.replace(/\D/g, '');
+  return digits.length >= 8 ? digits : '';
 }
 
 const internalMacroDatabase = {
   chicken: { amount: '4 oz cooked', calories: 185, protein: 35, carbs: 0, fat: 4 },
   'chicken breast': { amount: '4 oz cooked', calories: 185, protein: 35, carbs: 0, fat: 4 },
+  'egg white': { amount: '3 large whites', calories: 50, protein: 11, carbs: 1, fat: 0 },
   eggs: { amount: '2 large', calories: 140, protein: 12, carbs: 1, fat: 10 },
   egg: { amount: '1 large', calories: 70, protein: 6, carbs: 0, fat: 5 },
   rice: { amount: '1 cup cooked', calories: 205, protein: 4, carbs: 45, fat: 0 },
@@ -189,6 +282,59 @@ const internalMacroDatabase = {
   'herbal tea or tea bags': { amount: '1 cup brewed', calories: 0, protein: 0, carbs: 0, fat: 0 }
 };
 
+const defaultServingGrams = {
+  chicken: 113,
+  'chicken breast': 113,
+  egg: 50,
+  eggs: 100,
+  'egg white': 100,
+  rice: 158,
+  yogurt: 170,
+  'yogurt greek plain': 170,
+  cucumber: 104,
+  lemon: 58,
+  tofu: 113,
+  noodles: 140,
+  pasta: 140,
+  oats: 40,
+  oatmeal: 43,
+  spinach: 60,
+  broccoli: 91,
+  avocado: 75,
+  beans: 130,
+  'black beans': 130,
+  corn: 82,
+  salmon: 113,
+  tuna: 113,
+  milk: 244,
+  'almond milk': 244,
+  banana: 118,
+  berries: 140,
+  'protein powder': 32,
+  'drink mix electrolyte': 16,
+  'greens drink mix': 8,
+  'herbal tea': 240
+};
+
+const cupGramEstimates = {
+  rice: 158,
+  yogurt: 245,
+  'yogurt greek plain': 245,
+  cucumber: 104,
+  noodles: 140,
+  pasta: 140,
+  oats: 80,
+  oatmeal: 240,
+  spinach: 30,
+  broccoli: 91,
+  beans: 172,
+  'black beans': 172,
+  corn: 164,
+  milk: 244,
+  'almond milk': 244,
+  berries: 140
+};
+
 function findInternalMacroBase(name) {
   const normalized = normalizeIngredientName(name);
   if (internalMacroDatabase[normalized]) {
@@ -217,78 +363,233 @@ function amountMultiplier(amount = '', baseAmount = '') {
   return 1;
 }
 
-function macroConfidence({ ingredientConfidence = 0, portionConfirmed = false, source = 'internal' }) {
+function estimateGrams({ name, normalizedName, amount = '', baseAmount = '' }) {
+  const key = normalizedName || normalizeIngredientName(name);
+  const value = `${amount || baseAmount || ''}`.toLowerCase();
+  const numberMatch = value.match(/(\d+(?:\.\d+)?)/);
+  const number = numberMatch ? Number(numberMatch[1]) : 1;
+  const matchedCupKey = Object.keys(cupGramEstimates).find((item) => key.includes(item) || item.includes(key));
+  const matchedServingKey = Object.keys(defaultServingGrams).find((item) => key.includes(item) || item.includes(key));
+  const defaultGrams = matchedServingKey ? defaultServingGrams[matchedServingKey] : 100;
+
+  if (value.includes('oz')) {
+    return {
+      gramsEstimated: Math.round(number * 28.3495),
+      portionAssumption: `${number} oz converted to grams`
+    };
+  }
+  if (value.includes('lb')) {
+    return {
+      gramsEstimated: Math.round(number * 453.592),
+      portionAssumption: `${number} lb converted to grams`
+    };
+  }
+  if (value.includes('cup')) {
+    const cupGrams = matchedCupKey ? cupGramEstimates[matchedCupKey] : 240;
+    return {
+      gramsEstimated: Math.round(number * cupGrams),
+      portionAssumption: `${number} cup${number === 1 ? '' : 's'} estimated as ${cupGrams}g per cup`
+    };
+  }
+  if (value.includes('tbsp') || value.includes('tablespoon')) {
+    return {
+      gramsEstimated: Math.round(number * 15),
+      portionAssumption: `${number} tbsp estimated as 15g each`
+    };
+  }
+  if (value.includes('tsp') || value.includes('teaspoon')) {
+    return {
+      gramsEstimated: Math.round(number * 5),
+      portionAssumption: `${number} tsp estimated as 5g each`
+    };
+  }
+  if (value.includes('scoop')) {
+    return {
+      gramsEstimated: Math.round(number * (key.includes('protein') ? 32 : defaultGrams)),
+      portionAssumption: `${number} scoop${number === 1 ? '' : 's'} estimated by ingredient type`
+    };
+  }
+  if (value.includes('stick')) {
+    return {
+      gramsEstimated: Math.round(number * (key.includes('drink mix') ? 16 : defaultGrams)),
+      portionAssumption: `${number} stick${number === 1 ? '' : 's'} estimated by ingredient type`
+    };
+  }
+  if (value.includes('packet')) {
+    return {
+      gramsEstimated: Math.round(number * (key.includes('oatmeal') ? 43 : defaultGrams)),
+      portionAssumption: `${number} packet${number === 1 ? '' : 's'} estimated by ingredient type`
+    };
+  }
+  if (value.includes('large') && (key.includes('egg') || key.includes('banana') || key.includes('lemon'))) {
+    return {
+      gramsEstimated: Math.round(number * defaultGrams),
+      portionAssumption: `${number} item${number === 1 ? '' : 's'} estimated by ingredient type`
+    };
+  }
+  if (value.includes('serving') || value.includes('medium') || value.includes('small') || value.includes('large')) {
+    const sizeMultiplier = value.includes('small') ? 0.6 : value.includes('large') ? 1.5 : number;
+    return {
+      gramsEstimated: Math.round(defaultGrams * sizeMultiplier),
+      portionAssumption: `${amount || '1 serving'} estimated from default serving weight`
+    };
+  }
+  const baseGramMatch = `${baseAmount}`.match(/(\d+(?:\.\d+)?)\s*g/i);
+  if (baseGramMatch) {
+    return {
+      gramsEstimated: Math.round(Number(baseGramMatch[1])),
+      portionAssumption: `Using database serving weight from ${baseAmount}`
+    };
+  }
+  return {
+    gramsEstimated: defaultGrams,
+    portionAssumption: 'Default serving grams estimated by ingredient type'
+  };
+}
+
+function macroConfidence({ ingredientConfidence = 0, portionConfirmed = false, source = 'internal', exactMatch = false, barcodeMatched = false }) {
   const percent = Number(ingredientConfidence) <= 1
     ? Number(ingredientConfidence) * 100
     : Number(ingredientConfidence);
-  if (percent >= 80 && portionConfirmed && source === 'USDA FoodData Central') return 'High';
-  if (percent >= 80 && portionConfirmed) return 'High';
-  if (percent >= 55) return portionConfirmed ? 'High' : 'Medium';
+  if (barcodeMatched) return 'High';
+  if (source.startsWith('USDA') && exactMatch && portionConfirmed) return 'High';
+  if (source.startsWith('USDA') || source === 'internal') return percent >= 45 ? 'Medium' : 'Low';
   return 'Low';
 }
 
-function scaleMacroBase({ name, amount, confidence, portionConfirmed, base, source }) {
-  const multiplier = amountMultiplier(amount, base.amount);
-  const rowConfidence = macroConfidence({ ingredientConfidence: confidence, portionConfirmed, source });
+function scaleMacroBase({ name, normalizedName, amount, confidence, portionConfirmed, base, source, barcodeMatched = false, exactMatch = false }) {
+  const grams = estimateGrams({ name, normalizedName, amount, baseAmount: base.amount });
+  const multiplier = base.per100g ? grams.gramsEstimated / 100 : amountMultiplier(amount, base.amount);
+  const rowConfidence = macroConfidence({ ingredientConfidence: confidence, portionConfirmed, source, exactMatch, barcodeMatched });
   return {
     name,
+    normalizedName: normalizedName || normalizeIngredientName(name),
     amount: amount || base.amount || '1 serving',
     calories: roundCalories(base.calories * multiplier),
     protein: roundGram(base.protein * multiplier),
     carbs: roundGram(base.carbs * multiplier),
     fat: roundGram(base.fat * multiplier),
     source,
-    confidence: rowConfidence
+    confidence: rowConfidence,
+    barcodeMatched,
+    gramsEstimated: grams.gramsEstimated,
+    portionAssumption: grams.portionAssumption
   };
 }
 
 function nutrientValue(food = {}, nutrientName = '') {
-  const nutrient = (food.foodNutrients || []).find((item) =>
-    `${item.nutrientName || item.name}`.toLowerCase().includes(nutrientName)
-  );
+  const nutrients = food.foodNutrients || [];
+  const nutrient = nutrientName === 'energy'
+    ? nutrients.find((item) => `${item.nutrientNumber || item.number}` === '1008' || `${item.unitName || item.unit}`.toLowerCase() === 'kcal')
+    : nutrients.find((item) => `${item.nutrientName || item.name}`.toLowerCase().includes(nutrientName));
   return Number(nutrient?.value || nutrient?.amount || 0);
 }
 
-async function lookupUsdaMacroBase(name) {
-  if (!usdaApiKey) {
-    return null;
-  }
-  const url = new URL('https://api.nal.usda.gov/fdc/v1/foods/search');
-  url.searchParams.set('api_key', usdaApiKey);
-  url.searchParams.set('query', name);
-  url.searchParams.set('pageSize', '1');
-  url.searchParams.set('dataType', 'Foundation,SR Legacy');
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`USDA FoodData Central returned ${response.status}`);
-  }
-  const payload = await response.json();
-  const food = payload.foods?.[0];
-  if (!food) {
-    return null;
-  }
+function usdaFoodToBase(food, source) {
   return {
     amount: '100 g',
     calories: nutrientValue(food, 'energy'),
     protein: nutrientValue(food, 'protein'),
     carbs: nutrientValue(food, 'carbohydrate'),
-    fat: nutrientValue(food, 'total lipid')
+    fat: nutrientValue(food, 'total lipid'),
+    description: `${food.description || food.lowercaseDescription || ''}`.toLowerCase(),
+    source,
+    per100g: true
   };
 }
 
+function foodLooksExact(food = {}, normalizedName = '') {
+  const description = `${food.description || food.lowercaseDescription || ''}`.toLowerCase();
+  return description === normalizedName || description.includes(normalizedName) || normalizedName.includes(description);
+}
+
+async function searchUsdaFoods({ query, dataType = '', pageSize = '3' }) {
+  if (!usdaApiKey) {
+    return [];
+  }
+  const url = new URL('https://api.nal.usda.gov/fdc/v1/foods/search');
+  url.searchParams.set('api_key', usdaApiKey);
+  url.searchParams.set('query', query);
+  url.searchParams.set('pageSize', pageSize);
+  if (dataType) {
+    url.searchParams.set('dataType', dataType);
+  }
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`USDA FoodData Central returned ${response.status}`);
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.foods) ? payload.foods : [];
+}
+
+async function lookupUsdaMacroBase({ name, normalizedName, barcode, preferBranded }) {
+  if (!usdaApiKey) {
+    return null;
+  }
+  const normalizedBarcode = normalizeBarcode(barcode);
+  if (normalizedBarcode) {
+    const barcodeFoods = await searchUsdaFoods({ query: normalizedBarcode, dataType: 'Branded', pageSize: '1' });
+    if (barcodeFoods[0]) {
+      return {
+        ...usdaFoodToBase(barcodeFoods[0], 'USDA Branded'),
+        barcodeMatched: true,
+        exactMatch: true
+      };
+    }
+  }
+
+  const sourceOrder = preferBranded
+    ? [
+        { dataType: 'Branded', source: 'USDA Branded' },
+        { dataType: 'Foundation,SR Legacy', source: 'USDA Foundation' }
+      ]
+    : [
+        { dataType: 'Foundation,SR Legacy', source: 'USDA Foundation' },
+        { dataType: 'Branded', source: 'USDA Branded' }
+      ];
+
+  for (const sourceConfig of sourceOrder) {
+    const foods = await searchUsdaFoods({ query: normalizedName || name, dataType: sourceConfig.dataType, pageSize: '3' });
+    const exact = foods.find((food) => foodLooksExact(food, normalizedName));
+    const food = exact || foods[0];
+    if (food) {
+      return {
+        ...usdaFoodToBase(food, sourceConfig.source),
+        barcodeMatched: false,
+        exactMatch: Boolean(exact)
+      };
+    }
+  }
+
+  return null;
+}
+
 async function macroRowForIngredient(ingredient = {}) {
-  const name = normalizeIngredientName(ingredient.name);
+  const originalName = `${ingredient.name || ''}`.trim();
+  const name = normalizeIngredientName(originalName);
   const amount = ingredient.amount || '';
   const confidence = Number.isFinite(Number(ingredient.confidence)) ? Number(ingredient.confidence) : 0.65;
   const portionConfirmed = Boolean(ingredient.portionConfirmed);
+  const barcode = normalizeBarcode(ingredient.barcode);
   if (!name) {
     return null;
   }
 
   try {
-    const usdaBase = await lookupUsdaMacroBase(name);
+    const preferBranded = Boolean(barcode) || looksPackagedFood(originalName) || looksPackagedFood(name);
+    const usdaBase = await lookupUsdaMacroBase({ name: originalName || name, normalizedName: name, barcode, preferBranded });
     if (usdaBase) {
-      return scaleMacroBase({ name, amount, confidence, portionConfirmed, base: usdaBase, source: 'USDA FoodData Central' });
+      return scaleMacroBase({
+        name: originalName || name,
+        normalizedName: name,
+        amount,
+        confidence,
+        portionConfirmed,
+        base: usdaBase,
+        source: usdaBase.source,
+        barcodeMatched: usdaBase.barcodeMatched,
+        exactMatch: usdaBase.exactMatch
+      });
     }
   } catch (error) {
     console.warn('[Nutrition] USDA lookup failed:', { name, error: error.message });
@@ -296,11 +597,21 @@ async function macroRowForIngredient(ingredient = {}) {
 
   const internalBase = findInternalMacroBase(name);
   if (internalBase) {
-    return scaleMacroBase({ name, amount, confidence, portionConfirmed, base: internalBase, source: 'internal' });
+    return scaleMacroBase({
+      name: originalName || name,
+      normalizedName: name,
+      amount,
+      confidence,
+      portionConfirmed,
+      base: internalBase,
+      source: 'internal',
+      exactMatch: true
+    });
   }
 
   return scaleMacroBase({
-    name,
+    name: originalName || name,
+    normalizedName: name,
     amount,
     confidence,
     portionConfirmed,
@@ -325,8 +636,10 @@ async function macrosForIngredients(body = {}) {
   const confidence = items.reduce((lowest, item) => (
     confidenceRank[item.confidence] < confidenceRank[lowest] ? item.confidence : lowest
   ), items.length ? items[0].confidence : 'Low');
-  const source = items.some((item) => item.source === 'USDA FoodData Central')
-    ? 'USDA FoodData Central'
+  const source = items.some((item) => item.source === 'USDA Branded')
+    ? 'USDA Branded'
+    : items.some((item) => item.source === 'USDA Foundation')
+    ? 'USDA Foundation'
     : items.some((item) => item.source === 'internal')
     ? 'internal'
     : 'ai_estimate';

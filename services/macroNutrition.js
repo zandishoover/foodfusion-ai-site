@@ -11,7 +11,11 @@ let macroNutritionDebug = {
   endpointUsed: MACRO_ENDPOINT,
   sourceUsed: 'local',
   status: 'Not requested',
-  lastError: ''
+  lastError: '',
+  normalizedIngredients: '',
+  barcodeMatched: 'false',
+  gramsEstimated: '',
+  portionAssumption: ''
 };
 
 function roundCalories(value) {
@@ -50,6 +54,16 @@ function normalizeMacroPayload(payload = {}) {
       carbs: roundGram(totals.carbs),
       fat: roundGram(totals.fat)
     }
+  };
+}
+
+function macroDebugFromPayload(payload = {}) {
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  return {
+    normalizedIngredients: items.map((item) => item.normalizedName).filter(Boolean).join(', '),
+    barcodeMatched: items.some((item) => item.barcodeMatched) ? 'true' : 'false',
+    gramsEstimated: items.map((item) => item.gramsEstimated).filter((value) => Number.isFinite(Number(value))).join(', '),
+    portionAssumption: items.map((item) => item.portionAssumption).filter(Boolean).slice(0, 4).join(' | ')
   };
 }
 
@@ -98,11 +112,13 @@ export async function lookupHostedMacros(ingredients = []) {
     }
     const payload = raw ? JSON.parse(raw) : {};
     const normalized = normalizeMacroPayload(payload);
+    const metadata = macroDebugFromPayload(normalized);
     macroNutritionDebug = {
       endpointUsed: MACRO_ENDPOINT,
       sourceUsed: normalized.source,
       status: 'Synced',
-      lastError: ''
+      lastError: '',
+      ...metadata
     };
     console.log('[Macro Nutrition] lookup success', {
       source: normalized.source,
@@ -116,7 +132,11 @@ export async function lookupHostedMacros(ingredients = []) {
       endpointUsed: MACRO_ENDPOINT,
       sourceUsed: 'local',
       status: 'Local fallback',
-      lastError: message
+      lastError: message,
+      normalizedIngredients: '',
+      barcodeMatched: 'false',
+      gramsEstimated: '',
+      portionAssumption: ''
     };
     console.warn('[Macro Nutrition] lookup failed', message);
     throw error;
