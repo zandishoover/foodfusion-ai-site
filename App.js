@@ -65,6 +65,17 @@ import {
   syncSubscriptionStatus,
   syncUserPreferences
 } from './services/userDataRepository';
+import {
+  initializeRevenueCat,
+  getRevenueCatSubscription,
+  logOutRevenueCat,
+  purchaseMonthlySubscription,
+  purchaseYearlySubscription,
+  restoreRevenueCatPurchases,
+  revenueCatConfigured,
+  revenueCatDebugConfig
+} from './services/revenueCat';
+import { PremiumProvider, usePremium } from './contexts/PremiumContext';
 
 const SCAN_KEY = 'foodfusion:lastScanDate';
 const PREMIUM_KEY = 'foodfusion:fusionPlus';
@@ -235,10 +246,12 @@ const recipeTypes = ['Meals', 'Smoothies', 'Protein Shakes', 'Drinks'];
 const recipeTypeFilters = ['Meals', 'Smoothies', 'Protein Shakes', 'Drinks', 'All'];
 const favoriteFolders = ['All', 'Favorites', 'Meal Prep', 'Family', 'Gym Meals', 'Drinks', 'Quick Meals'];
 const fusionPlans = [
-  { id: 'weekly', name: 'Weekly', price: '$2.99', cadence: '/week', badge: '' },
-  { id: 'monthly', name: 'Monthly', price: '$7.99', cadence: '/month', badge: 'Most Popular' },
-  { id: 'yearly', name: 'Yearly', price: '$49.99', cadence: '/year', badge: 'Best Value' }
+  { id: 'monthly', name: 'Monthly', price: '$7.99', cadence: '/month', badge: '', detail: 'Flexible cancel anytime' },
+  { id: 'yearly', name: 'Yearly', price: '$69.99', cadence: '/year', badge: 'Best Value', savings: 'SAVE 27%', detail: '2 months free' }
 ];
+function fusionPlanById(planId = 'yearly') {
+  return fusionPlans.find((plan) => plan.id === planId) || fusionPlans.find((plan) => plan.id === 'yearly') || fusionPlans[0];
+}
 const fusionBenefits = [
   'Unlimited scans',
   'One More Item',
@@ -2409,9 +2422,10 @@ function FusionPlusScreen({
   onRestore,
   onSelectPlan,
   onManage,
-  selectedPlan
+  selectedPlan,
+  premiumAccess
 }) {
-  const currentPlan = fusionPlans.find((plan) => plan.id === selectedPlan) || fusionPlans[2];
+  const currentPlan = fusionPlanById(selectedPlan);
 
   return (
     <Screen>
@@ -2451,9 +2465,15 @@ function FusionPlusScreen({
                   <Text style={styles.bestValueText}>{plan.badge}</Text>
                 </View>
               ) : null}
+              {plan.savings ? (
+                <View style={[styles.bestValueBadge, styles.savingsBadge]}>
+                  <Text style={styles.bestValueText}>{plan.savings}</Text>
+                </View>
+              ) : null}
               <Text style={styles.planName}>{plan.name}</Text>
               <Text style={styles.planPrice}>{plan.price}</Text>
               <Text style={styles.planCadence}>{plan.cadence}</Text>
+              <Text style={styles.planDetail}>{plan.detail}</Text>
             </Pressable>
           ))}
         </View>
@@ -2483,6 +2503,12 @@ function FusionPlusScreen({
         ) : (
           <Button accent={flowColors.fusion.accent} onPress={() => onSelectPlan(selectedPlan)}>Continue with {currentPlan.name}</Button>
         )}
+
+        {premiumAccess.status === 'loading' ? (
+          <Text style={styles.authMessage}>Checking Fusion+ access...</Text>
+        ) : premiumAccess.error ? (
+          <Text style={styles.authError}>{premiumAccess.error}</Text>
+        ) : null}
 
         <View style={styles.paymentActions}>
           <Pressable onPress={onRestore} style={styles.textAction}>
@@ -2695,7 +2721,8 @@ function SplashScreen() {
   );
 }
 
-export default function App() {
+function FoodFusionApp() {
+  const premiumAccess = usePremium();
   const [screen, setScreen] = useState('home');
   const [isLoggedIn, setIsLoggedIn] = useState(null);
   const [userProfile, setUserProfile] = useState(null);
@@ -2741,13 +2768,9 @@ export default function App() {
   const [selectedFusionPlan, setSelectedFusionPlan] = useState('yearly');
   const [selectedRecipeType, setSelectedRecipeType] = useState('Meals');
   const [isProcessingPayment, setIsProcessingPayment] = useState(false);
-  const [paymentForm, setPaymentForm] = useState({
-    cardNumber: '',
-    expiration: '',
-    cvv: '',
-    name: '',
-    zip: ''
-  });
+  const [subscriptionManagementUrl, setSubscriptionManagementUrl] = useState(null);
+  const [subscriptionRenewalDate, setSubscriptionRenewalDate] = useState(null);
+  const [revenueCatDebug, setRevenueCatDebug] = useState(revenueCatDebugConfig());
   const [macroFilter, setMacroFilter] = useState('Balanced');
   const [fridgePersonality, setFridgePersonality] = useState('');
   const [mealHistory, setMealHistory] = useState([]);
@@ -3252,6 +3275,66 @@ export default function App() {
     }));
   }
 
+  async function applySubscriptionResultForUser(userId, result, source = 'RevenueCat') {
+    const active = Boolean(result?.isPremium);
+    const plan = active ? result?.selectedPlan || selectedFusionPlan || 'yearly' : 'yearly';
+    if (activeUserIdRef.current === userId) {
+      setIsPremium(active);
+      setSelectedFusionPlan(plan);
+      setSubscriptionManagementUrl(result?.managementURL || null);
+      setSubscriptionRenewalDate(result?.renewsAt || result?.expirationDate || null);
+    }
+    premiumAccess.setPremiumState({
+      isPremium: active,
+      selectedPlan: plan,
+      source,
+      status: active ? 'active' : result?.subscriptionStatus || 'inactive',
+      error: '',
+      expirationDate: result?.expirationDate || null,
+      managementURL: result?.managementURL || null,
+      productIdentifier: result?.productIdentifier || null
+    });
+    await withRestoreTimeout(multiSetCachedForUser(userId, [
+      [PREMIUM_KEY, active ? 'true' : 'false'],
+      [PREMIUM_PLAN_KEY, plan]
+    ]), 'Subscription cache save', 2500).catch((error) => {
+      console.warn('[Subscription] Cache save deferred:', error?.message);
+    });
+    if (supabaseConfigured && isLoggedIn && !appleSessionRef.current && activeUserIdRef.current === userId) {
+      await withRestoreTimeout(
+        syncSubscriptionStatus({
+          isPremium: active,
+          selectedPlan: plan,
+          provider: source === 'RevenueCat' ? 'revenuecat' : 'mvp_local',
+          status: result?.subscriptionStatus || (active ? 'active' : 'inactive'),
+          renewsAt: result?.renewsAt || result?.expirationDate || null,
+          externalSubscriptionId: result?.productIdentifier || null
+        }),
+        'Subscription Supabase sync',
+        3000
+      ).catch((error) => {
+        console.warn('[Subscription] Supabase sync deferred:', error?.message);
+      });
+    }
+    setAccountDiagnostics((current) => ({
+      ...current,
+      userId,
+      subscriptionSource: source,
+      subscriptionStatus: active ? 'active' : 'free',
+      isPremium: active,
+      selectedPlan: plan
+    }));
+    await refreshAccountDebugPanel(userId, null, {
+      lastRestoreFunction: 'applySubscriptionResultForUser',
+      isPremium: active,
+      selectedPlan: plan,
+      subscriptionSource: source
+    }).catch((error) => {
+      console.warn('[Account Debug] Subscription apply debug refresh deferred:', error?.message);
+    });
+    return { isPremium: active, selectedPlan: plan, source };
+  }
+
   async function runManualAccountRestore() {
     const userId = activeUserIdRef.current;
     if (!userId) {
@@ -3283,6 +3366,33 @@ export default function App() {
 
   async function restoreSubscriptionForUser(userId, options = {}) {
     console.log('[Subscription] restoring for userId', userId);
+    if (revenueCatConfigured() && userId && !appleSessionRef.current) {
+      try {
+        const revenueCatSubscription = await withRestoreTimeout(
+          getRevenueCatSubscription(userId),
+          'RevenueCat entitlement restore',
+          5000
+        );
+        setRevenueCatDebug(revenueCatDebugConfig());
+        console.log('[Subscription] RevenueCat result', {
+          active: revenueCatSubscription.isPremium,
+          plan: revenueCatSubscription.selectedPlan,
+          status: revenueCatSubscription.subscriptionStatus,
+          productIdentifier: revenueCatSubscription.productIdentifier
+        });
+        console.log('[Subscription] final active state', {
+          userId,
+          active: revenueCatSubscription.isPremium,
+          plan: revenueCatSubscription.selectedPlan,
+          source: 'RevenueCat'
+        });
+        return applySubscriptionResultForUser(userId, revenueCatSubscription, 'RevenueCat');
+      } catch (error) {
+        console.warn('[Subscription] RevenueCat restore failed, using offline fallback:', error?.message || String(error));
+        setRevenueCatDebug(revenueCatDebugConfig());
+      }
+    }
+
     const cachedAccount = options.cachedAccount || await withRestoreTimeout(
       readAccountRestoreCache(userId),
       'Subscription cache restore',
@@ -3330,7 +3440,19 @@ export default function App() {
     if (activeUserIdRef.current === userId) {
       setIsPremium(finalActive);
       setSelectedFusionPlan(finalPlan);
+      setSubscriptionManagementUrl(null);
+      setSubscriptionRenewalDate(remoteSubscription?.renews_at || null);
     }
+    premiumAccess.setPremiumState({
+      isPremium: finalActive,
+      selectedPlan: finalPlan,
+      source,
+      status: finalActive ? 'active' : 'inactive',
+      error: '',
+      expirationDate: remoteSubscription?.renews_at || null,
+      managementURL: null,
+      productIdentifier: remoteSubscription?.external_subscription_id || null
+    });
     await withRestoreTimeout(multiSetCachedForUser(userId, [
       [PREMIUM_KEY, finalActive ? 'true' : 'false'],
       [PREMIUM_PLAN_KEY, finalPlan]
@@ -3725,6 +3847,9 @@ export default function App() {
         activeUserIdRef.current = null;
         clearAccountRestoreLoading('signed out');
         AsyncStorage.setItem(AUTH_KEY, 'false');
+        logOutRevenueCat().catch((error) => {
+          console.warn('[RevenueCat] logout deferred:', error?.message || String(error));
+        });
       }
     });
 
@@ -3733,6 +3858,20 @@ export default function App() {
       stopObserving();
     };
   }, [authBootstrapped]);
+
+  useEffect(() => {
+    initializeRevenueCat()
+      .then(() => {
+        setRevenueCatDebug(revenueCatDebugConfig());
+      })
+      .catch((error) => {
+        console.warn('[RevenueCat] initialization failed:', error?.message || String(error));
+        premiumAccess.setPremiumState({
+          status: 'error',
+          error: error?.message || 'RevenueCat initialization failed'
+        });
+      });
+  }, []);
 
   useEffect(() => {
     checkRecipeMcpStatus().then((status) => {
@@ -3901,6 +4040,10 @@ export default function App() {
     if (!loadingAccountData) {
       setSelectedFusionPlan('yearly');
     }
+    setSubscriptionManagementUrl(null);
+    setSubscriptionRenewalDate(null);
+    setRevenueCatDebug(revenueCatDebugConfig());
+    premiumAccess.resetPremiumState();
     setFridgePersonality('');
     setMealHistory([]);
     setFavoriteScanIds([]);
@@ -4345,38 +4488,37 @@ export default function App() {
     if (isProcessingPayment) {
       return;
     }
-    const incompleteField = Object.values(paymentForm).some((value) => !value.trim());
-    if (incompleteField) {
-      Alert.alert('Payment Details', 'Enter all payment details to continue.');
+    const userId = activeUserIdRef.current;
+    if (!userId) {
+      Alert.alert('Account Required', 'Please log in before subscribing to Fusion+.');
+      return;
+    }
+    if (!revenueCatConfigured()) {
+      Alert.alert('Subscriptions Unavailable', 'Fusion+ checkout is not available in this build.');
       return;
     }
 
     setIsProcessingPayment(true);
     try {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      setIsPremium(true);
-      await updateOfflineCache(Promise.all([
-        setCachedItem(PREMIUM_KEY, 'true'),
-        setCachedItem(PREMIUM_PLAN_KEY, selectedFusionPlan)
-      ]));
-      if (supabaseConfigured && isLoggedIn && !appleSessionRef.current) {
-        await withRestoreTimeout(
-          syncSubscriptionStatus({ isPremium: true, selectedPlan: selectedFusionPlan }),
-          'Subscription activation sync'
-        );
-        if (activeUserIdRef.current) {
-          await restoreSubscriptionForUser(activeUserIdRef.current, { fetchRemote: true });
-        }
-        setSyncState({ status: 'synced', message: 'Synced to your account' });
-      }
+      premiumAccess.setPremiumState({ status: 'loading', error: '' });
+      const result = selectedFusionPlan === 'monthly'
+        ? await purchaseMonthlySubscription(userId)
+        : await purchaseYearlySubscription(userId);
+      await applySubscriptionResultForUser(userId, result, 'RevenueCat');
+      setSyncState({ status: 'synced', message: 'Synced to your account' });
       hapticSuccess();
       showToast('Fusion+ Activated');
       setScreen('fusionSuccess');
     } catch (error) {
-      setIsPremium(true);
-      hapticSuccess();
-      showToast('Fusion+ Activated');
-      setScreen('fusionSuccess');
+      console.warn('[RevenueCat] purchase failed', error);
+      premiumAccess.setPremiumState({
+        status: 'error',
+        error: error?.message || 'Fusion+ checkout could not be completed.'
+      });
+      const userCancelled = Boolean(error?.userCancelled || error?.code === 'PURCHASE_CANCELLED');
+      if (!userCancelled) {
+        Alert.alert('Purchase Unavailable', error?.message || 'Fusion+ checkout could not be completed.');
+      }
     } finally {
       setIsProcessingPayment(false);
     }
@@ -4385,78 +4527,83 @@ export default function App() {
   async function restorePurchase() {
     const userId = activeUserIdRef.current;
     setSubscriptionLoading(true);
-    await updateOfflineCache(Promise.all([
-      setCachedItem(PREMIUM_KEY, 'true'),
-      setCachedItem(PREMIUM_PLAN_KEY, selectedFusionPlan || 'yearly')
-    ]));
     try {
-      if (userId && supabaseConfigured && isLoggedIn && !appleSessionRef.current) {
-        await withRestoreTimeout(
-          syncSubscriptionStatus({ isPremium: true, selectedPlan: selectedFusionPlan || 'yearly' }),
-          'Restore purchase sync'
-        );
-        await restoreSubscriptionForUser(userId, { fetchRemote: true });
-      } else if (userId) {
+      if (!userId) {
+        Alert.alert('Account Required', 'Please log in before restoring purchases.');
+        return;
+      }
+      if (!revenueCatConfigured()) {
         await restoreSubscriptionForUser(userId);
-        setSyncState({ status: 'offline', message: 'Saved on this device' });
+        Alert.alert('Restore Unavailable', 'Fusion+ restore is not available in this build.');
+        return;
+      }
+      premiumAccess.setPremiumState({ status: 'loading', error: '' });
+      const result = await restoreRevenueCatPurchases(userId);
+      await applySubscriptionResultForUser(userId, result, 'RevenueCat');
+      setSyncState({ status: 'synced', message: 'Synced to your account' });
+      if (result.isPremium) {
+        hapticSuccess();
+        showToast('Fusion+ Activated');
+        setScreen('fusionSuccess');
       } else {
-        setIsPremium(true);
-        setSyncState({ status: 'offline', message: 'Saved on this device' });
+        showToast('No active Fusion+ purchase found');
       }
     } catch (error) {
-      console.warn('[FoodFusion Sync] Restore purchase sync deferred:', error);
+      console.warn('[RevenueCat] restore failed', error);
+      premiumAccess.setPremiumState({
+        status: 'error',
+        error: error?.message || 'Restore purchases failed.'
+      });
       if (userId) {
-        await restoreSubscriptionForUser(userId).catch(() => {
-          setIsPremium(true);
-        });
+        await restoreSubscriptionForUser(userId).catch(() => {});
       }
       setSyncState({ status: 'error', message: 'Sync failed. Saved on this device.' });
     } finally {
       setSubscriptionLoading(false);
     }
-    hapticSuccess();
-    showToast('Fusion+ Activated');
-    setScreen('fusionSuccess');
   }
 
   async function resetPremium() {
     const userId = activeUserIdRef.current;
-    setIsPremium(false);
-    setSelectedMode('Basic');
-    setSelectedFusionPlan('yearly');
     await updateOfflineCache(Promise.all([
         removeCachedItem(PREMIUM_KEY),
         removeCachedItem(PREMIUM_PLAN_KEY)
       ]));
     try {
-      if (supabaseConfigured && isLoggedIn && !appleSessionRef.current) {
-        await withRestoreTimeout(
-          syncSubscriptionStatus({ isPremium: false, selectedPlan: 'yearly' }),
-          'Subscription cancellation sync'
-        );
-        if (userId) {
-          await restoreSubscriptionForUser(userId, { fetchRemote: true });
-        }
-        setSyncState({ status: 'synced', message: 'Synced to your account' });
-      } else if (userId) {
+      if (userId) {
         await restoreSubscriptionForUser(userId);
+        setSyncState({ status: 'synced', message: 'Synced to your account' });
+      } else {
+        setIsPremium(false);
+        setSelectedFusionPlan('yearly');
       }
     } catch (error) {
-      console.warn('[FoodFusion Sync] Subscription cancellation deferred:', error);
+      console.warn('[FoodFusion Sync] Subscription refresh deferred:', error);
       setSyncState({ status: 'error', message: 'Sync failed. Saved on this device.' });
     }
-    setScreen('home');
+    showToast('Subscription refreshed');
   }
 
   function confirmCancelSubscription() {
     Alert.alert(
-      'Cancel Fusion+?',
-      'Your account will return to Fusion Free.',
+      'Manage Fusion+',
+      'Subscriptions are managed through your App Store account.',
       [
-        { text: 'Keep Fusion+', style: 'cancel' },
-        { text: 'Cancel Subscription', style: 'destructive', onPress: resetPremium }
+        { text: 'Close', style: 'cancel' },
+        { text: 'Restore Purchases', onPress: restorePurchase },
+        { text: 'Open App Store', onPress: openSubscriptionManagement }
       ]
     );
+  }
+
+  async function openSubscriptionManagement() {
+    const url = subscriptionManagementUrl || 'https://apps.apple.com/account/subscriptions';
+    const canOpen = await Linking.canOpenURL(url);
+    if (canOpen) {
+      await Linking.openURL(url);
+    } else {
+      Alert.alert('Manage Subscription', 'Open your App Store account subscriptions to manage Fusion+.');
+    }
   }
 
   async function toggleFavorite(meal) {
@@ -5560,6 +5707,9 @@ export default function App() {
       if (supabaseConfigured) {
         await signOutOfSupabase();
       }
+      await logOutRevenueCat().catch((error) => {
+        console.warn('[RevenueCat] logout deferred:', error?.message || String(error));
+      });
       console.log('[FoodFusion Auth] AsyncStorage logout writes starting');
       await AsyncStorage.multiSet([[AUTH_KEY, 'false']]);
       await AsyncStorage.multiRemove([APPLE_AUTH_KEY, USER_PROFILE_KEY]);
@@ -6033,10 +6183,6 @@ export default function App() {
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ recipeSource: source })));
   }
 
-  function updatePaymentField(key, value) {
-    setPaymentForm((current) => ({ ...current, [key]: value }));
-  }
-
   async function setIngredientFreshness(ingredient, status) {
     const nextStatuses = { ...ingredientStatuses, [ingredient]: status };
     setIngredientStatuses(nextStatuses);
@@ -6159,7 +6305,7 @@ export default function App() {
   }
 
   if (screen === 'home') {
-    const homeFusionPlan = fusionPlans.find((item) => item.id === selectedFusionPlan) || fusionPlans[2];
+    const homeFusionPlan = fusionPlanById(selectedFusionPlan);
     const recipeTone = flowColors[selectedRecipeType];
 
     return (
@@ -6911,7 +7057,7 @@ export default function App() {
 
   if (screen === 'profile') {
     const mealsCooked = mealHistory.reduce((total, entry) => total + entry.meals.length, 0);
-    const plan = fusionPlans.find((item) => item.id === selectedFusionPlan) || fusionPlans[2];
+    const plan = fusionPlanById(selectedFusionPlan);
     return (
       <Screen>
         <AppHeader eyebrow="Profile" onSettings={() => setScreen('settings')} accent={flowColors.profile.accent} />
@@ -8128,7 +8274,7 @@ export default function App() {
   }
 
   if (screen === 'settings') {
-    const plan = fusionPlans.find((item) => item.id === selectedFusionPlan) || fusionPlans[2];
+    const plan = fusionPlanById(selectedFusionPlan);
     return (
       <Screen>
         <AppHeader eyebrow="Settings" onBack={() => setScreen('home')} accent={flowColors.profile.accent} />
@@ -8242,7 +8388,7 @@ export default function App() {
               <Text style={styles.settingsTitle}>Developer Mode</Text>
               <Text style={styles.settingsSubtitle}>Local app tools.</Text>
               <Button variant="ghost" onPress={resetDailyScan}>Reset scans</Button>
-              <Button variant="ghost" onPress={resetPremium}>Reset premium</Button>
+              <Button variant="ghost" onPress={resetPremium}>Refresh subscription</Button>
               <Button variant="ghost" onPress={testRecipeMcpConnection}>Test MCP connection</Button>
               <Button variant="ghost" onPress={() => setScreen('launchChecklist')}>QA Checklist</Button>
               <Button variant="ghost" onPress={clearAsyncStorageOnly}>Clear AsyncStorage</Button>
@@ -8475,6 +8621,32 @@ export default function App() {
             <Button variant="ghost" onPress={() => refreshAuthDebug()}>Refresh Auth Debug</Button>
           </View>
           <View style={styles.settingsCard}>
+            <Text style={styles.settingsTitle}>RevenueCat Debug</Text>
+            {[
+              ['RevenueCat configured', revenueCatDebug.configured ? 'true' : 'false'],
+              ['RevenueCat API key loaded', revenueCatDebug.apiKeyLoaded ? 'true' : 'false'],
+              ['RevenueCat app user ID', revenueCatDebug.appUserId || 'Not initialized'],
+              ['Premium entitlement', revenueCatDebug.entitlement],
+              ['Monthly product ID', revenueCatDebug.monthlyProductId || 'Missing'],
+              ['Yearly product ID', revenueCatDebug.yearlyProductId || 'Missing'],
+              ['Active subscription status', isPremium ? 'Fusion+ Active' : 'Fusion Free'],
+              ['Subscription source', accountDiagnostics.subscriptionSource || 'Not restored yet'],
+              ['Management URL', subscriptionManagementUrl || 'None'],
+              ['Renewal/expiration date', subscriptionRenewalDate || 'None']
+            ].map(([label, value]) => (
+              <View key={label} style={styles.launchRow}>
+                <Text style={styles.launchLabel}>{label}</Text>
+                <Text style={styles.launchValue}>{value}</Text>
+              </View>
+            ))}
+            <Button variant="ghost" onPress={() => {
+              setRevenueCatDebug(revenueCatDebugConfig());
+              if (activeUserIdRef.current) {
+                restoreSubscriptionForUser(activeUserIdRef.current);
+              }
+            }}>Refresh RevenueCat</Button>
+          </View>
+          <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Account Diagnostics</Text>
             {[
               ['Current logged-in email', userProfile?.email || 'Not signed in'],
@@ -8608,7 +8780,7 @@ export default function App() {
   }
 
   if (screen === 'fusionPayment') {
-    const plan = fusionPlans.find((item) => item.id === selectedFusionPlan) || fusionPlans[2];
+    const plan = fusionPlanById(selectedFusionPlan);
     return (
       <Screen>
         <AppHeader eyebrow="Fusion+ Payment" onBack={() => setScreen('paywall')} accent={flowColors.fusion.accent} />
@@ -8617,35 +8789,18 @@ export default function App() {
           <View style={[styles.subscriptionStatusCard, { borderColor: flowColors.fusion.tint }]}>
             <Text style={styles.paywallTitle}>{plan.name}</Text>
             <Text style={styles.paywallText}>{plan.price}{plan.cadence}</Text>
-            <Text style={styles.demoPaymentText}>Subscription checkout</Text>
-          </View>
-
-          <View style={styles.paymentFormCard}>
-            {[
-              ['cardNumber', 'Card number', '4242 4242 4242 4242'],
-              ['expiration', 'Expiration date', 'MM/YY'],
-              ['cvv', 'CVV', '123'],
-              ['name', 'Name on card', 'Alex Cook'],
-              ['zip', 'ZIP code', '85001']
-            ].map(([key, label, placeholder]) => (
-              <View key={key} style={styles.paymentField}>
-                <Text style={styles.totalLabel}>{label}</Text>
-                <TextInput
-                  value={paymentForm[key]}
-                  onChangeText={(value) => updatePaymentField(key, value)}
-                  placeholder={placeholder}
-                  placeholderTextColor={palette.muted}
-                  autoCapitalize={key === 'name' ? 'words' : 'none'}
-                  keyboardType={key === 'name' ? 'default' : 'number-pad'}
-                  style={styles.dislikeInput}
-                />
-              </View>
-            ))}
+            {plan.savings ? <Text style={styles.demoPaymentText}>{plan.savings} • Best Value • 2 months free</Text> : null}
+            <Text style={styles.settingsSubtitle}>Your subscription is completed securely through your App Store account.</Text>
           </View>
 
           <Button accent={flowColors.fusion.accent} onPress={startFusionPlus} disabled={isProcessingPayment}>
-            {isProcessingPayment ? 'Subscribing...' : 'Subscribe'}
+            {isProcessingPayment ? 'Opening checkout...' : `Subscribe ${plan.price}${plan.cadence}`}
           </Button>
+          {premiumAccess.status === 'loading' ? (
+            <Text style={styles.authMessage}>Opening secure App Store checkout...</Text>
+          ) : premiumAccess.error ? (
+            <Text style={styles.authError}>{premiumAccess.error}</Text>
+          ) : null}
           {isProcessingPayment ? <ActivityIndicator color={flowColors.fusion.accent} style={styles.paymentSpinner} /> : null}
           <Button variant="ghost" onPress={() => setScreen('paywall')}>Cancel</Button>
         </ScrollView>
@@ -8654,7 +8809,7 @@ export default function App() {
   }
 
   if (screen === 'fusionSuccess') {
-    const plan = fusionPlans.find((item) => item.id === selectedFusionPlan) || fusionPlans[2];
+    const plan = fusionPlanById(selectedFusionPlan);
     return (
       <Screen toast={toast}>
         <FlowProgress steps={['Plan', 'Payment', 'Active']} current={2} tone={flowColors.fusion} />
@@ -8669,7 +8824,7 @@ export default function App() {
   }
 
   if (screen === 'manageSubscription') {
-    const plan = fusionPlans.find((item) => item.id === selectedFusionPlan) || fusionPlans[2];
+    const plan = fusionPlanById(selectedFusionPlan);
     return (
       <Screen>
         <AppHeader eyebrow="Manage Subscription" onBack={() => setScreen('settings')} accent={flowColors.fusion.accent} />
@@ -8679,7 +8834,9 @@ export default function App() {
             <Text style={styles.settingsSubtitle}>
               {fusionStatusLoading ? 'Restoring your subscription for this account.' : `Current plan: ${plan.name} ${plan.price}${plan.cadence}`}
             </Text>
-            <Text style={styles.settingsSubtitle}>Renewal date: Next billing cycle</Text>
+            <Text style={styles.settingsSubtitle}>
+              {subscriptionRenewalDate ? `Renews or expires: ${new Date(subscriptionRenewalDate).toLocaleDateString()}` : 'Renewal details update after App Store confirmation.'}
+            </Text>
           </View>
           <View style={styles.pricingRow}>
             {fusionPlans.map((item) => (
@@ -8697,9 +8854,15 @@ export default function App() {
                     <Text style={styles.bestValueText}>{item.badge}</Text>
                   </View>
                 ) : null}
+                {item.savings ? (
+                  <View style={[styles.bestValueBadge, styles.savingsBadge]}>
+                    <Text style={styles.bestValueText}>{item.savings}</Text>
+                  </View>
+                ) : null}
                 <Text style={styles.planName}>{item.name}</Text>
                 <Text style={styles.planPrice}>{item.price}</Text>
                 <Text style={styles.planCadence}>{item.cadence}</Text>
+                <Text style={styles.planDetail}>{item.detail}</Text>
               </Pressable>
             ))}
           </View>
@@ -8720,11 +8883,20 @@ export default function App() {
         onSelectPlan={chooseFusionPlan}
         onManage={() => setScreen('manageSubscription')}
         selectedPlan={selectedFusionPlan}
+        premiumAccess={premiumAccess}
       />
     );
   }
 
   return null;
+}
+
+export default function App() {
+  return (
+    <PremiumProvider>
+      <FoodFusionApp />
+    </PremiumProvider>
+  );
 }
 
 const styles = StyleSheet.create({
@@ -12162,6 +12334,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 9,
     paddingVertical: 5
   },
+  savingsBadge: {
+    backgroundColor: flowColors.fusion.accent,
+    marginBottom: 8
+  },
   bestValueText: {
     color: palette.black,
     fontSize: 10,
@@ -12183,6 +12359,13 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '800',
     marginTop: 4
+  },
+  planDetail: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '800',
+    lineHeight: 15,
+    marginTop: 8
   },
   paymentSpinner: {
     marginTop: 12

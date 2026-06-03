@@ -296,6 +296,8 @@ PODS:
   - libwebp/sharpyuv (1.5.0)
   - libwebp/webp (1.5.0):
     - libwebp/sharpyuv
+  - PurchasesHybridCommon (18.8.0):
+    - RevenueCat (= 5.74.0)
   - RCT-Folly (2024.11.18.00):
     - boost
     - DoubleConversion
@@ -2744,6 +2746,7 @@ PODS:
     - React-perflogger (= 0.85.3)
     - React-utils (= 0.85.3)
     - SocketRocket
+  - RevenueCat (5.74.0)
   - RNCAsyncStorage (2.2.0):
     - boost
     - DoubleConversion
@@ -2772,6 +2775,9 @@ PODS:
     - ReactCommon/turbomodule/core
     - SocketRocket
     - Yoga
+  - RNPurchases (10.2.0):
+    - PurchasesHybridCommon (= 18.8.0)
+    - React-Core
   - SDWebImage/Core (5.21.7)
   - SDWebImageWebPCoder (0.15.0):
     - libwebp (~> 1.0)
@@ -2882,12 +2888,15 @@ DEPENDENCIES:
   - ReactCodegen (from `build/generated/ios/ReactCodegen`)
   - ReactCommon/turbomodule/core (from `../node_modules/react-native/ReactCommon`)
   - "RNCAsyncStorage (from `../node_modules/@react-native-async-storage/async-storage`)"
+  - RNPurchases (from `../node_modules/react-native-purchases`)
   - SocketRocket (~> 0.7.1)
   - Yoga (from `../node_modules/react-native/ReactCommon/yoga`)
 
 SPEC REPOS:
   trunk:
     - libwebp
+    - PurchasesHybridCommon
+    - RevenueCat
     - SDWebImage
     - SDWebImageWebPCoder
     - SocketRocket
@@ -3096,6 +3105,8 @@ EXTERNAL SOURCES:
     :path: "../node_modules/react-native/ReactCommon"
   RNCAsyncStorage:
     :path: "../node_modules/@react-native-async-storage/async-storage"
+  RNPurchases:
+    :path: "../node_modules/react-native-purchases"
   Yoga:
     :path: "../node_modules/react-native/ReactCommon/yoga"
 
@@ -3131,6 +3142,7 @@ SPEC CHECKSUMS:
   glog: e56ede4028c4b7418e6b1195a36b1656bb35e225
   hermes-engine: ad0751ddecafcb08bde1230bbbf14b72f4ce5c7b
   libwebp: 02b23773aedb6ff1fd38cec7a77b81414c6842a8
+  PurchasesHybridCommon: e723f7c9b109be51f7ec6c85a104791369f1b562
   RCT-Folly: 36c4f904fb6cd0219dcb76b94e9502d2a72fab0b
   RCTDeprecation: 225e022b85a206cf0883a909c4a114159783363c
   RCTRequired: 827a95c181af0886a11e21bc66c084088cf87839
@@ -3201,7 +3213,9 @@ SPEC CHECKSUMS:
   ReactAppDependencyProvider: 25c9c516839be2c5e3d3344f95dc7da5f7e63fc2
   ReactCodegen: f186fd170f39344e1c459b2ed8143092b318366f
   ReactCommon: 4e44c3353d307b2d41dec7ef7a9faa76b1d82d51
+  RevenueCat: efcd02bf9b14ffce229e57dc6863a2513136b9ca
   RNCAsyncStorage: 29f0230e1a25f36c20b05f65e2eb8958d6526e82
+  RNPurchases: 814d23250d91856382f2d1d7c5e255b3d6b4b8ef
   SDWebImage: e9fc87c1aab89a8ab1bbd74eba378c6f53be8abf
   SDWebImageWebPCoder: 0e06e365080397465cc73a7a9b472d8a3bd0f377
   SocketRocket: d4aabe649be1e368d1318fdf28a022d714d65748

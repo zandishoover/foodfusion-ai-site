@@ -357,16 +357,25 @@ export async function saveOpenedRecipe(meal) {
   if (savedError) throw savedError;
 }
 
-export async function syncSubscriptionStatus({ isPremium = false, selectedPlan = 'yearly' } = {}) {
+export async function syncSubscriptionStatus({
+  isPremium = false,
+  selectedPlan = 'yearly',
+  provider = 'mvp_local',
+  status,
+  renewsAt = null,
+  externalSubscriptionId = null
+} = {}) {
   const userId = await authenticatedUserId();
   if (!userId) return;
   const { error } = await supabase.from('subscriptions').upsert({
     user_id: userId,
     plan: isPremium ? selectedPlan : 'free',
-    status: isPremium ? 'active' : 'inactive',
-    provider: 'mvp_local',
+    status: status || (isPremium ? 'active' : 'inactive'),
+    provider,
     started_at: isPremium ? new Date().toISOString() : null,
-    cancelled_at: isPremium ? null : new Date().toISOString()
+    renews_at: renewsAt,
+    cancelled_at: isPremium ? null : new Date().toISOString(),
+    external_subscription_id: externalSubscriptionId
   });
   if (error) throw error;
 }
