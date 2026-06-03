@@ -20,11 +20,10 @@ const spoonacularApiKey = process.env.SPOONACULAR_API_KEY?.trim();
 const edamamAppId = process.env.EDAMAM_APP_ID?.trim();
 const edamamAppKey = process.env.EDAMAM_APP_KEY?.trim();
 const usdaApiKey = process.env.USDA_API_KEY?.trim();
-const publicSupabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || '';
+const publicSupabaseUrl = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '';
 const publicSupabaseKey =
-  process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
-  process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ||
   process.env.SUPABASE_ANON_KEY ||
+  process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
   '';
 
 if (process.env.EXPO_PUBLIC_OPENAI_API_KEY) {
@@ -1033,6 +1032,10 @@ function escapeHtml(value = '') {
     .replace(/'/g, '&#39;');
 }
 
+function inlineJson(value = '') {
+  return JSON.stringify(`${value}`).replace(/</g, '\\u003c');
+}
+
 function sendHtml(response, statusCode, html) {
   response.writeHead(statusCode, {
     'Content-Type': 'text/html; charset=utf-8',
@@ -1242,8 +1245,11 @@ function confirmationPage() {
 }
 
 function resetPasswordPage() {
-  const supabaseUrl = escapeHtml(publicSupabaseUrl);
-  const supabaseKey = escapeHtml(publicSupabaseKey);
+  console.log('[Auth Reset] supabase url present', Boolean(publicSupabaseUrl));
+  console.log('[Auth Reset] supabase anon key present', Boolean(publicSupabaseKey));
+  console.log('[Auth Reset] reset page served');
+  const supabaseUrl = inlineJson(publicSupabaseUrl);
+  const supabaseKey = inlineJson(publicSupabaseKey);
   return authPageShell({
     title: 'Reset Password',
     subtitle: 'Enter a new password for your FoodFusion AI account.',
@@ -1272,8 +1278,8 @@ function resetPasswordPage() {
     script: `
       <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
       <script>
-        const SUPABASE_URL = "${supabaseUrl}";
-        const SUPABASE_KEY = "${supabaseKey}";
+        const SUPABASE_URL = ${supabaseUrl};
+        const SUPABASE_KEY = ${supabaseKey};
         const form = document.getElementById('reset-form');
         const message = document.getElementById('message');
         const button = document.getElementById('submit-button');
@@ -1503,6 +1509,14 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === 'GET' && pathname === '/reset-password') {
       sendHtml(response, 200, resetPasswordPage());
+      return;
+    }
+
+    if (request.method === 'GET' && pathname === '/reset-debug') {
+      send(response, 200, {
+        supabaseUrlPresent: Boolean(publicSupabaseUrl),
+        supabaseAnonKeyPresent: Boolean(publicSupabaseKey)
+      });
       return;
     }
 
