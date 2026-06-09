@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -25,6 +25,14 @@ const publicSupabaseKey =
   process.env.SUPABASE_ANON_KEY ||
   process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
   '';
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() || '';
+const resendApiKey = process.env.RESEND_API_KEY?.trim() || '';
+const resetCodeFromEmail =
+  process.env.RESET_CODE_FROM_EMAIL ||
+  process.env.RESEND_FROM_EMAIL ||
+  'FoodFusion AI <onboarding@resend.dev>';
+const resetCodeTtlMs = 10 * 60 * 1000;
+const resetCodeMaxAttempts = 5;
 
 if (process.env.EXPO_PUBLIC_OPENAI_API_KEY) {
   throw new Error('Remove EXPO_PUBLIC_OPENAI_API_KEY. OpenAI credentials must never be exposed to the mobile app.');
@@ -36,6 +44,7 @@ if (isNetworkExposed && !scanAccessToken) {
 
 let clientPromise = null;
 let cachedTools = [];
+const passwordResetCodes = new Map();
 
 function hasValidBridgeToken(request) {
   if (!scanAccessToken) {
@@ -467,6 +476,7 @@ function scaleMacroBase({ name, normalizedName, amount, confidence, portionConfi
     calories: roundCalories(base.calories * multiplier),
     protein: roundGram(base.protein * multiplier),
     carbs: roundGram(base.carbs * multiplier),
+    sugar: roundGram(Number.isFinite(Number(base.sugar)) ? base.sugar * multiplier : (base.carbs * multiplier) * 0.22),
     fat: roundGram(base.fat * multiplier),
     source,
     confidence: rowConfidence,
@@ -490,6 +500,7 @@ function usdaFoodToBase(food, source) {
     calories: nutrientValue(food, 'energy'),
     protein: nutrientValue(food, 'protein'),
     carbs: nutrientValue(food, 'carbohydrate'),
+    sugar: nutrientValue(food, 'sugars'),
     fat: nutrientValue(food, 'total lipid'),
     description: `${food.description || food.lowercaseDescription || ''}`.toLowerCase(),
     source,
@@ -614,7 +625,7 @@ async function macroRowForIngredient(ingredient = {}) {
     amount,
     confidence,
     portionConfirmed,
-    base: { amount: '1 serving', calories: 120, protein: 4, carbs: 18, fat: 4 },
+    base: { amount: '1 serving', calories: 120, protein: 4, carbs: 18, sugar: 4, fat: 4 },
     source: 'ai_estimate'
   });
 }
@@ -627,9 +638,10 @@ async function macrosForIngredients(body = {}) {
       calories: sum.calories + item.calories,
       protein: sum.protein + item.protein,
       carbs: sum.carbs + item.carbs,
+      sugar: sum.sugar + item.sugar,
       fat: sum.fat + item.fat
     }),
-    { calories: 0, protein: 0, carbs: 0, fat: 0 }
+    { calories: 0, protein: 0, carbs: 0, sugar: 0, fat: 0 }
   );
   const confidenceRank = { Low: 1, Medium: 2, High: 3 };
   const confidence = items.reduce((lowest, item) => (
@@ -650,6 +662,7 @@ async function macrosForIngredients(body = {}) {
       calories: roundCalories(totals.calories),
       protein: roundGram(totals.protein),
       carbs: roundGram(totals.carbs),
+      sugar: roundGram(totals.sugar),
       fat: roundGram(totals.fat)
     }
   };
@@ -789,6 +802,7 @@ function normalizeRecipe(recipe, fallbackIngredients = []) {
       calories: recipe.calories || recipe.macros?.calories || 480,
       protein: recipe.protein || recipe.macros?.protein || 28,
       carbs: recipe.carbs || recipe.macros?.carbs || 48,
+      sugar: recipe.sugar || recipe.sugars || recipe.macros?.sugar || recipe.macros?.sugars || Math.round((recipe.carbs || recipe.macros?.carbs || 48) * 0.22),
       fat: recipe.fat || recipe.macros?.fat || 16
     },
     missingIngredients: recipe.missingIngredients || [],
@@ -1042,6 +1056,145 @@ function sendHtml(response, statusCode, html) {
     'Cache-Control': 'no-store'
   });
   response.end(html);
+}
+
+const strongPasswordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{10,}$/;
+
+function normalizeEmail(email = '') {
+  return `${email}`.trim().toLowerCase();
+}
+
+function hashResetValue(value = '') {
+  return createHash('sha256').update(`${value}`).digest('hex');
+}
+
+function createResetCodeRecord(email) {
+  const code = `${randomInt(0, 1000000)}`.padStart(6, '0');
+  const resetToken = randomBytes(24).toString('hex');
+  const now = Date.now();
+  return {
+    email,
+    code,
+    codeHash: hashResetValue(`${email}:${code}`),
+    resetTokenHash: hashResetValue(`${email}:${resetToken}`),
+    resetToken,
+    expiresAt: now + resetCodeTtlMs,
+    attempts: 0,
+    verified: false,
+    used: false
+  };
+}
+
+function pruneResetCodes() {
+  const now = Date.now();
+  for (const [email, record] of passwordResetCodes.entries()) {
+    if (!record || record.used || record.expiresAt <= now) {
+      passwordResetCodes.delete(email);
+    }
+  }
+}
+
+function getValidResetCodeRecord(email) {
+  pruneResetCodes();
+  const record = passwordResetCodes.get(email);
+  if (!record || record.used || record.expiresAt <= Date.now() || record.attempts >= resetCodeMaxAttempts) {
+    return null;
+  }
+  return record;
+}
+
+function resetCodeMatches(record, email, code) {
+  const expected = Buffer.from(record.codeHash);
+  const actual = Buffer.from(hashResetValue(`${email}:${code}`));
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+function resetTokenMatches(record, email, resetToken) {
+  const expected = Buffer.from(record.resetTokenHash);
+  const actual = Buffer.from(hashResetValue(`${email}:${resetToken}`));
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+async function sendResetCodeEmail(email, code) {
+  if (!resendApiKey) {
+    throw new Error('Reset code email provider is not configured.');
+  }
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${resendApiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      from: resetCodeFromEmail,
+      to: email,
+      subject: 'Your FoodFusion AI reset code',
+      text: `Your FoodFusion AI password reset code is ${code}. It expires in 10 minutes.`,
+      html: `
+        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#070b12;color:#f7fbff;padding:28px;border-radius:18px;">
+          <h1 style="margin:0 0 12px;">FoodFusion AI</h1>
+          <p style="color:#9fb0c7;">Use this code to reset your password. It expires in 10 minutes.</p>
+          <div style="font-size:32px;font-weight:900;letter-spacing:8px;margin:22px 0;color:#6ca8ff;">${escapeHtml(code)}</div>
+          <p style="color:#9fb0c7;">If you did not request this code, you can ignore this email.</p>
+        </div>
+      `
+    })
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Reset code email failed with status ${response.status}: ${text.slice(0, 160)}`);
+  }
+}
+
+async function supabaseAdminFetch(pathname, options = {}) {
+  const baseUrl = publicSupabaseUrl.replace(/\/+$/, '');
+  if (!baseUrl || !supabaseServiceRoleKey) {
+    throw new Error('Supabase admin password reset is not configured.');
+  }
+  const response = await fetch(`${baseUrl}${pathname}`, {
+    ...options,
+    headers: {
+      apikey: supabaseServiceRoleKey,
+      Authorization: `Bearer ${supabaseServiceRoleKey}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {})
+    }
+  });
+  const text = await response.text();
+  let payload = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { message: text };
+  }
+  if (!response.ok) {
+    throw new Error(payload?.msg || payload?.message || `Supabase admin request failed with status ${response.status}`);
+  }
+  return payload;
+}
+
+async function findSupabaseUserIdByEmail(email) {
+  const payload = await supabaseAdminFetch(`/auth/v1/admin/users?email=${encodeURIComponent(email)}`, {
+    method: 'GET'
+  });
+  const users = Array.isArray(payload?.users) ? payload.users : [];
+  const match = users.find((user) => normalizeEmail(user?.email) === email) || users[0];
+  return match?.id || '';
+}
+
+async function updateSupabasePasswordForEmail(email, password) {
+  const userId = await findSupabaseUserIdByEmail(email);
+  if (!userId) {
+    throw new Error('Password reset could not be completed.');
+  }
+  await supabaseAdminFetch(`/auth/v1/admin/users/${encodeURIComponent(userId)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ password })
+  });
+}
+
+function resetCodeGenericMessage() {
+  return 'If an account exists, a reset code has been sent.';
 }
 
 function authPageShell({ title, subtitle, body, script = '' }) {
@@ -1487,6 +1640,7 @@ function nutritionFor(recipe = {}) {
     calories: recipe.macros?.calories || recipe.calories || 480,
     protein: recipe.macros?.protein || recipe.protein || 28,
     carbs: recipe.macros?.carbs || recipe.carbs || 48,
+    sugar: recipe.macros?.sugar || recipe.macros?.sugars || recipe.sugar || recipe.sugars || Math.round((recipe.macros?.carbs || recipe.carbs || 48) * 0.22),
     fat: recipe.macros?.fat || recipe.fat || 16,
     note: 'Estimated by local Recipe MCP bridge.'
   };
@@ -1515,8 +1669,92 @@ const server = http.createServer(async (request, response) => {
     if (request.method === 'GET' && pathname === '/reset-debug') {
       send(response, 200, {
         supabaseUrlPresent: Boolean(publicSupabaseUrl),
-        supabaseAnonKeyPresent: Boolean(publicSupabaseKey)
+        supabaseAnonKeyPresent: Boolean(publicSupabaseKey),
+        supabaseServiceRolePresent: Boolean(supabaseServiceRoleKey),
+        resetCodeEmailProviderPresent: Boolean(resendApiKey),
+        resetPasswordRouteAvailable: true,
+        resetCodeRoutesAvailable: true,
+        activeResetCodeCount: passwordResetCodes.size
       });
+      return;
+    }
+
+    if (request.method === 'POST' && pathname === '/auth/send-reset-code') {
+      const body = await readBody(request);
+      const email = normalizeEmail(body.email);
+      console.log('[Auth Reset] send reset code requested', { hasEmail: Boolean(email) });
+      if (!email) {
+        send(response, 400, { error: 'Enter the email for your FoodFusion account.' });
+        return;
+      }
+      const record = createResetCodeRecord(email);
+      try {
+        await sendResetCodeEmail(email, record.code);
+        passwordResetCodes.set(email, { ...record, code: undefined });
+        console.log('[Auth Reset] reset code sent', { email });
+        send(response, 200, { ok: true, message: resetCodeGenericMessage(), expiresInMinutes: 10 });
+      } catch (error) {
+        console.warn('[Auth Reset] reset code send failed', error?.message || String(error));
+        send(response, 503, { error: 'Password reset code is temporarily unavailable. Please use the email reset link.' });
+      }
+      return;
+    }
+
+    if (request.method === 'POST' && pathname === '/auth/verify-reset-code') {
+      const body = await readBody(request);
+      const email = normalizeEmail(body.email);
+      const code = `${body.code || ''}`.replace(/\D/g, '').slice(0, 6);
+      const record = getValidResetCodeRecord(email);
+      console.log('[Auth Reset] verify reset code requested', { hasEmail: Boolean(email), codeLength: code.length });
+      if (!email || code.length !== 6 || !record) {
+        send(response, 400, { error: 'Invalid or expired reset code.' });
+        return;
+      }
+      record.attempts += 1;
+      if (!resetCodeMatches(record, email, code)) {
+        console.warn('[Auth Reset] verify reset code failed', { email, attempts: record.attempts });
+        send(response, 400, { error: 'Invalid or expired reset code.' });
+        return;
+      }
+      record.verified = true;
+      console.log('[Auth Reset] verify reset code success', { email });
+      send(response, 200, { ok: true, resetToken: record.resetToken, message: 'Reset code verified.' });
+      return;
+    }
+
+    if (request.method === 'POST' && pathname === '/auth/update-password-with-code') {
+      const body = await readBody(request);
+      const email = normalizeEmail(body.email);
+      const code = `${body.code || ''}`.replace(/\D/g, '').slice(0, 6);
+      const resetToken = `${body.resetToken || ''}`;
+      const password = `${body.password || ''}`;
+      const record = getValidResetCodeRecord(email);
+      console.log('[Auth Reset] update password with code requested', { hasEmail: Boolean(email), codeLength: code.length });
+      if (!strongPasswordRegex.test(password)) {
+        send(response, 400, { error: 'Password must contain at least 10 characters, including uppercase, lowercase, number, and special character.' });
+        return;
+      }
+      if (
+        !email ||
+        code.length !== 6 ||
+        !record ||
+        !record.verified ||
+        !resetCodeMatches(record, email, code) ||
+        !resetTokenMatches(record, email, resetToken)
+      ) {
+        send(response, 400, { error: 'Invalid or expired reset code.' });
+        return;
+      }
+      try {
+        await updateSupabasePasswordForEmail(email, password);
+        record.used = true;
+        passwordResetCodes.delete(email);
+        console.log('[Auth Reset] password update success', { email });
+        send(response, 200, { ok: true, message: 'Password updated successfully.' });
+      } catch (error) {
+        console.warn('[Auth Reset] password update fail', error?.message || String(error));
+        send(response, 503, { error: 'Password reset is temporarily unavailable. Please use the email reset link.' });
+      }
       return;
     }
 
@@ -1529,6 +1767,12 @@ const server = http.createServer(async (request, response) => {
         scan: {
           openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
           authorization: scanAccessToken ? 'token-required' : 'local-only'
+        },
+        authReset: {
+          resetPasswordRouteAvailable: true,
+          resetCodeRoutesAvailable: true,
+          resetCodeEmailProviderConfigured: Boolean(resendApiKey),
+          supabaseAdminConfigured: Boolean(supabaseServiceRoleKey)
         },
         recipeMcp
       });

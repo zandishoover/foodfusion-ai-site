@@ -11,6 +11,10 @@ const supabaseKey =
   process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
 const authRedirectUrl = process.env.EXPO_PUBLIC_SUPABASE_REDIRECT_URL;
 const hostedAuthBaseUrl = 'https://foodfusion-ai-site.onrender.com';
+const hostedResetApiBaseUrl =
+  process.env.EXPO_PUBLIC_RECIPE_MCP_ENDPOINT ||
+  process.env.EXPO_PUBLIC_FOODFUSION_AUTH_ENDPOINT ||
+  hostedAuthBaseUrl;
 const authConfirmationRedirectUrl =
   process.env.EXPO_PUBLIC_SUPABASE_CONFIRM_REDIRECT_URL ||
   `${hostedAuthBaseUrl}/confirm`;
@@ -60,6 +64,39 @@ export const supabase = supabaseConfigured
   : null;
 
 let sessionRequest = null;
+const SIGN_IN_TIMEOUT_MS = 15000;
+const RESET_CODE_TIMEOUT_MS = 15000;
+
+function withTimeout(promise, timeoutMs, message) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timeoutId);
+  });
+}
+
+function resetApiUrl(pathname) {
+  return `${hostedResetApiBaseUrl}`.replace(/\/+$/, '') + pathname;
+}
+
+async function postResetApi(pathname, payload) {
+  const url = resetApiUrl(pathname);
+  const response = await withTimeout(fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  }), RESET_CODE_TIMEOUT_MS, 'Password reset request timed out. Try switching Wi-Fi/5G and try again.');
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || 'Password reset is temporarily unavailable.');
+  }
+  return data;
+}
 
 function userMetadataName(user) {
   return user?.user_metadata?.full_name || user?.user_metadata?.name || '';
@@ -227,7 +264,21 @@ export async function signInWithSupabase(email, password) {
     console.warn('[Supabase Auth] signInWithPassword unavailable:', error.message);
     throw error;
   }
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  let result;
+  try {
+    result = await withTimeout(
+      supabase.auth.signInWithPassword({ email, password }),
+      SIGN_IN_TIMEOUT_MS,
+      'Login timed out. Try switching Wi-Fi/5G and try again.'
+    );
+  } catch (error) {
+    console.warn('[Supabase Auth] signInWithPassword fail:', {
+      message: error?.message || String(error),
+      email
+    });
+    throw error;
+  }
+  const { data, error } = result;
   console.log('[Supabase Auth] signInWithPassword response:', {
     hasUser: Boolean(data?.user),
     hasSession: Boolean(data?.session),
@@ -236,8 +287,19 @@ export async function signInWithSupabase(email, password) {
     error: error ? { message: error.message, status: error.status, name: error.name } : null
   });
   if (error) {
+    console.warn('[Supabase Auth] signInWithPassword fail:', {
+      message: error.message,
+      status: error.status,
+      name: error.name,
+      email
+    });
     throw error;
   }
+  console.log('[Supabase Auth] signInWithPassword success:', {
+    userId: data?.user?.id || null,
+    email: data?.user?.email || null,
+    sessionExists: Boolean(data?.session)
+  });
   console.log('[Supabase Auth] session creation:', {
     sessionExists: Boolean(data.session),
     expiresAt: data.session?.expires_at || null
@@ -296,6 +358,32 @@ export async function resetSupabasePassword(email) {
     throw error;
   }
   console.log('[Auth] reset email sent', { email, redirectTo: passwordResetRedirectUrl });
+}
+
+export async function sendPasswordResetCode(email) {
+  console.log('[Auth] reset code send requested', { endpoint: resetApiUrl('/auth/send-reset-code') });
+  const result = await postResetApi('/auth/send-reset-code', { email });
+  console.log('[Auth] reset code sent', { status: result?.ok ? 'sent' : 'unknown' });
+  return result;
+}
+
+export async function verifyPasswordResetCode(email, code) {
+  console.log('[Auth] reset code verify requested', { endpoint: resetApiUrl('/auth/verify-reset-code') });
+  const result = await postResetApi('/auth/verify-reset-code', { email, code });
+  console.log('[Auth] reset code verify success');
+  return result;
+}
+
+export async function updatePasswordWithResetCode({ email, code, resetToken, password }) {
+  console.log('[Auth] reset code password update requested', { endpoint: resetApiUrl('/auth/update-password-with-code') });
+  const result = await postResetApi('/auth/update-password-with-code', {
+    email,
+    code,
+    resetToken,
+    password
+  });
+  console.log('[Auth] reset code password update success');
+  return result;
 }
 
 export async function resendSupabaseConfirmation(email) {

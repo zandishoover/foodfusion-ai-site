@@ -26,6 +26,16 @@ function roundGram(value) {
   return Math.round(Number(value || 0));
 }
 
+function macroSugarValue(macros = {}) {
+  if (Number.isFinite(Number(macros.sugar))) {
+    return Number(macros.sugar);
+  }
+  if (Number.isFinite(Number(macros.sugars))) {
+    return Number(macros.sugars);
+  }
+  return Math.max(0, Math.round(Number(macros.carbs || 0) * 0.22));
+}
+
 function normalizeMacroPayload(payload = {}) {
   const items = Array.isArray(payload.items) ? payload.items : [];
   const totals = payload.totals || items.reduce(
@@ -33,9 +43,10 @@ function normalizeMacroPayload(payload = {}) {
       calories: sum.calories + Number(item.calories || 0),
       protein: sum.protein + Number(item.protein || 0),
       carbs: sum.carbs + Number(item.carbs || 0),
+      sugar: sum.sugar + macroSugarValue(item),
       fat: sum.fat + Number(item.fat || 0)
     }),
-    { calories: 0, protein: 0, carbs: 0, fat: 0 }
+    { calories: 0, protein: 0, carbs: 0, sugar: 0, fat: 0 }
   );
 
   return {
@@ -46,12 +57,14 @@ function normalizeMacroPayload(payload = {}) {
       calories: roundCalories(item.calories),
       protein: roundGram(item.protein),
       carbs: roundGram(item.carbs),
+      sugar: roundGram(macroSugarValue(item)),
       fat: roundGram(item.fat)
     })),
     totals: {
       calories: roundCalories(totals.calories),
       protein: roundGram(totals.protein),
       carbs: roundGram(totals.carbs),
+      sugar: roundGram(macroSugarValue(totals)),
       fat: roundGram(totals.fat)
     }
   };

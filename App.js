@@ -46,11 +46,14 @@ import {
   observeSupabaseAuth,
   resendSupabaseConfirmation,
   resetSupabasePassword,
+  sendPasswordResetCode,
   signInWithSupabase,
   signOutOfSupabase,
   signUpWithSupabase,
   supabaseAuthConfig,
-  supabaseConfigured
+  supabaseConfigured,
+  updatePasswordWithResetCode,
+  verifyPasswordResetCode
 } from './services/supabaseAuth';
 import {
   clearRemoteScanHistory,
@@ -124,6 +127,14 @@ const EQUIPMENT_PROFILE_KEY = 'foodfusion:equipmentProfile';
 const RECIPE_RATINGS_KEY = 'foodfusion:recipeRatings';
 const HOUSEHOLD_KEY = 'foodfusion:household';
 const BUDGET_GOALS_KEY = 'foodfusion:budgetGoals';
+const WEEK_START_KEY = 'foodfusion:macroWeekStart';
+const DEFAULT_MACRO_GOALS = {
+  calorieTarget: '2200',
+  proteinGoal: '160',
+  carbsGoal: '260',
+  sugarGoal: '50',
+  fatGoal: '75'
+};
 const MACRO_LOCK_KEY = 'foodfusion:macroLock';
 const SOCIAL_KEY = 'foodfusion:socialPosts';
 const NOTIFICATION_PREFERENCES_KEY = 'foodfusion:notificationPreferences';
@@ -134,6 +145,8 @@ const RECENT_SEARCHES_KEY = 'foodfusion:recentSearches';
 const QA_CHECKLIST_KEY = 'foodfusion:qaChecklist';
 const BETA_FEEDBACK_EMAIL = 'zandis.hoover04@gmail.com';
 const ACCOUNT_RESTORE_TIMEOUT_MS = 4500;
+const STARTUP_NETWORK_HINT_MS = 8000;
+const LOGIN_TIMEOUT_MESSAGE = 'Login timed out. Try switching Wi-Fi/5G and try again.';
 const USER_SCOPED_CACHE_KEYS = new Set([
   SCAN_KEY,
   PREMIUM_KEY,
@@ -161,6 +174,7 @@ const USER_SCOPED_CACHE_KEYS = new Set([
   RECIPE_RATINGS_KEY,
   HOUSEHOLD_KEY,
   BUDGET_GOALS_KEY,
+  WEEK_START_KEY,
   MACRO_LOCK_KEY,
   SOCIAL_KEY,
   NOTIFICATION_PREFERENCES_KEY,
@@ -197,6 +211,9 @@ function withRestoreTimeout(promise, label, ms = ACCOUNT_RESTORE_TIMEOUT_MS) {
 function readableAuthError(error) {
   const message = error?.message || `${error || ''}` || 'Authentication failed.';
   const lower = message.toLowerCase();
+  if (lower.includes('login timed out') || lower.includes('sign in timed out') || lower.includes('timed out')) {
+    return LOGIN_TIMEOUT_MESSAGE;
+  }
   if (lower.includes('invalid login') || lower.includes('invalid credentials')) {
     return 'Invalid credentials. Check your email and password.';
   }
@@ -213,6 +230,29 @@ function readableAuthError(error) {
     return `Supabase auth failure: ${message}`;
   }
   return message;
+}
+
+function readablePasswordResetError(error) {
+  const message = error?.message || `${error || ''}` || 'Password reset failed.';
+  const lower = message.toLowerCase();
+  if (lower.includes('timed out')) {
+    return 'Password reset timed out. Try switching Wi-Fi/5G and try again.';
+  }
+  if (lower.includes('network') || lower.includes('fetch') || lower.includes('request failed')) {
+    return `Network failure during password reset: ${message}`;
+  }
+  return message;
+}
+
+function detectableNetworkLabel() {
+  const connection =
+    globalThis?.navigator?.connection ||
+    globalThis?.navigator?.mozConnection ||
+    globalThis?.navigator?.webkitConnection;
+  if (connection?.effectiveType || connection?.type) {
+    return [connection.type, connection.effectiveType].filter(Boolean).join(' / ');
+  }
+  return `Not detectable on ${Platform.OS}`;
 }
 
 function isReviewDemoProfile(profile) {
@@ -397,9 +437,9 @@ const qaChecklistItems = [
   'Scan works',
   'See Meals works',
   'Favorites save',
-  'Shopping works',
-  'Checkout works',
-  'Orders save',
+  'Grocery list works',
+  'Macro tracker works',
+  'Email grocery list works',
   'Feedback works',
   'Delete account works',
   'Logout works'
@@ -424,7 +464,7 @@ const voiceCommands = ['next step', 'repeat', 'start timer'];
 const onboardingScreens = [
   { title: 'Scan ingredients', text: 'Take a fridge or pantry photo and review what is detected.' },
   { title: 'Get AI recipes', text: 'Turn available ingredients into meals, smoothies, shakes, and drinks.' },
-  { title: "Shop what's missing", text: 'Add needed ingredients to your cart and track your order.' }
+  { title: "List what's missing", text: 'Save needed ingredients, check off groceries, and track your macros.' }
 ];
 const collectionFolders = [
   'Game Day',
@@ -1077,6 +1117,57 @@ function dateFromToday(days) {
   return localDateKey(date);
 }
 
+function parseAppDate(value) {
+  if (!value) return new Date();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(`${value}`)) {
+    return new Date(`${value}T00:00:00`);
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+function dateDisplay(value, options = { month: 'short', day: 'numeric' }) {
+  return parseAppDate(value).toLocaleDateString(undefined, options);
+}
+
+function activeMacroWeekWindow(preference = {}) {
+  const today = new Date(`${todayKey()}T00:00:00`);
+  const start = new Date(today);
+  if (preference.mode === 'Today') {
+    start.setDate(today.getDate());
+  } else if (preference.mode === 'Sunday') {
+    start.setDate(today.getDate() - today.getDay());
+  } else if (preference.mode === 'Monday') {
+    const mondayOffset = (today.getDay() + 6) % 7;
+    start.setDate(today.getDate() - mondayOffset);
+  } else {
+    const custom = parseAppDate(preference.customDate || todayKey());
+    start.setTime(new Date(`${localDateKey(custom)}T00:00:00`).getTime());
+  }
+  const end = new Date(start);
+  end.setDate(start.getDate() + 6);
+  return {
+    start,
+    end,
+    startKey: localDateKey(start),
+    endKey: localDateKey(end),
+    label: `${dateDisplay(start)} – ${dateDisplay(end)}`
+  };
+}
+
+function mealMacroTotals(sourceMeals = []) {
+  return sourceMeals.reduce(
+    (sum, meal) => ({
+      protein: sum.protein + Number(meal.macros?.protein || 0),
+      calories: sum.calories + Number(meal.macros?.calories || 0),
+      carbs: sum.carbs + Number(meal.macros?.carbs || 0),
+      sugar: sum.sugar + macroSugarValue(meal.macros || {}),
+      fat: sum.fat + Number(meal.macros?.fat || 0)
+    }),
+    { protein: 0, calories: 0, carbs: 0, sugar: 0, fat: 0 }
+  );
+}
+
 function daysUntilExpiration(dateValue) {
   if (!dateValue || !/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) {
     return null;
@@ -1319,6 +1410,26 @@ function roundGram(value) {
   return Math.round(Number(value || 0));
 }
 
+function macroSugarValue(macros = {}) {
+  if (Number.isFinite(Number(macros.sugar))) {
+    return Number(macros.sugar);
+  }
+  if (Number.isFinite(Number(macros.sugars))) {
+    return Number(macros.sugars);
+  }
+  return Math.max(0, Math.round(Number(macros.carbs || 0) * 0.22));
+}
+
+function completeMacros(macros = {}) {
+  return {
+    calories: roundCalories(macros.calories),
+    protein: roundGram(macros.protein),
+    carbs: roundGram(macros.carbs),
+    sugar: roundGram(macroSugarValue(macros)),
+    fat: roundGram(macros.fat)
+  };
+}
+
 function findMacroBase(ingredient) {
   const normalized = `${ingredient}`.toLowerCase().trim();
   if (ingredientMacroDatabase[normalized]) {
@@ -1334,6 +1445,7 @@ function findMacroBase(ingredient) {
     calories: 120,
     protein: 4,
     carbs: 18,
+    sugar: 4,
     fat: 4,
     matchedName: normalized
   };
@@ -1389,6 +1501,7 @@ function estimateIngredientMacros(ingredient, index, detections = [], portionSel
     calories: roundCalories(base.calories * multiplier),
     protein: roundGram(base.protein * multiplier),
     carbs: roundGram(base.carbs * multiplier),
+    sugar: roundGram(macroSugarValue(base) * multiplier),
     fat: roundGram(base.fat * multiplier),
     confidence,
     source: macroSourcePriority[base.source] || macroSourcePriority.ai,
@@ -1404,9 +1517,10 @@ function buildMacroBreakdown(ingredients = [], detections = [], portionSelection
       calories: sum.calories + row.calories,
       protein: sum.protein + row.protein,
       carbs: sum.carbs + row.carbs,
+      sugar: sum.sugar + row.sugar,
       fat: sum.fat + row.fat
     }),
-    { calories: 0, protein: 0, carbs: 0, fat: 0 }
+    { calories: 0, protein: 0, carbs: 0, sugar: 0, fat: 0 }
   );
   const confidenceRank = { Low: 1, Medium: 2, High: 3 };
   const lowestConfidence = rows.reduce((lowest, row) => (
@@ -1420,6 +1534,7 @@ function buildMacroBreakdown(ingredients = [], detections = [], portionSelection
       calories: roundCalories(totals.calories),
       protein: roundGram(totals.protein),
       carbs: roundGram(totals.carbs),
+      sugar: roundGram(totals.sugar),
       fat: roundGram(totals.fat)
     },
     confidence: rows.length ? lowestConfidence : 'Low',
@@ -1440,6 +1555,7 @@ function normalizeHostedMacroSummary(payload = {}, localSummary = {}) {
       calories: roundCalories(item.calories),
       protein: roundGram(item.protein),
       carbs: roundGram(item.carbs),
+      sugar: roundGram(macroSugarValue(item)),
       fat: roundGram(item.fat),
       confidence: item.confidence || localRow.confidence || 'Low',
       source: item.source || payload.source || 'Hosted nutrition',
@@ -1458,6 +1574,7 @@ function normalizeHostedMacroSummary(payload = {}, localSummary = {}) {
       calories: roundCalories(payload.totals?.calories),
       protein: roundGram(payload.totals?.protein),
       carbs: roundGram(payload.totals?.carbs),
+      sugar: roundGram(macroSugarValue(payload.totals || {})),
       fat: roundGram(payload.totals?.fat)
     },
     confidence: payload.confidence || localSummary.confidence || 'Low',
@@ -1483,6 +1600,8 @@ function formatTimer(seconds) {
 }
 
 function groceryCategory(item) {
+  const itemName = typeof item === 'string' ? item : item?.name || '';
+  item = itemName.toLowerCase();
   if (['chicken', 'eggs', 'salmon', 'tuna', 'tofu', 'lunch meat', 'yogurt'].some((value) => item.includes(value))) {
     return 'Protein';
   }
@@ -1490,9 +1609,192 @@ function groceryCategory(item) {
     return 'Produce';
   }
   if (['rice', 'noodles', 'tortillas', 'pasta'].some((value) => item.includes(value))) {
+    return 'Carbs';
+  }
+  if (['milk', 'cheese', 'cream', 'butter'].some((value) => item.includes(value))) {
+    return 'Dairy';
+  }
+  if (['tea', 'coffee', 'juice', 'water', 'drink', 'shake'].some((value) => item.includes(value))) {
+    return 'Drinks';
+  }
+  if (['beans', 'sauce', 'oats', 'flour', 'oil', 'spice', 'protein powder'].some((value) => item.includes(value))) {
     return 'Pantry';
   }
   return 'Other';
+}
+
+function normalizeGroceryItem(item) {
+  if (typeof item === 'string') {
+    return {
+      id: item,
+      name: item,
+      quantity: '',
+      notes: '',
+      category: groceryCategory(item)
+    };
+  }
+  const name = item?.name || '';
+  return {
+    id: item?.id || name,
+    name,
+    quantity: item?.quantity || '',
+    notes: item?.notes || '',
+    category: item?.category || groceryCategory(name)
+  };
+}
+
+function groceryItemKey(item) {
+  return normalizeGroceryItem(item).id || normalizeGroceryItem(item).name;
+}
+
+const recipePackagingWords = [
+  'carton',
+  'package',
+  'bag',
+  'container',
+  'frozen',
+  'canned',
+  'bottled',
+  'jarred',
+  'boxed',
+  'raw',
+  'uncooked'
+];
+
+const weakRecipeWords = ['fast', 'lazy', 'basic', 'plain', 'simple', 'leftover', 'remix', 'pantry'];
+const premiumTitleAdjectives = {
+  Meals: ['Garlic Herb', 'Golden', 'Savory', 'Harvest', 'Steakhouse', 'Crisp Garden', 'Fire-Roasted'],
+  Smoothies: ['Tropical', 'Velvet', 'Sunrise', 'Smoothie Bar', 'Bright Berry', 'Coconut Kissed'],
+  'Protein Shakes': ['Creamy', 'Powerhouse', 'Lean', 'Post-Workout', 'Vanilla Cloud', 'Chocolate Studio'],
+  Drinks: ['Sparkling', 'Citrus', 'Café-Style', 'Garden Fresh', 'Iced', 'Mocktail']
+};
+
+function titleCase(value = '') {
+  return `${value}`
+    .toLowerCase()
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+    .replace(/\bAi\b/g, 'AI')
+    .replace(/\bUsda\b/g, 'USDA');
+}
+
+function cleanRecipeTitleText(title = '') {
+  const packagingPattern = new RegExp(`\\b(${recipePackagingWords.join('|')})\\b`, 'gi');
+  const cleanedWords = `${title}`
+    .replace(/[()_[\]{}]/g, ' ')
+    .replace(packagingPattern, ' ')
+    .replace(/\b(and|with|plus|or)\b\s*$/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean);
+  const seen = new Set();
+  return titleCase(cleanedWords.filter((word) => {
+    const normalized = word.toLowerCase();
+    if (seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  }).join(' '));
+}
+
+function titleHasWeakNaming(title = '') {
+  const normalized = `${title}`.toLowerCase();
+  return !title || title.split(/\s+/).length < 3 || weakRecipeWords.some((word) => normalized.includes(word));
+}
+
+function inferNamingStyle(meal = {}, recipeType = 'Meals') {
+  const macros = meal.macros || {};
+  const title = `${meal.title || ''}`.toLowerCase();
+  if (recipeType === 'Smoothies') {
+    return macros.protein >= 20 ? 'fitness smoothie bar' : title.includes('berry') || title.includes('banana') ? 'tropical smoothie bar' : 'smoothie bar';
+  }
+  if (recipeType === 'Protein Shakes') {
+    return 'fitness';
+  }
+  if (recipeType === 'Drinks') {
+    return title.includes('coffee') ? 'café style' : 'refreshing mocktail';
+  }
+  if (macros.protein >= 35) return 'high protein';
+  if (title.includes('rice') || title.includes('bowl')) return 'modern restaurant';
+  if (title.includes('noodle') || title.includes('pasta') || title.includes('toast')) return 'comfort food';
+  return 'healthy café';
+}
+
+function premiumRecipeTitle(meal = {}, recipeType = 'Meals') {
+  const originalRecipeName = meal.originalRecipeName || meal.title || 'FoodFusion Recipe';
+  const cleanedRecipeName = cleanRecipeTitleText(originalRecipeName) || 'FoodFusion Recipe';
+  const lower = cleanedRecipeName.toLowerCase();
+  if (!titleHasWeakNaming(cleanedRecipeName) && !recipePackagingWords.some((word) => lower.includes(word))) {
+    return cleanedRecipeName;
+  }
+  const style = inferNamingStyle(meal, recipeType);
+  const ingredients = (meal.ingredients || []).map(cleanRecipeTitleText).filter(Boolean);
+  const primary = ingredients.find((item) => /chicken|steak|egg|tofu|salmon|tuna|bean|yogurt|banana|berry|coffee|lemon/i.test(item)) || ingredients[0] || cleanedRecipeName;
+  const titleLower = `${originalRecipeName} ${ingredients.join(' ')}`.toLowerCase();
+  if (recipeType === 'Protein Shakes') {
+    if (titleLower.includes('banana')) return 'Creamy Banana Power Shake';
+    if (titleLower.includes('coffee')) return 'Cold Brew Protein Shake';
+    return `${premiumTitleAdjectives['Protein Shakes'][0]} ${primary} Power Shake`;
+  }
+  if (recipeType === 'Smoothies') {
+    if (titleLower.includes('berry')) return 'Bright Berry Recovery Smoothie';
+    if (titleLower.includes('oat')) return 'Cinnamon Oat Energy Smoothie';
+    return `${premiumTitleAdjectives.Smoothies[0]} ${primary} Smoothie`;
+  }
+  if (recipeType === 'Drinks') {
+    if (titleLower.includes('coffee')) return 'Iced Honey Café Coffee';
+    if (titleLower.includes('lemon') || titleLower.includes('citrus')) return 'Sparkling Citrus Garden Cooler';
+    return `${premiumTitleAdjectives.Drinks[0]} ${primary} Refresher`;
+  }
+  if (titleLower.includes('steak') && titleLower.includes('pasta')) return 'Creamy Steakhouse Alfredo Pasta';
+  if (titleLower.includes('egg') && titleLower.includes('toast')) return 'Golden Morning Egg Toast';
+  if (titleLower.includes('chicken') && titleLower.includes('rice')) return 'Garlic Herb Chicken Rice Bowl';
+  if (titleLower.includes('tofu')) return 'Crisp Garden Tofu Bowl';
+  if (titleLower.includes('noodle')) return 'Sesame Garlic Noodle Toss';
+  if (titleLower.includes('bean')) return 'Smoky Bean Harvest Bowl';
+  const adjective = style === 'high protein'
+    ? 'High-Protein'
+    : style === 'comfort food'
+    ? 'Golden Comfort'
+    : style === 'healthy café'
+    ? 'Fresh Café'
+    : 'Garlic Herb';
+  return `${adjective} ${cleanedRecipeName}`;
+}
+
+function recipeSubtitle(meal = {}, recipeType = 'Meals', title = '') {
+  if (meal.subtitle || meal.description) return meal.subtitle || meal.description;
+  const ingredients = (meal.ingredients || []).join(' ').toLowerCase();
+  if (recipeType === 'Protein Shakes') {
+    return ingredients.includes('banana') ? 'Creamy banana protein blended for steady workout fuel.' : 'A smooth fitness-style shake with clean protein and balance.';
+  }
+  if (recipeType === 'Smoothies') {
+    return ingredients.includes('berries') ? 'A bright smoothie bar blend with fruit and creamy protein.' : 'A refreshing chilled blend built for energy and balance.';
+  }
+  if (recipeType === 'Drinks') {
+    return ingredients.includes('coffee') ? 'A café-style sip with a lightly sweet chilled finish.' : 'A crisp refresher with clean fruit and herbal notes.';
+  }
+  if (title.toLowerCase().includes('chicken')) return 'Savory garlic chicken served over fluffy seasoned rice.';
+  if (title.toLowerCase().includes('tofu')) return 'Crisp tofu with fresh greens and a savory finish.';
+  if (title.toLowerCase().includes('egg')) return 'Golden eggs layered with cozy breakfast flavor.';
+  if (title.toLowerCase().includes('noodle') || title.toLowerCase().includes('pasta')) return 'A comforting bowl with rich sauce and satisfying texture.';
+  return 'A polished FoodFusion match with balanced flavor and easy prep.';
+}
+
+function enhanceRecipeForDisplay(meal = {}, fallbackType = 'Meals') {
+  const recipeType = recipeTypeForMeal(meal, fallbackType);
+  const originalRecipeName = meal.originalRecipeName || meal.title || 'FoodFusion Recipe';
+  const cleanedRecipeName = cleanRecipeTitleText(originalRecipeName);
+  const title = premiumRecipeTitle({ ...meal, originalRecipeName, title: cleanedRecipeName }, recipeType);
+  const namingStyleUsed = inferNamingStyle(meal, recipeType);
+  const subtitleGenerated = recipeSubtitle(meal, recipeType, title);
+  return {
+    ...meal,
+    originalRecipeName,
+    cleanedRecipeName,
+    namingStyleUsed,
+    subtitle: subtitleGenerated,
+    title
+  };
 }
 
 function assistantReply(prompt, currentMeals) {
@@ -1547,11 +1849,11 @@ function prioritizeFreshness(meals, statuses = {}) {
 function addProductSignals(meals, ingredients = [], statuses = {}) {
   return prioritizeFreshness(meals, statuses).map((meal) => {
     const urgent = meal.ingredients.some((ingredient) => ['use soon', 'almost expired'].includes(statuses[ingredient]));
-    return {
+    return enhanceRecipeForDisplay({
       ...meal,
       useSoon: meal.useSoon || urgent,
       quality: qualityScores(meal, ingredients)
-    };
+    }, recipeTypeForMeal(meal));
   });
 }
 
@@ -2152,6 +2454,9 @@ function Button({ children, onPress, variant = 'primary', disabled, accent }) {
       ]}
     >
       <Text
+        numberOfLines={2}
+        adjustsFontSizeToFit
+        minimumFontScale={0.82}
         style={[
           styles.buttonText,
           variant === 'ghost' && styles.ghostButtonText,
@@ -2181,6 +2486,9 @@ function CompactButton({ children, onPress, variant = 'primary', disabled, accen
       ]}
     >
       <Text
+        numberOfLines={2}
+        adjustsFontSizeToFit
+        minimumFontScale={0.78}
         style={[
           styles.buttonText,
           variant === 'ghost' && styles.ghostButtonText,
@@ -2236,25 +2544,14 @@ function MacroFilterButton({ label, active, onPress }) {
   );
 }
 
-function CartIcon({ accent = palette.green }) {
-  return (
-    <View style={styles.cartIcon}>
-      <View style={[styles.cartBasket, { borderBottomColor: accent, borderLeftColor: accent, borderRightColor: accent }]} />
-      <View style={[styles.cartHandle, { borderColor: accent }]} />
-      <View style={styles.cartWheelRow}>
-        <View style={[styles.cartWheel, { backgroundColor: accent }]} />
-        <View style={[styles.cartWheel, { backgroundColor: accent }]} />
-      </View>
-    </View>
-  );
-}
-
 function MacroGrid({ macros }) {
+  const normalizedMacros = completeMacros(macros);
   const items = [
-    { label: 'Calories', value: macros.calories },
-    { label: 'Protein', value: `${macros.protein}g` },
-    { label: 'Carbs', value: `${macros.carbs}g` },
-    { label: 'Fat', value: `${macros.fat}g` }
+    { label: 'Calories', value: normalizedMacros.calories },
+    { label: 'Protein', value: `${normalizedMacros.protein}g` },
+    { label: 'Carbs', value: `${normalizedMacros.carbs}g` },
+    { label: 'Sugar', value: `${normalizedMacros.sugar}g` },
+    { label: 'Fat', value: `${normalizedMacros.fat}g` }
   ];
 
   return (
@@ -2469,7 +2766,7 @@ function Screen({ children, toast }) {
   );
 }
 
-function AppHeader({ onBack, eyebrow, onSettings, onCart, cartCount = 0, onFavorites, favoriteCount = 0, accent = palette.green }) {
+function AppHeader({ onBack, eyebrow, onSettings, onFavorites, favoriteCount = 0, accent = palette.green }) {
   return (
     <View style={styles.header}>
       {onBack ? (
@@ -2477,24 +2774,14 @@ function AppHeader({ onBack, eyebrow, onSettings, onCart, cartCount = 0, onFavor
           <Text style={[styles.backText, { color: accent }]}>Back</Text>
         </Pressable>
       ) : (
-        <View style={[styles.backSpacer, (onSettings || onCart || onFavorites) && styles.headerActionSpacer]} />
+        <View style={[styles.backSpacer, (onSettings || onFavorites) && styles.headerActionSpacer]} />
       )}
       <Text style={[styles.eyebrow, { color: accent }]}>{eyebrow}</Text>
-      {onSettings || onCart || onFavorites ? (
+      {onSettings || onFavorites ? (
         <View style={styles.headerActionStack}>
           {onSettings ? (
             <Pressable accessibilityRole="button" accessibilityLabel="Settings" onPress={onSettings} style={({ pressed }) => [styles.headerIconButton, pressed && styles.pressed]}>
               <Text style={[styles.headerGearText, { color: flowColors.profile.accent }]}>⚙</Text>
-            </Pressable>
-          ) : null}
-          {onCart ? (
-            <Pressable accessibilityRole="button" accessibilityLabel="Shopping cart" onPress={onCart} style={({ pressed }) => [styles.headerIconButton, pressed && styles.pressed]}>
-              <CartIcon accent={flowColors.shopping.accent} />
-              {cartCount > 0 ? (
-                <View style={styles.cartBadge}>
-                  <Text style={styles.cartBadgeText}>{cartCount > 9 ? '9+' : cartCount}</Text>
-                </View>
-              ) : null}
             </Pressable>
           ) : null}
           {onFavorites ? (
@@ -2519,8 +2806,8 @@ function BottomTabs({ active, onNavigate }) {
   const tabs = [
     { id: 'home', label: 'Home', icon: '⌂', tone: flowColors.Meals },
     { id: 'favorites', label: 'Saved', icon: '♡', tone: flowColors.saved },
-    { id: 'shopping', label: 'Shop', icon: '▣', tone: flowColors.shopping },
-    { id: 'orderHistory', label: 'Orders', icon: '≡', tone: flowColors.shopping },
+    { id: 'shopping', label: 'List', icon: '☑', tone: flowColors.shopping },
+    { id: 'macroTracker', label: 'Macros', icon: '▥', tone: flowColors.fusion },
     { id: 'profile', label: 'Profile', icon: '○', tone: flowColors.profile }
   ];
 
@@ -2757,21 +3044,50 @@ function AuthScreen({
   onLogin,
   onSignUp,
   onResetPassword,
+  onSendResetCode,
+  onVerifyResetCode,
+  onUpdatePasswordWithCode,
+  resetFlow,
+  onResetFlowChange,
+  onResetMethodChange,
   onResendConfirmation,
   onShowLogin,
   onShowSignUp,
   onShowForgotPassword,
-  needsConfirmation
+  needsConfirmation,
+  authLoading
 }) {
   const isWelcome = mode === 'welcome';
   const isSignUp = mode === 'signup';
   const isForgotPassword = mode === 'forgotPassword';
   const [showPassword, setShowPassword] = useState(false);
+  const [showResetPassword, setShowResetPassword] = useState(false);
   const passwordItems = passwordValidationItems(form.password);
   const passwordStrong = isStrongPassword(form.password);
   const confirmPasswordMatches = !isSignUp || !form.confirmPassword || form.password === form.confirmPassword;
   const submitDisabled = isSignUp && (!passwordStrong || !form.confirmPassword || !confirmPasswordMatches);
   const passwordToggleLabel = showPassword ? 'Hide password' : 'Show password';
+  const resetMethod = resetFlow?.method || 'code';
+  const resetStep = resetFlow?.step || 'request';
+  const resetPassword = resetFlow?.newPassword || '';
+  const resetConfirmPassword = resetFlow?.confirmPassword || '';
+  const resetPasswordItems = passwordValidationItems(resetPassword);
+  const resetPasswordStrong = isStrongPassword(resetPassword);
+  const resetPasswordsMatch = !resetConfirmPassword || resetPassword === resetConfirmPassword;
+  const resetPasswordToggleLabel = showResetPassword ? 'Hide password' : 'Show password';
+  const resetPrimaryAction = !isForgotPassword
+    ? null
+    : resetMethod === 'link'
+    ? { label: 'Send Email Reset Link', onPress: onResetPassword, disabled: false }
+    : resetStep === 'verify'
+    ? { label: 'Verify Code', onPress: onVerifyResetCode, disabled: !(resetFlow?.code || '').trim() }
+    : resetStep === 'password'
+    ? {
+        label: 'Update Password',
+        onPress: onUpdatePasswordWithCode,
+        disabled: !resetPasswordStrong || !resetConfirmPassword || resetPassword !== resetConfirmPassword
+      }
+    : { label: 'Send Reset Code', onPress: onSendResetCode, disabled: false };
 
   return (
     <Screen>
@@ -2808,6 +3124,107 @@ function AuthScreen({
               keyboardType="email-address"
               style={styles.authInput}
             />
+            {isForgotPassword ? (
+              <>
+                <View style={styles.resetMethodRow}>
+                  {[
+                    ['code', 'Use Reset Code'],
+                    ['link', 'Email Reset Link']
+                  ].map(([method, label]) => (
+                    <Pressable
+                      key={method}
+                      accessibilityRole="button"
+                      onPress={() => onResetMethodChange(method)}
+                      style={({ pressed }) => [
+                        styles.resetMethodButton,
+                        resetMethod === method && styles.resetMethodButtonActive,
+                        pressed && styles.pressed
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.resetMethodText,
+                          resetMethod === method && styles.resetMethodTextActive
+                        ]}
+                      >
+                        {label}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <Text style={styles.resetHelper}>
+                  {resetMethod === 'code'
+                    ? 'A 6-digit code will be sent to your email. Text code coming soon.'
+                    : 'A secure reset link will open the hosted FoodFusion page.'}
+                </Text>
+                {resetMethod === 'code' && resetStep !== 'request' ? (
+                  <TextInput
+                    value={resetFlow?.code || ''}
+                    onChangeText={(value) => onResetFlowChange('code', value.replace(/\D/g, '').slice(0, 6))}
+                    placeholder="6-digit code"
+                    placeholderTextColor={palette.muted}
+                    keyboardType="number-pad"
+                    maxLength={6}
+                    style={styles.authInput}
+                  />
+                ) : null}
+                {resetMethod === 'code' && resetStep === 'password' ? (
+                  <>
+                    <View style={styles.passwordInputWrap}>
+                      <TextInput
+                        value={resetPassword}
+                        onChangeText={(value) => onResetFlowChange('newPassword', value)}
+                        placeholder="New password"
+                        placeholderTextColor={palette.muted}
+                        secureTextEntry={!showResetPassword}
+                        textContentType="newPassword"
+                        autoComplete="new-password"
+                        style={styles.passwordInput}
+                      />
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={resetPasswordToggleLabel}
+                        onPress={() => setShowResetPassword((current) => !current)}
+                        style={({ pressed }) => [styles.passwordToggle, pressed && styles.pressed]}
+                      >
+                        <PasswordEyeIcon visible={showResetPassword} />
+                      </Pressable>
+                    </View>
+                    <View style={styles.passwordChecklist}>
+                      {resetPasswordItems.map((item) => (
+                        <Text
+                          key={item.label}
+                          style={[styles.passwordChecklistItem, item.valid && styles.passwordChecklistItemValid]}
+                        >
+                          {item.valid ? '✓' : '•'} {item.label}
+                        </Text>
+                      ))}
+                    </View>
+                    <View style={styles.passwordInputWrap}>
+                      <TextInput
+                        value={resetConfirmPassword}
+                        onChangeText={(value) => onResetFlowChange('confirmPassword', value)}
+                        placeholder="Confirm new password"
+                        placeholderTextColor={palette.muted}
+                        secureTextEntry={!showResetPassword}
+                        textContentType="newPassword"
+                        autoComplete="new-password"
+                        style={styles.passwordInput}
+                      />
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={resetPasswordToggleLabel}
+                        onPress={() => setShowResetPassword((current) => !current)}
+                        style={({ pressed }) => [styles.passwordToggle, pressed && styles.pressed]}
+                      >
+                        <PasswordEyeIcon visible={showResetPassword} />
+                      </Pressable>
+                    </View>
+                    {!resetPasswordsMatch ? <Text style={styles.authError}>Passwords must match.</Text> : null}
+                  </>
+                ) : null}
+              </>
+            ) : null}
             {!isForgotPassword ? (
               <>
                 <View style={styles.passwordInputWrap}>
@@ -2872,10 +3289,20 @@ function AuthScreen({
             {error ? <Text style={styles.authError}>{error}</Text> : null}
             {message ? <Text style={styles.authMessage}>{message}</Text> : null}
             <Button
-              disabled={submitDisabled}
-              onPress={isForgotPassword ? onResetPassword : isSignUp ? onSignUp : onLogin}
+              disabled={(isForgotPassword ? resetPrimaryAction?.disabled : submitDisabled) || authLoading}
+              onPress={isForgotPassword ? resetPrimaryAction?.onPress : isSignUp ? onSignUp : onLogin}
             >
-              {isForgotPassword ? 'Send Reset Link' : isSignUp ? 'Create Account' : 'Log In'}
+              {authLoading
+                ? isForgotPassword
+                  ? 'Working...'
+                  : isSignUp
+                  ? 'Creating...'
+                  : 'Signing in...'
+                : isForgotPassword
+                ? resetPrimaryAction?.label
+                : isSignUp
+                ? 'Create Account'
+                : 'Log In'}
             </Button>
             {needsConfirmation ? (
               <Pressable onPress={onResendConfirmation} style={styles.authSwitch}>
@@ -2899,7 +3326,7 @@ function AuthScreen({
   );
 }
 
-function SplashScreen() {
+function SplashScreen({ showNetworkHint = false }) {
   const fade = useRef(new Animated.Value(0)).current;
   const scale = useRef(new Animated.Value(0.94)).current;
 
@@ -2923,6 +3350,11 @@ function SplashScreen() {
         </Animated.View>
         <Animated.Text style={[styles.splashTitle, { opacity: fade }]}>FoodFusion AI</Animated.Text>
         <Animated.Text style={[styles.splashSubtitle, { opacity: fade }]}>Scan. Match. Cook.</Animated.Text>
+        {showNetworkHint ? (
+          <Animated.Text style={[styles.splashNetworkHint, { opacity: fade }]}>
+            Still loading… check Wi-Fi or switch to cellular.
+          </Animated.Text>
+        ) : null}
       </View>
     </SafeAreaView>
   );
@@ -2942,6 +3374,24 @@ function FoodFusionApp() {
   });
   const [authError, setAuthError] = useState('');
   const [authMessage, setAuthMessage] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+  const [resetFlow, setResetFlow] = useState({
+    method: 'code',
+    step: 'request',
+    code: '',
+    resetToken: '',
+    newPassword: '',
+    confirmPassword: ''
+  });
+  const [passwordResetDebug, setPasswordResetDebug] = useState({
+    lastResetMethod: 'None',
+    resetCodeSentStatus: 'Not requested',
+    resetVerifyStatus: 'Not requested',
+    resetPasswordUpdateStatus: 'Not requested'
+  });
+  const [startupNetworkHint, setStartupNetworkHint] = useState(false);
+  const [lastNetworkTimeoutSource, setLastNetworkTimeoutSource] = useState('None');
+  const [lastLoginNetworkUsed, setLastLoginNetworkUsed] = useState('Not checked');
   const [authNeedsConfirmation, setAuthNeedsConfirmation] = useState(false);
   const [authDebug, setAuthDebug] = useState({
     authState: 'Booting',
@@ -3054,6 +3504,8 @@ function FoodFusionApp() {
   const [startupComplete, setStartupComplete] = useState(false);
   const [groceryChecked, setGroceryChecked] = useState({});
   const [customGroceryItem, setCustomGroceryItem] = useState('');
+  const [customGroceryQuantity, setCustomGroceryQuantity] = useState('');
+  const [customGroceryNotes, setCustomGroceryNotes] = useState('');
   const [pantryItems, setPantryItems] = useState([]);
   const [pantryInput, setPantryInput] = useState('');
   const [pantryExpirationInput, setPantryExpirationInput] = useState(dateFromToday(3));
@@ -3085,7 +3537,17 @@ function FoodFusionApp() {
   const [recipeRatings, setRecipeRatings] = useState({ loved: [], fine: [], never: [] });
   const [householdMembers, setHouseholdMembers] = useState(['You']);
   const [householdInput, setHouseholdInput] = useState('');
-  const [budgetGoals, setBudgetGoals] = useState({ weeklyBudget: '120', proteinGoal: '160', calorieTarget: '2200' });
+  const [budgetGoals, setBudgetGoals] = useState({ weeklyBudget: '120', ...DEFAULT_MACRO_GOALS });
+  const [macroGoalDrafts, setMacroGoalDrafts] = useState(DEFAULT_MACRO_GOALS);
+  const [macroGoalUpdateStatus, setMacroGoalUpdateStatus] = useState('');
+  const [macroGoalError, setMacroGoalError] = useState('');
+  const [weekStartPreference, setWeekStartPreference] = useState({ mode: 'Monday', customDate: todayKey() });
+  const [recentMealPickerOpen, setRecentMealPickerOpen] = useState(false);
+  const [selectedRecentMealIds, setSelectedRecentMealIds] = useState([]);
+  const [editingEatenMeal, setEditingEatenMeal] = useState(null);
+  const [eatenMealEditForm, setEatenMealEditForm] = useState(null);
+  const [lastEatenMealEditStatus, setLastEatenMealEditStatus] = useState('None');
+  const [lastClearActionStatus, setLastClearActionStatus] = useState('None');
   const [macroLock, setMacroLock] = useState('200g protein');
   const [portionMode, setPortionMode] = useState('couple');
   const [restaurantQuery, setRestaurantQuery] = useState('');
@@ -3132,6 +3594,7 @@ function FoodFusionApp() {
   const restoringUserIdRef = useRef(null);
   const restoredUserIdRef = useRef(null);
   const restoreFailsafeTimerRef = useRef(null);
+  const loginInFlightRef = useRef(false);
 
   function cacheKey(key, userId = activeUserIdRef.current) {
     return scopedCacheKey(key, userId);
@@ -3276,6 +3739,7 @@ function FoodFusionApp() {
       storedRecipeRatings,
       storedHousehold,
       storedBudgetGoals,
+      storedWeekStart,
       storedMacroLock,
       storedSocialPosts,
       storedNotificationPreferences,
@@ -3307,6 +3771,7 @@ function FoodFusionApp() {
       getCachedItem(RECIPE_RATINGS_KEY, userId),
       getCachedItem(HOUSEHOLD_KEY, userId),
       getCachedItem(BUDGET_GOALS_KEY, userId),
+      getCachedItem(WEEK_START_KEY, userId),
       getCachedItem(MACRO_LOCK_KEY, userId),
       getCachedItem(SOCIAL_KEY, userId),
       getCachedItem(NOTIFICATION_PREFERENCES_KEY, userId),
@@ -3342,7 +3807,8 @@ function FoodFusionApp() {
       equipmentProfile: parseStoredJson(storedEquipmentProfile, ['stove', 'microwave']),
       recipeRatings: parseStoredJson(storedRecipeRatings, { loved: [], fine: [], never: [] }),
       householdMembers: parseStoredJson(storedHousehold, ['You']),
-      budgetGoals: parseStoredJson(storedBudgetGoals, { weeklyBudget: '120', proteinGoal: '160', calorieTarget: '2200' }),
+      budgetGoals: parseStoredJson(storedBudgetGoals, { weeklyBudget: '120', ...DEFAULT_MACRO_GOALS }),
+      weekStartPreference: parseStoredJson(storedWeekStart, { mode: 'Monday', customDate: todayKey() }),
       macroLock: storedMacroLock || '200g protein',
       socialPosts: parseStoredJson(storedSocialPosts, []),
       notificationPreferences: parseStoredJson(storedNotificationPreferences, {
@@ -3381,7 +3847,8 @@ function FoodFusionApp() {
       equipmentProfile: ['stove', 'microwave'],
       recipeRatings: { loved: [], fine: [], never: [] },
       householdMembers: ['You'],
-      budgetGoals: { weeklyBudget: '120', proteinGoal: '160', calorieTarget: '2200' },
+      budgetGoals: { weeklyBudget: '120', ...DEFAULT_MACRO_GOALS },
+      weekStartPreference: { mode: 'Monday', customDate: todayKey() },
       macroLock: '200g protein',
       socialPosts: [],
       notificationPreferences: {
@@ -3441,7 +3908,8 @@ function FoodFusionApp() {
     setEquipmentProfile(snapshot.equipmentProfile || ['stove', 'microwave']);
     setRecipeRatings(snapshot.recipeRatings || { loved: [], fine: [], never: [] });
     setHouseholdMembers(snapshot.householdMembers || ['You']);
-    setBudgetGoals(snapshot.budgetGoals || { weeklyBudget: '120', proteinGoal: '160', calorieTarget: '2200' });
+    setBudgetGoals({ weeklyBudget: '120', ...DEFAULT_MACRO_GOALS, ...(snapshot.budgetGoals || {}) });
+    setWeekStartPreference(snapshot.weekStartPreference || { mode: 'Monday', customDate: todayKey() });
     setMacroLock(snapshot.macroLock || '200g protein');
     setSocialPosts(snapshot.socialPosts || []);
     setNotificationPreferences(snapshot.notificationPreferences || {
@@ -3768,7 +4236,7 @@ function FoodFusionApp() {
       setServings(remote.preferences.default_servings || 2);
       setRecipeSource(remote.preferences.recipe_source || 'Hybrid Mode');
       setMacroLock(remote.preferences.macro_lock || '200g protein');
-      setBudgetGoals(remote.preferences.budget_goals || budgetGoals);
+      setBudgetGoals({ weeklyBudget: '120', ...DEFAULT_MACRO_GOALS, ...(remote.preferences.budget_goals || budgetGoals) });
       setHouseholdMembers(remote.preferences.household?.members || ['You']);
       setNotificationPreferences(remote.preferences.notification_preferences || notificationPreferences);
       setNotificationsEnabled(Boolean(remote.preferences.notifications_enabled));
@@ -3858,6 +4326,7 @@ function FoodFusionApp() {
         date: meal.date || entry.date,
         recipeType: recipeTypeForMeal(meal, entry.recipeType || 'Meals')
       })))
+      .map((meal) => enhanceRecipeForDisplay(meal, meal.recipeType))
       .filter((meal) => {
         const key = recipeKey(meal, meal.recipeType);
         if (seen.has(key)) {
@@ -3872,16 +4341,23 @@ function FoodFusionApp() {
     ? recentRecipes
     : recentRecipes.filter((meal) => recipeTypeForMeal(meal) === activeRecentType);
   const lastScan = mealHistory[0];
-  const homeMeals = meals.length > 0 ? meals : visibleRecentRecipes;
+  const enhancedMeals = useMemo(
+    () => meals.map((meal) => enhanceRecipeForDisplay(meal, recipeTypeForMeal(meal, selectedRecipeType))),
+    [meals, selectedRecipeType]
+  );
+  const homeMeals = enhancedMeals.length > 0 ? enhancedMeals : visibleRecentRecipes;
   const tonightBest = homeMeals[0];
   const quickestMeal = homeMeals.length > 0 ? [...homeMeals].sort((a, b) => parseMinutes(a.time) - parseMinutes(b.time))[0] : null;
   const mostProteinMeal =
     homeMeals.length > 0 ? [...homeMeals].sort((a, b) => (b.macros?.protein || 0) - (a.macros?.protein || 0))[0] : null;
   const visibleMeals = useMemo(
-    () => (isPremium ? sortMealsForMacroFilter(meals, macroFilter) : meals),
-    [isPremium, macroFilter, meals]
+    () => (isPremium ? sortMealsForMacroFilter(enhancedMeals, macroFilter) : enhancedMeals),
+    [enhancedMeals, isPremium, macroFilter]
   );
   const displayedMeals = hasLoadedMoreMeals ? visibleMeals : visibleMeals.slice(0, 3);
+  const recipeNamingSample = selectedMeal
+    ? enhanceRecipeForDisplay(selectedMeal, recipeTypeForMeal(selectedMeal, selectedRecipeType))
+    : displayedMeals[0] || homeMeals[0] || null;
   const mealsCooked = mealHistory.reduce((total, entry) => total + entry.meals.length, 0);
   const weeklyMoneySaved = mealsCooked * 7;
   const currentPantryIngredients = [...new Set([...ingredients, ...pantryItems.map((item) => item.name)])];
@@ -4034,17 +4510,8 @@ function FoodFusionApp() {
         AsyncStorage.getItem(CAMERA_PERMISSION_INTRO_KEY),
         AsyncStorage.getItem(QA_CHECKLIST_KEY)
       ]);
-      let sessionProfile = null;
-      if (supabaseConfigured) {
-        try {
-          sessionProfile = await getSupabaseSessionProfile();
-          console.log('[FoodFusion Auth] startup session profile:', sessionProfile);
-        } catch {
-          console.warn('[FoodFusion Auth] startup session profile failed');
-          sessionProfile = null;
-        }
-      }
-      const activeProfile = supabaseConfigured ? sessionProfile : storedUserProfile ? JSON.parse(storedUserProfile) : null;
+      const cachedProfile = storedUserProfile ? JSON.parse(storedUserProfile) : null;
+      const activeProfile = cachedProfile;
       const activeUserId = stableUserId(activeProfile);
       activeUserIdRef.current = activeUserId;
       const cachedAccount = await withRestoreTimeout(
@@ -4052,26 +4519,22 @@ function FoodFusionApp() {
         'Startup account cache restore',
         2500
       ).catch(() => emptyAccountRestoreSnapshot());
-      const needsRemoteRestore = Boolean(sessionProfile);
-      setIsLoggedIn(supabaseConfigured ? Boolean(sessionProfile) : storedLoggedIn === 'true');
+      const hasCachedLogin = storedLoggedIn === 'true' && Boolean(activeProfile);
+      setIsLoggedIn(hasCachedLogin);
       setUserProfile(activeProfile);
       setAuthDebug((current) => ({
         ...current,
-        authState: activeProfile ? 'Logged in' : 'Logged out',
-        sessionExists: Boolean(sessionProfile),
-        sessionUserId: sessionProfile?.id || null,
-        sessionEmail: sessionProfile?.email || null
+        authState: activeProfile ? 'Restored from cache' : 'Logged out',
+        sessionExists: false,
+        sessionUserId: activeProfile?.id || null,
+        sessionEmail: activeProfile?.email || null
       }));
-      if (needsRemoteRestore) {
-        beginAccountRestore(activeUserId, 'startup session restore');
-      } else {
-        clearAccountRestoreLoading('startup local restore', activeUserId);
-      }
+      clearAccountRestoreLoading('startup local restore', activeUserId);
       applyAccountCacheSnapshot(cachedAccount, {
-        includeSubscription: !needsRemoteRestore,
-        includeHistory: !needsRemoteRestore
+        includeSubscription: true,
+        includeHistory: true
       });
-      if (!needsRemoteRestore && !cachedAccount.subscription) {
+      if (!cachedAccount.subscription) {
         setIsPremium(false);
         setSelectedFusionPlan('yearly');
       }
@@ -4079,19 +4542,73 @@ function FoodFusionApp() {
       setOnboardingCompleted(storedOnboarding === 'true');
       setCameraPermissionIntroSeen(storedCameraPermissionIntro === 'true');
       setQaChecklist(storedQaChecklist ? JSON.parse(storedQaChecklist) : {});
-      if (needsRemoteRestore) {
-        await hydrateSyncedUserData(activeProfile);
-      } else {
-        clearAccountRestoreLoading('startup complete', activeUserId);
-      }
       setAuthBootstrapped(true);
+
+      if (supabaseConfigured) {
+        withRestoreTimeout(
+          getSupabaseSessionProfile(),
+          'Supabase startup session',
+          3500
+        ).then((sessionProfile) => {
+          console.log('[FoodFusion Auth] startup session profile:', sessionProfile);
+          setStartupNetworkHint(false);
+          if (!sessionProfile) {
+            if (!hasCachedLogin) {
+              setIsLoggedIn(false);
+              setUserProfile(null);
+            }
+            setAuthDebug((current) => ({
+              ...current,
+              authState: hasCachedLogin ? 'Cached session' : 'Logged out',
+              sessionExists: false
+            }));
+            return;
+          }
+          const sessionUserId = stableUserId(sessionProfile);
+          activeUserIdRef.current = sessionUserId;
+          setIsLoggedIn(true);
+          setUserProfile(sessionProfile);
+          setAuthDebug((current) => ({
+            ...current,
+            authState: 'Logged in',
+            sessionExists: true,
+            sessionUserId: sessionProfile.id,
+            sessionEmail: sessionProfile.email,
+            lastAuthError: ''
+          }));
+          hydrateSyncedUserData(sessionProfile).catch((error) => {
+            const readable = readableAuthError(error);
+            if (readable === LOGIN_TIMEOUT_MESSAGE || readable.toLowerCase().includes('timed out')) {
+              setLastNetworkTimeoutSource('Supabase hydration');
+            }
+            console.warn('[FoodFusion Auth] startup background hydration failed:', error);
+            setAuthDebug((current) => ({ ...current, lastAuthError: readable }));
+          });
+        }).catch((error) => {
+          const readable = readableAuthError(error);
+          console.warn('[FoodFusion Auth] startup session profile deferred:', error);
+          if (readable === LOGIN_TIMEOUT_MESSAGE || readable.toLowerCase().includes('timed out')) {
+            setLastNetworkTimeoutSource('Supabase startup session');
+          }
+          setAuthDebug((current) => ({
+            ...current,
+            authState: hasCachedLogin ? 'Cached session' : 'Logged out',
+            lastAuthError: readable
+          }));
+        });
+      }
     }
 
     loadState().catch((error) => {
+      const readable = readableAuthError(error);
       console.warn('[FoodFusion Auth] Startup cache load deferred:', error);
-      setAuthError(readableAuthError(error));
-      setAuthDebug((current) => ({ ...current, lastAuthError: readableAuthError(error) }));
+      setAuthError(readable);
+      if (readable === LOGIN_TIMEOUT_MESSAGE || readable.toLowerCase().includes('timed out')) {
+        setLastNetworkTimeoutSource('Startup cache load');
+      }
+      setAuthDebug((current) => ({ ...current, lastAuthError: readable }));
       clearAccountRestoreLoading('startup error');
+      setOnboardingCompleted(false);
       setAuthBootstrapped(true);
     });
   }, []);
@@ -4119,6 +4636,17 @@ function FoodFusionApp() {
         sessionEmail: profile?.email || null
       }));
       if (profile) {
+        if (loginInFlightRef.current) {
+          loginInFlightRef.current = false;
+          setAuthLoading(false);
+          setAuthMessage('');
+          console.log('[FoodFusion Auth] Login success', {
+            userId: profile.id,
+            email: profile.email,
+            source: 'auth event'
+          });
+          console.log('[FoodFusion Auth] Login finished');
+        }
         console.log('[FoodFusion Auth] AsyncStorage auth writes starting:', { userId: profile.id, email: profile.email });
         AsyncStorage.multiSet([
           [AUTH_KEY, 'true'],
@@ -4184,6 +4712,33 @@ function FoodFusionApp() {
     const startupTimer = setTimeout(() => setStartupComplete(true), 2400);
     return () => clearTimeout(startupTimer);
   }, []);
+
+  useEffect(() => {
+    if (startupComplete && onboardingCompleted !== null && authBootstrapped) {
+      return undefined;
+    }
+    const networkHintTimer = setTimeout(() => {
+      setStartupNetworkHint(true);
+      setLastNetworkTimeoutSource((current) => current === 'None' ? 'Startup loading' : current);
+    }, STARTUP_NETWORK_HINT_MS);
+    return () => clearTimeout(networkHintTimer);
+  }, [authBootstrapped, onboardingCompleted, startupComplete]);
+
+  useEffect(() => {
+    setMacroGoalDrafts({
+      calorieTarget: `${budgetGoals.calorieTarget || DEFAULT_MACRO_GOALS.calorieTarget}`,
+      proteinGoal: `${budgetGoals.proteinGoal || DEFAULT_MACRO_GOALS.proteinGoal}`,
+      carbsGoal: `${budgetGoals.carbsGoal || DEFAULT_MACRO_GOALS.carbsGoal}`,
+      sugarGoal: `${budgetGoals.sugarGoal || DEFAULT_MACRO_GOALS.sugarGoal}`,
+      fatGoal: `${budgetGoals.fatGoal || DEFAULT_MACRO_GOALS.fatGoal}`
+    });
+  }, [
+    budgetGoals.calorieTarget,
+    budgetGoals.proteinGoal,
+    budgetGoals.carbsGoal,
+    budgetGoals.sugarGoal,
+    budgetGoals.fatGoal
+  ]);
 
   useEffect(() => {
     if (screen !== 'analysis' || !pendingScan) {
@@ -4556,6 +5111,9 @@ function FoodFusionApp() {
     } catch (error) {
       console.warn('[FoodFusion Restore] Restore timeout or failure:', { userId: hydrateUserId, message: error?.message });
       console.warn('[FoodFusion Sync] Account cache refresh deferred:', error);
+      if (`${error?.message || error}`.toLowerCase().includes('timed out')) {
+        setLastNetworkTimeoutSource('Supabase hydration');
+      }
       try {
         if (hydrateRunId !== accountHydrateRef.current) {
           return;
@@ -4579,8 +5137,8 @@ function FoodFusionApp() {
   }
 
   function navigateTab(nextScreen) {
-    setScreen(nextScreen === 'shopping' && !shoppingLocation ? 'shoppingLocation' : nextScreen);
-    if (['favorites', 'shopping', 'orderHistory'].includes(nextScreen)) {
+    setScreen(nextScreen);
+    if (['favorites', 'shopping', 'macroTracker'].includes(nextScreen)) {
       setTabLoading(nextScreen);
       setTimeout(() => setTabLoading(null), 340);
     }
@@ -4973,26 +5531,133 @@ function FoodFusionApp() {
   }
 
   async function deleteGroceryItem(item) {
-    const nextItems = groceryList.filter((groceryItem) => groceryItem !== item);
+    const targetKey = groceryItemKey(item);
+    const nextItems = groceryList.filter((groceryItem) => groceryItemKey(groceryItem) !== targetKey);
     setGroceryList(nextItems);
     await setCachedItem(GROCERY_KEY, JSON.stringify(nextItems));
   }
 
   async function toggleGroceryChecked(item) {
-    const nextChecked = { ...groceryChecked, [item]: !groceryChecked[item] };
+    const key = groceryItemKey(item);
+    const nextChecked = { ...groceryChecked, [key]: !groceryChecked[key] };
     setGroceryChecked(nextChecked);
     await setCachedItem(GROCERY_CHECKED_KEY, JSON.stringify(nextChecked));
   }
 
   async function addCustomGroceryItem() {
-    const item = customGroceryItem.trim().toLowerCase();
-    if (!item) {
+    const name = customGroceryItem.trim().toLowerCase();
+    if (!name) {
       return;
     }
-    const nextItems = [...new Set([...groceryList, item])];
+    const newItem = {
+      id: `grocery-${Date.now()}`,
+      name,
+      quantity: customGroceryQuantity.trim(),
+      notes: customGroceryNotes.trim(),
+      category: groceryCategory(name)
+    };
+    const nextItems = [
+      ...groceryList.filter((item) => normalizeGroceryItem(item).name !== name),
+      newItem
+    ];
     setGroceryList(nextItems);
     setCustomGroceryItem('');
+    setCustomGroceryQuantity('');
+    setCustomGroceryNotes('');
     await setCachedItem(GROCERY_KEY, JSON.stringify(nextItems));
+    hapticTap();
+    showToast('Added to list');
+  }
+
+  async function updateGroceryItem(item, updates) {
+    const key = groceryItemKey(item);
+    const nextItems = groceryList.map((groceryItem) => {
+      if (groceryItemKey(groceryItem) !== key) {
+        return groceryItem;
+      }
+      const normalized = normalizeGroceryItem(groceryItem);
+      const nextName = updates.name ?? normalized.name;
+      return {
+        ...normalized,
+        ...updates,
+        category: updates.category || groceryCategory(nextName)
+      };
+    });
+    setGroceryList(nextItems);
+    await setCachedItem(GROCERY_KEY, JSON.stringify(nextItems));
+  }
+
+  async function addMissingIngredientsToGroceryList() {
+    const missingItems = [
+      ...meals.flatMap((meal) => meal.missingIngredients || []),
+      ...(selectedMeal?.missingIngredients || [])
+    ].map((item) => `${item}`.trim().toLowerCase()).filter(Boolean);
+    const existingNames = new Set(groceryList.map((item) => normalizeGroceryItem(item).name));
+    const additions = [...new Set(missingItems)]
+      .filter((name) => !existingNames.has(name))
+      .map((name) => ({
+        id: `missing-${Date.now()}-${name}`,
+        name,
+        quantity: '',
+        notes: 'Missing ingredient',
+        category: groceryCategory(name)
+      }));
+    if (additions.length === 0) {
+      showToast('No missing ingredients to add');
+      return;
+    }
+    const nextItems = [...groceryList, ...additions];
+    setGroceryList(nextItems);
+    await setCachedItem(GROCERY_KEY, JSON.stringify(nextItems));
+    hapticTap();
+    showToast('Missing ingredients added');
+  }
+
+  async function emailGroceryList(targetEmail = userProfile?.email || '') {
+    const normalizedItems = groceryList.map(normalizeGroceryItem);
+    const timestamp = new Date().toLocaleString();
+    const lines = normalizedItems.map((item) => {
+      const checked = groceryChecked[item.id] ? '[x]' : '[ ]';
+      const quantity = item.quantity ? ` • ${item.quantity}` : '';
+      const notes = item.notes ? ` • ${item.notes}` : '';
+      return `${checked} ${item.name}${quantity}${notes}`;
+    });
+    const body = [
+      `FoodFusion Grocery List`,
+      `Generated: ${timestamp}`,
+      '',
+      ...lines
+    ].join('\n');
+    const subject = 'FoodFusion Grocery List';
+    const sendEmail = async (email) => {
+      const url = `mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      const canOpen = await Linking.canOpenURL(url).catch(() => false);
+      if (canOpen) {
+        await Linking.openURL(url);
+      } else {
+        await Share.share({ title: subject, message: `${subject}\n\n${body}` });
+      }
+    };
+    if (targetEmail) {
+      await sendEmail(targetEmail);
+      showToast('Grocery list ready to email');
+      return;
+    }
+    if (Platform.OS === 'ios' && Alert.prompt) {
+      Alert.prompt('Email Grocery List', 'Enter an email address.', [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Send',
+          onPress: (email) => {
+            if (email?.trim()) {
+              sendEmail(email.trim()).catch(() => Share.share({ title: subject, message: `${subject}\n\n${body}` }));
+            }
+          }
+        }
+      ], 'plain-text', '', 'email-address');
+      return;
+    }
+    await Share.share({ title: subject, message: `${subject}\n\n${body}` });
   }
 
   function localShoppingSearch(query) {
@@ -5397,10 +6062,20 @@ function FoodFusionApp() {
   async function generatePlannerGroceryList() {
     const plannedMeals = Object.values(planner).filter(Boolean);
     const missingItems = plannedMeals.flatMap((meal) => meal.missingIngredients || []);
-    const nextItems = [...new Set([...groceryList, ...missingItems])];
+    const existingNames = new Set(groceryList.map((item) => normalizeGroceryItem(item).name));
+    const additions = [...new Set(missingItems.map((item) => `${item}`.trim().toLowerCase()).filter(Boolean))]
+      .filter((name) => !existingNames.has(name))
+      .map((name) => ({
+        id: `planner-${Date.now()}-${name}`,
+        name,
+        quantity: '',
+        notes: 'Meal plan ingredient',
+        category: groceryCategory(name)
+      }));
+    const nextItems = [...groceryList, ...additions];
     setGroceryList(nextItems);
     await setCachedItem(GROCERY_KEY, JSON.stringify(nextItems));
-    setScreen('grocery');
+    setScreen('shopping');
   }
 
   function sendAssistantPrompt(prompt) {
@@ -5438,9 +6113,173 @@ function FoodFusionApp() {
     syncQuietly('saved recipes', () => saveOpenedRecipe(recentMeal));
   }
 
+  async function persistMealHistory(nextHistory, status = 'Updated meal history') {
+    setMealHistory(nextHistory);
+    await updateOfflineCache(setCachedItem(HISTORY_KEY, JSON.stringify(nextHistory)));
+    setLastEatenMealEditStatus(status);
+  }
+
+  function flattenMealsForTracking(entries = mealHistory) {
+    return entries.flatMap((entry) => (entry.meals || []).map((meal, mealIndex) => {
+      const recipeType = recipeTypeForMeal(meal, entry.recipeType || selectedRecipeType);
+      return enhanceRecipeForDisplay({
+        ...meal,
+        entryId: entry.id,
+        mealIndex,
+        entryDate: entry.date,
+        date: meal.date || entry.date,
+        recipeType
+      }, recipeType);
+    }));
+  }
+
+  function startEditEatenMeal(mealRef) {
+    const macros = completeMacros(mealRef.macros || {});
+    setEditingEatenMeal(mealRef);
+    setEatenMealEditForm({
+      title: mealRef.title || '',
+      servingPercent: `${mealRef.servingPercent || 100}`,
+      calories: `${macros.calories}`,
+      protein: `${macros.protein}`,
+      carbs: `${macros.carbs}`,
+      sugar: `${macros.sugar}`,
+      fat: `${macros.fat}`
+    });
+  }
+
+  function updateEatenMealForm(key, value) {
+    if (key === 'servingPercent') {
+      const cleanValue = value.replace(/[^0-9]/g, '');
+      const percent = Number(cleanValue || 0);
+      const baseMacros = completeMacros(editingEatenMeal?.macros || {});
+      const scale = percent > 0 ? percent / 100 : 0;
+      setEatenMealEditForm((current) => ({
+        ...current,
+        servingPercent: cleanValue,
+        calories: `${roundCalories(baseMacros.calories * scale)}`,
+        protein: `${roundGram(baseMacros.protein * scale)}`,
+        carbs: `${roundGram(baseMacros.carbs * scale)}`,
+        sugar: `${roundGram(baseMacros.sugar * scale)}`,
+        fat: `${roundGram(baseMacros.fat * scale)}`
+      }));
+      return;
+    }
+    setEatenMealEditForm((current) => ({
+      ...current,
+      [key]: key === 'title' ? value : value.replace(/[^0-9]/g, '')
+    }));
+  }
+
+  async function saveEatenMealEdit() {
+    if (!editingEatenMeal || !eatenMealEditForm) return;
+    const nextHistory = mealHistory.map((entry) => {
+      if (entry.id !== editingEatenMeal.entryId) return entry;
+      return {
+        ...entry,
+        meals: (entry.meals || []).map((meal, index) => {
+          if (index !== editingEatenMeal.mealIndex) return meal;
+          return enhanceRecipeForDisplay({
+            ...meal,
+            title: eatenMealEditForm.title.trim() || meal.title,
+            servingPercent: Number(eatenMealEditForm.servingPercent || 100),
+            macros: {
+              calories: Number(eatenMealEditForm.calories || meal.macros?.calories || 0),
+              protein: Number(eatenMealEditForm.protein || meal.macros?.protein || 0),
+              carbs: Number(eatenMealEditForm.carbs || meal.macros?.carbs || 0),
+              sugar: Number(eatenMealEditForm.sugar || macroSugarValue(meal.macros || {})),
+              fat: Number(eatenMealEditForm.fat || meal.macros?.fat || 0)
+            }
+          }, recipeTypeForMeal(meal, entry.recipeType || selectedRecipeType));
+        })
+      };
+    });
+    await persistMealHistory(nextHistory, `Edited ${new Date().toLocaleTimeString()}`);
+    setEditingEatenMeal(null);
+    setEatenMealEditForm(null);
+    showToast('Meal updated');
+  }
+
+  async function removeEatenMeal(mealRef) {
+    const nextHistory = mealHistory
+      .map((entry) => entry.id === mealRef.entryId
+        ? { ...entry, meals: (entry.meals || []).filter((_, index) => index !== mealRef.mealIndex) }
+        : entry)
+      .filter((entry) => (entry.meals || []).length > 0);
+    await persistMealHistory(nextHistory, `Removed ${mealRef.title}`);
+  }
+
+  async function addSelectedRecentMealsToToday() {
+    const selectedMeals = recentRecipes.filter((meal) => selectedRecentMealIds.includes(recipeKey(meal, meal.recipeType)));
+    if (selectedMeals.length === 0) {
+      setRecentMealPickerOpen(false);
+      return;
+    }
+    const todayLabel = new Date().toLocaleDateString();
+    const eatenMeals = selectedMeals.map((meal) => enhanceRecipeForDisplay({
+      ...meal,
+      id: `eaten-${Date.now()}-${meal.title}`,
+      date: todayLabel,
+      mode: 'Eaten',
+      servingPercent: 100
+    }, recipeTypeForMeal(meal, selectedRecipeType)));
+    const nextEntry = {
+      id: `eaten-${Date.now()}`,
+      date: todayLabel,
+      mode: 'Eaten',
+      recipeType: selectedRecipeType,
+      personality: 'Logged meal',
+      meals: eatenMeals
+    };
+    const nextHistory = [nextEntry, ...mealHistory].slice(0, 60);
+    await persistMealHistory(nextHistory, `Added ${selectedMeals.length} eaten meal${selectedMeals.length === 1 ? '' : 's'}`);
+    await Promise.all(eatenMeals.map((meal) => saveOpenedRecipe(meal).catch(() => null)));
+    setSelectedRecentMealIds([]);
+    setRecentMealPickerOpen(false);
+    showToast('Meals logged');
+  }
+
+  function confirmClearToday(todayEntryIds = []) {
+    if (todayEntryIds.length === 0) return;
+    Alert.alert('Clear Today', 'Remove all meals logged for today?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Clear',
+        style: 'destructive',
+        onPress: async () => {
+          const nextHistory = mealHistory.filter((entry) => !todayEntryIds.includes(entry.id));
+          await persistMealHistory(nextHistory, 'Cleared today');
+          setLastClearActionStatus(`Cleared today ${new Date().toLocaleTimeString()}`);
+        }
+      }
+    ]);
+  }
+
+  function confirmClearWeek(weekEntryIds = []) {
+    if (weekEntryIds.length === 0) return;
+    Alert.alert('Clear Week', 'Remove meals in the active 7-day tracking window?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Clear',
+        style: 'destructive',
+        onPress: async () => {
+          const nextHistory = mealHistory.filter((entry) => !weekEntryIds.includes(entry.id));
+          await persistMealHistory(nextHistory, 'Cleared week');
+          setLastClearActionStatus(`Cleared week ${new Date().toLocaleTimeString()}`);
+        }
+      }
+    ]);
+  }
+
+  async function updateWeekStartPreference(mode, customDate = weekStartPreference.customDate) {
+    const nextPreference = { mode, customDate: customDate || todayKey() };
+    setWeekStartPreference(nextPreference);
+    await updateOfflineCache(setCachedItem(WEEK_START_KEY, JSON.stringify(nextPreference)));
+    syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ macroWeekStart: nextPreference })));
+  }
+
   function openMeal(meal) {
     const recipeType = recipeTypeForMeal(meal, selectedRecipeType);
-    const nextMeal = { ...meal, recipeType, date: meal.date || new Date().toLocaleDateString() };
+    const nextMeal = enhanceRecipeForDisplay({ ...meal, recipeType, date: meal.date || new Date().toLocaleDateString() }, recipeType);
     setSelectedMeal(nextMeal);
     setRecipeStepIndex(0);
     saveRecentRecipe(nextMeal);
@@ -5603,6 +6442,70 @@ function FoodFusionApp() {
     syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ budgetGoals: nextGoals })));
   }
 
+  function showMacroGoalSavedStatus(message = 'Goals saved') {
+    setMacroGoalUpdateStatus(message);
+    setTimeout(() => {
+      setMacroGoalUpdateStatus((current) => (current === message ? '' : current));
+    }, 2000);
+  }
+
+  async function saveMacroGoalDrafts({ navigateBack = false, touchedKey = null } = {}) {
+    const macroKeys = ['calorieTarget', 'proteinGoal', 'carbsGoal', 'sugarGoal', 'fatGoal'];
+    const nextGoals = { ...budgetGoals };
+    let hasEmptyField = false;
+
+    macroKeys.forEach((key) => {
+      const rawValue = `${macroGoalDrafts[key] ?? ''}`.trim();
+      if (!rawValue) {
+        hasEmptyField = true;
+        return;
+      }
+      const parsed = Number(rawValue);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        nextGoals[key] = `${Math.round(parsed)}`;
+      }
+    });
+
+    if (hasEmptyField) {
+      setMacroGoalError('Enter a number for each goal.');
+      if (touchedKey && !`${macroGoalDrafts[touchedKey] ?? ''}`.trim()) {
+        setMacroGoalDrafts((current) => ({
+          ...current,
+          [touchedKey]: `${budgetGoals[touchedKey] || DEFAULT_MACRO_GOALS[touchedKey]}`
+        }));
+      }
+      return false;
+    }
+
+    setMacroGoalError('');
+    setBudgetGoals(nextGoals);
+    setMacroGoalDrafts({
+      calorieTarget: nextGoals.calorieTarget,
+      proteinGoal: nextGoals.proteinGoal,
+      carbsGoal: nextGoals.carbsGoal,
+      sugarGoal: nextGoals.sugarGoal,
+      fatGoal: nextGoals.fatGoal
+    });
+    await updateOfflineCache(setCachedItem(BUDGET_GOALS_KEY, JSON.stringify(nextGoals)));
+    syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ budgetGoals: nextGoals })));
+    showMacroGoalSavedStatus();
+    if (navigateBack) {
+      setScreen('macroTracker');
+    }
+    return true;
+  }
+
+  async function resetMacroGoals() {
+    const nextGoals = { ...budgetGoals, ...DEFAULT_MACRO_GOALS };
+    setBudgetGoals(nextGoals);
+    setMacroGoalDrafts(DEFAULT_MACRO_GOALS);
+    setMacroGoalError('');
+    await updateOfflineCache(setCachedItem(BUDGET_GOALS_KEY, JSON.stringify(nextGoals)));
+    syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ budgetGoals: nextGoals })));
+    showMacroGoalSavedStatus('Goals reset');
+    showToast('Macro goals reset');
+  }
+
   async function selectMacroLock(lock) {
     setMacroLock(lock);
     await updateOfflineCache(setCachedItem(MACRO_LOCK_KEY, lock));
@@ -5611,9 +6514,10 @@ function FoodFusionApp() {
 
   function generateRestaurantRecipe() {
     const recreatedMeal = recreateRestaurantRecipe(restaurantQuery, servings);
-    setMeals(addProductSignals([recreatedMeal], recreatedMeal.ingredients, activeIngredientStatuses));
-    setSelectedMeal(recreatedMeal);
-    setIngredients(recreatedMeal.ingredients);
+    const enhancedMeal = enhanceRecipeForDisplay(recreatedMeal, recipeTypeForMeal(recreatedMeal, selectedRecipeType));
+    setMeals(addProductSignals([enhancedMeal], enhancedMeal.ingredients, activeIngredientStatuses));
+    setSelectedMeal(enhancedMeal);
+    setIngredients(enhancedMeal.ingredients);
     setRecipeNotice('Restaurant recreation built for home cooking.');
     setScreen('recipe');
   }
@@ -5708,7 +6612,11 @@ function FoodFusionApp() {
 
   async function clearGroceryList() {
     setGroceryList([]);
-    await removeCachedItem(GROCERY_KEY);
+    setGroceryChecked({});
+    await Promise.all([
+      removeCachedItem(GROCERY_KEY),
+      removeCachedItem(GROCERY_CHECKED_KEY)
+    ]);
   }
 
   async function togglePreference(preference) {
@@ -5795,11 +6703,52 @@ function FoodFusionApp() {
     }
   }
 
+  function updateResetFlowField(key, value) {
+    setResetFlow((current) => ({ ...current, [key]: value }));
+    if (authError) {
+      setAuthError('');
+    }
+    if (authMessage) {
+      setAuthMessage('');
+    }
+  }
+
+  function changeResetMethod(method) {
+    setResetFlow({
+      method,
+      step: 'request',
+      code: '',
+      resetToken: '',
+      newPassword: '',
+      confirmPassword: ''
+    });
+    setAuthError('');
+    setAuthMessage('');
+    setPasswordResetDebug((current) => ({
+      ...current,
+      lastResetMethod: method === 'link' ? 'Email Reset Link' : 'Use Reset Code'
+    }));
+  }
+
   function showAuthMode(nextMode) {
     setAuthScreen(nextMode);
     setAuthError('');
     setAuthMessage('');
     setAuthNeedsConfirmation(false);
+    if (nextMode === 'forgotPassword') {
+      setResetFlow({
+        method: 'code',
+        step: 'request',
+        code: '',
+        resetToken: '',
+        newPassword: '',
+        confirmPassword: ''
+      });
+      setPasswordResetDebug((current) => ({
+        ...current,
+        lastResetMethod: 'Use Reset Code'
+      }));
+    }
   }
 
   async function finishAuth(profile) {
@@ -5835,7 +6784,11 @@ function FoodFusionApp() {
         lastAuthError: ''
       }));
       if (supabaseConfigured) {
-        await hydrateSyncedUserData(profile);
+        hydrateSyncedUserData(profile).catch((error) => {
+          const readable = readableAuthError(error);
+          console.warn('[FoodFusion Auth] background hydration failed:', error);
+          setAuthDebug((current) => ({ ...current, lastAuthError: readable }));
+        });
       }
     } catch (error) {
       const readable = readableAuthError(error);
@@ -5846,6 +6799,10 @@ function FoodFusionApp() {
   }
 
   async function handleLogin() {
+    if (loginInFlightRef.current || authLoading) {
+      console.log('[FoodFusion Auth] Login ignored: already signing in');
+      return;
+    }
     const email = authForm.email.trim();
     if (!email) {
       setAuthError('Email is required.');
@@ -5856,21 +6813,30 @@ function FoodFusionApp() {
       return;
     }
 
+    loginInFlightRef.current = true;
+    setAuthLoading(true);
+    const loginNetworkLabel = detectableNetworkLabel();
+    setLastLoginNetworkUsed(loginNetworkLabel);
     try {
       setAuthError('');
       setAuthMessage('Signing in...');
       setAuthDebug((current) => ({ ...current, authState: 'Signing in', lastAuthError: '' }));
-      console.log('[FoodFusion Auth] Login requested:', {
+      console.log('[FoodFusion Auth] Login started', {
         email,
         supabaseConfigured,
         supabaseUrlLoaded: supabaseAuthConfig.supabaseUrlLoaded,
         publishableKeyLoaded: supabaseAuthConfig.publishableKeyLoaded,
         redirectUrlLoaded: supabaseAuthConfig.redirectUrlLoaded,
-        supabaseUrl: supabaseAuthConfig.supabaseUrl
+        supabaseUrl: supabaseAuthConfig.supabaseUrl,
+        network: loginNetworkLabel
       });
       if (supabaseConfigured) {
         const profile = await signInWithSupabase(email, authForm.password);
         await finishAuth(profile);
+        console.log('[FoodFusion Auth] Login success', {
+          userId: profile?.id || null,
+          email: profile?.email || email
+        });
         setAuthMessage('');
         await refreshAuthDebug({ lastAuthError: '' });
         return;
@@ -5879,13 +6845,22 @@ function FoodFusionApp() {
         name: email.split('@')[0] || 'FoodFusion Member',
         email
       });
+      console.log('[FoodFusion Auth] Login success', { userId: 'local', email });
       setAuthMessage('');
     } catch (error) {
       const readable = readableAuthError(error);
-      console.warn('[FoodFusion Auth] Login failed:', error);
+      console.warn('[FoodFusion Auth] Login failed', error);
       setAuthMessage('');
       setAuthError(readable);
+      if (readable === LOGIN_TIMEOUT_MESSAGE || readable.toLowerCase().includes('timed out')) {
+        setLastNetworkTimeoutSource('Supabase login');
+      }
       setAuthDebug((current) => ({ ...current, authState: 'Login failed', lastAuthError: readable }));
+    } finally {
+      loginInFlightRef.current = false;
+      setAuthLoading(false);
+      setAuthMessage((current) => current === 'Signing in...' ? '' : current);
+      console.log('[FoodFusion Auth] Login finished');
     }
   }
 
@@ -5949,10 +6924,7 @@ function FoodFusionApp() {
   }
 
   function handleForgotPassword() {
-    setAuthScreen('forgotPassword');
-    setAuthError('');
-    setAuthMessage('');
-    setAuthNeedsConfirmation(false);
+    showAuthMode('forgotPassword');
   }
 
   async function handleResetPassword() {
@@ -5963,15 +6935,174 @@ function FoodFusionApp() {
     }
 
     try {
+      setAuthLoading(true);
+      setPasswordResetDebug((current) => ({
+        ...current,
+        lastResetMethod: 'Email Reset Link',
+        resetPasswordUpdateStatus: 'Not requested'
+      }));
       if (supabaseConfigured) {
         await resetSupabasePassword(email);
       }
       setAuthError('');
-      setAuthMessage('Password reset instructions have been sent.');
+      setAuthMessage('Password reset link sent. Please check your email.');
+      setPasswordResetDebug((current) => ({
+        ...current,
+        lastResetMethod: 'Email Reset Link',
+        resetCodeSentStatus: 'Email reset link sent'
+      }));
     } catch (error) {
-      const readable = readableAuthError(error);
+      const readable = readablePasswordResetError(error);
       setAuthError(readable);
       setAuthDebug((current) => ({ ...current, lastAuthError: readable }));
+      setPasswordResetDebug((current) => ({
+        ...current,
+        lastResetMethod: 'Email Reset Link',
+        resetCodeSentStatus: readable
+      }));
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleSendResetCode() {
+    const email = authForm.email.trim();
+    if (!email) {
+      setAuthError('Email is required.');
+      return;
+    }
+    try {
+      setAuthLoading(true);
+      setAuthError('');
+      setAuthMessage('Sending reset code...');
+      setPasswordResetDebug((current) => ({
+        ...current,
+        lastResetMethod: 'Use Reset Code',
+        resetCodeSentStatus: 'Sending',
+        resetVerifyStatus: 'Not requested',
+        resetPasswordUpdateStatus: 'Not requested'
+      }));
+      await sendPasswordResetCode(email);
+      setResetFlow((current) => ({ ...current, method: 'code', step: 'verify' }));
+      setAuthMessage('Reset code sent. Please check your email.');
+      setPasswordResetDebug((current) => ({
+        ...current,
+        resetCodeSentStatus: 'Sent'
+      }));
+    } catch (error) {
+      const readable = readablePasswordResetError(error);
+      setAuthMessage('');
+      setAuthError(readable);
+      setPasswordResetDebug((current) => ({
+        ...current,
+        resetCodeSentStatus: readable
+      }));
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleVerifyResetCode() {
+    const email = authForm.email.trim();
+    const code = resetFlow.code.trim();
+    if (!email) {
+      setAuthError('Email is required.');
+      return;
+    }
+    if (code.length !== 6) {
+      setAuthError('Enter the 6-digit reset code.');
+      return;
+    }
+    try {
+      setAuthLoading(true);
+      setAuthError('');
+      setAuthMessage('Verifying code...');
+      setPasswordResetDebug((current) => ({
+        ...current,
+        lastResetMethod: 'Use Reset Code',
+        resetVerifyStatus: 'Verifying'
+      }));
+      const result = await verifyPasswordResetCode(email, code);
+      setResetFlow((current) => ({
+        ...current,
+        step: 'password',
+        resetToken: result.resetToken || ''
+      }));
+      setAuthMessage('Code verified. Enter a new password.');
+      setPasswordResetDebug((current) => ({
+        ...current,
+        resetVerifyStatus: 'Verified'
+      }));
+    } catch (error) {
+      const readable = readablePasswordResetError(error);
+      setAuthMessage('');
+      setAuthError(readable);
+      setPasswordResetDebug((current) => ({
+        ...current,
+        resetVerifyStatus: readable
+      }));
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleUpdatePasswordWithCode() {
+    const email = authForm.email.trim();
+    if (!email) {
+      setAuthError('Email is required.');
+      return;
+    }
+    if (!isStrongPassword(resetFlow.newPassword)) {
+      console.log('[Auth] password validation fail');
+      setAuthError('Password must contain at least 10 characters, including uppercase, lowercase, number, and special character.');
+      return;
+    }
+    console.log('[Auth] password validation pass');
+    if (resetFlow.newPassword !== resetFlow.confirmPassword) {
+      setAuthError('Passwords must match.');
+      return;
+    }
+    try {
+      setAuthLoading(true);
+      setAuthError('');
+      setAuthMessage('Updating password...');
+      setPasswordResetDebug((current) => ({
+        ...current,
+        lastResetMethod: 'Use Reset Code',
+        resetPasswordUpdateStatus: 'Updating'
+      }));
+      await updatePasswordWithResetCode({
+        email,
+        code: resetFlow.code,
+        resetToken: resetFlow.resetToken,
+        password: resetFlow.newPassword
+      });
+      setAuthScreen('login');
+      setResetFlow({
+        method: 'code',
+        step: 'request',
+        code: '',
+        resetToken: '',
+        newPassword: '',
+        confirmPassword: ''
+      });
+      setAuthForm((current) => ({ ...current, password: '', confirmPassword: '' }));
+      setAuthError('');
+      setAuthMessage('Password updated. You can now log in.');
+      setPasswordResetDebug((current) => ({
+        ...current,
+        resetPasswordUpdateStatus: 'Updated'
+      }));
+    } catch (error) {
+      const readable = readablePasswordResetError(error);
+      setAuthMessage('');
+      setAuthError(readable);
+      setPasswordResetDebug((current) => ({
+        ...current,
+        resetPasswordUpdateStatus: readable
+      }));
+    } finally {
+      setAuthLoading(false);
     }
   }
 
@@ -6163,7 +7294,7 @@ function FoodFusionApp() {
   function confirmDeleteAccount() {
     Alert.alert(
       'Delete Account',
-      'This will permanently remove your local account, preferences, favorites, scan history, shopping cart, orders, and subscription status from this device.',
+      'This will permanently remove your local account, preferences, favorites, scan history, grocery list, macro history, and subscription status from this device.',
       [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Delete Account', style: 'destructive', onPress: deleteAccount }
@@ -6324,6 +7455,7 @@ function FoodFusionApp() {
       RECIPE_RATINGS_KEY,
       HOUSEHOLD_KEY,
       BUDGET_GOALS_KEY,
+      WEEK_START_KEY,
       MACRO_LOCK_KEY,
       SOCIAL_KEY,
       NOTIFICATION_PREFERENCES_KEY,
@@ -6615,7 +7747,7 @@ function FoodFusionApp() {
   }
 
   if (!startupComplete || onboardingCompleted === null) {
-    return <SplashScreen />;
+    return <SplashScreen showNetworkHint={startupNetworkHint} />;
   }
 
   if (onboardingCompleted === false) {
@@ -6633,11 +7765,18 @@ function FoodFusionApp() {
         onLogin={handleLogin}
         onSignUp={handleSignUp}
         onResetPassword={handleResetPassword}
+        onSendResetCode={handleSendResetCode}
+        onVerifyResetCode={handleVerifyResetCode}
+        onUpdatePasswordWithCode={handleUpdatePasswordWithCode}
+        resetFlow={resetFlow}
+        onResetFlowChange={updateResetFlowField}
+        onResetMethodChange={changeResetMethod}
         onResendConfirmation={handleResendConfirmation}
         onShowLogin={() => showAuthMode('login')}
         onShowSignUp={() => showAuthMode('signup')}
         onShowForgotPassword={handleForgotPassword}
         needsConfirmation={authNeedsConfirmation}
+        authLoading={authLoading}
       />
     );
   }
@@ -6697,19 +7836,6 @@ function FoodFusionApp() {
                   style={({ pressed }) => [styles.headerIconButton, pressed && styles.pressed]}
                 >
                   <Text style={[styles.headerGearText, { color: flowColors.profile.accent }]}>⚙</Text>
-                </Pressable>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={`Shopping cart, ${cartItemCount} ${cartItemCount === 1 ? 'item' : 'items'}`}
-                  onPress={() => navigateTab('shopping')}
-                  style={({ pressed }) => [styles.headerIconButton, pressed && styles.pressed]}
-                >
-                  <CartIcon accent={flowColors.shopping.accent} />
-                  {cartItemCount > 0 ? (
-                    <View style={styles.cartBadge}>
-                      <Text style={styles.cartBadgeText}>{cartItemCount > 99 ? '99+' : cartItemCount}</Text>
-                    </View>
-                  ) : null}
                 </Pressable>
               </View>
             </View>
@@ -6845,15 +7971,19 @@ function FoodFusionApp() {
           {globalSearchResults.recipes.length > 0 ? (
             <View style={styles.listCard}>
               <Text style={styles.listTitle}>Recipes</Text>
-              {globalSearchResults.recipes.map((meal) => (
-                <Pressable key={recipeKey(meal, recipeTypeForMeal(meal))} onPress={() => openMeal(meal)} style={styles.searchResultRow}>
-                  <View style={styles.searchResultCopy}>
-                    <Text style={styles.shopItemName}>{meal.title}</Text>
-                    <Text style={styles.shopItemMeta}>{recipeTypeForMeal(meal)} • {meal.time}</Text>
-                  </View>
-                  <Text style={styles.collectionArrow}>›</Text>
-                </Pressable>
-              ))}
+              {globalSearchResults.recipes.map((rawMeal) => {
+                const meal = enhanceRecipeForDisplay(rawMeal, recipeTypeForMeal(rawMeal));
+                return (
+                  <Pressable key={recipeKey(meal, recipeTypeForMeal(meal))} onPress={() => openMeal(meal)} style={styles.searchResultRow}>
+                    <View style={styles.searchResultCopy}>
+                      <Text style={styles.shopItemName}>{meal.title}</Text>
+                      {meal.subtitle ? <Text style={styles.shopItemMeta}>{meal.subtitle}</Text> : null}
+                      <Text style={styles.shopItemMeta}>{recipeTypeForMeal(meal)} • {meal.time}</Text>
+                    </View>
+                    <Text style={styles.collectionArrow}>›</Text>
+                  </Pressable>
+                );
+              })}
             </View>
           ) : null}
           {globalSearchResults.ingredients.length > 0 ? (
@@ -7075,6 +8205,7 @@ function FoodFusionApp() {
                   ['Calories', displayedMacroSummary.totals.calories],
                   ['Protein', `${displayedMacroSummary.totals.protein}g`],
                   ['Carbs', `${displayedMacroSummary.totals.carbs}g`],
+                  ['Sugar', `${displayedMacroSummary.totals.sugar}g`],
                   ['Fat', `${displayedMacroSummary.totals.fat}g`]
                 ].map(([label, value]) => (
                   <View key={label} style={styles.macroTotalTile}>
@@ -7104,6 +8235,7 @@ function FoodFusionApp() {
                       <Text style={styles.macroMiniText}>{row.calories} cal</Text>
                       <Text style={styles.macroMiniText}>{row.protein}g P</Text>
                       <Text style={styles.macroMiniText}>{row.carbs}g C</Text>
+                      <Text style={styles.macroMiniText}>{row.sugar}g S</Text>
                       <Text style={styles.macroMiniText}>{row.fat}g F</Text>
                     </View>
                     {row.needsConfirmation ? (
@@ -7252,6 +8384,7 @@ function FoodFusionApp() {
                   </TapScale>
                 </View>
               </View>
+              {meal.subtitle ? <Text style={styles.mealSubtitle}>{meal.subtitle}</Text> : null}
               <View style={styles.mealBadgeRow}>
                 <Text style={[styles.flowBadge, { backgroundColor: recipeTone.tint, borderColor: recipeTone.accent, color: recipeTone.accent }]}>
                   {recipeTypeForMeal(meal, selectedRecipeType)}
@@ -7345,6 +8478,7 @@ function FoodFusionApp() {
           <FlowProgress steps={['Scan', 'Ingredients', 'Recipes']} current={2} tone={recipeTone} />
           <MealPreviewArt title={selectedMeal.title} />
           <Text style={styles.recipeTitle}>{selectedMeal.title}</Text>
+          {selectedMeal.subtitle ? <Text style={styles.recipeSubtitle}>{selectedMeal.subtitle}</Text> : null}
           <View style={styles.recipeMetaRow}>
             <Pill label={recipeTypeForMeal(selectedMeal, selectedRecipeType)} active accent={recipeTone.accent} tint={recipeTone.tint} />
             <Pill label={selectedMeal.time} active accent={recipeTone.accent} tint={recipeTone.tint} />
@@ -7618,7 +8752,7 @@ function FoodFusionApp() {
   }
 
   if (screen === 'favorites') {
-    const visibleFavorites = favorites.filter((meal) => {
+    const visibleFavorites = favorites.map((meal) => enhanceRecipeForDisplay(meal, recipeTypeForMeal(meal))).filter((meal) => {
       const matchesType = favoriteTypeFilter === 'All' || recipeTypeForMeal(meal) === favoriteTypeFilter;
       const matchesFolder = favoriteFolderFilter === 'All' || (meal.folder || 'Favorites') === favoriteFolderFilter;
       return matchesType && matchesFolder;
@@ -7677,6 +8811,7 @@ function FoodFusionApp() {
                   <Text style={styles.favoriteText}>♥</Text>
                 </TapScale>
               </View>
+              {meal.subtitle ? <Text style={styles.mealSubtitle}>{meal.subtitle}</Text> : null}
               <Text style={styles.listMeta}>
                 {[meal.folder || 'Favorites', recipeTypeForMeal(meal), meal.time, meal.macros ? `${meal.macros.protein}g protein` : '', meal.savedAt ? `Saved ${meal.savedAt}` : ''].filter(Boolean).join(' • ')}
               </Text>
@@ -7718,7 +8853,7 @@ function FoodFusionApp() {
     );
   }
 
-  if (screen === 'grocery') {
+  if (false && screen === 'grocery') {
     const groupedGrocery = groceryList.reduce((groups, item) => {
       const category = groceryCategory(item);
       return { ...groups, [category]: [...(groups[category] || []), item] };
@@ -7767,7 +8902,7 @@ function FoodFusionApp() {
     );
   }
 
-  if (screen === 'shoppingLocation') {
+  if (false && screen === 'shoppingLocation') {
     return (
       <Screen toast={toast}>
         <AppHeader eyebrow="Shopping Location" onBack={() => setScreen('home')} accent={flowColors.shopping.accent} />
@@ -7807,7 +8942,7 @@ function FoodFusionApp() {
     );
   }
 
-  if (screen === 'shoppingStores') {
+  if (false && screen === 'shoppingStores') {
     return (
       <Screen toast={toast}>
         <AppHeader eyebrow="Nearby Stores" onBack={() => setScreen('shoppingLocation')} accent={flowColors.shopping.accent} />
@@ -7850,210 +8985,132 @@ function FoodFusionApp() {
     );
   }
 
-  if (screen === 'shopping') {
-    const filteredResults = visibleShoppingResults();
-    const storeFilters = ['All Stores', ...nearbyStores.map((store) => store.name)];
-    const groupedResults = Object.entries(filteredResults.reduce((groups, item) => {
-      const storeName = item.store || item.brand || 'Store';
-      return { ...groups, [storeName]: [...(groups[storeName] || []), item] };
-    }, {}));
+  if (['shopping', 'grocery', 'shoppingLocation', 'shoppingStores', 'shoppingCheckout', 'shoppingTracking', 'orderHistory'].includes(screen)) {
+    const normalizedGrocery = groceryList.map(normalizeGroceryItem);
+    const groupedGrocery = normalizedGrocery.reduce((groups, item) => {
+      const category = item.category || groceryCategory(item.name);
+      return { ...groups, [category]: [...(groups[category] || []), item] };
+    }, {});
+    const boughtCount = normalizedGrocery.filter((item) => groceryChecked[item.id]).length;
+    const missingCount = [...new Set([
+      ...meals.flatMap((meal) => meal.missingIngredients || []),
+      ...(selectedMeal?.missingIngredients || [])
+    ].map((item) => String(item).trim().toLowerCase()).filter(Boolean))].length;
+
     return (
       <Screen toast={toast}>
-        <AppHeader eyebrow="Shop Ingredients" onSettings={() => setScreen('settings')} accent={flowColors.shopping.accent} />
+        <AppHeader
+          eyebrow="Grocery List"
+          onSettings={() => setScreen('settings')}
+          accent={flowColors.shopping.accent}
+        />
         <ScrollView showsVerticalScrollIndicator={false} style={styles.tabScroll} contentContainerStyle={styles.tabScrollContent}>
-          <FlowProgress steps={['Cart', 'Checkout', 'Tracking']} current={0} tone={flowColors.shopping} />
-          <View style={styles.locationSummaryCard}>
-            <View style={styles.storeCardHeader}>
-              <View style={styles.shopItemInfo}>
-                <Text style={styles.listTitle}>{fulfillmentMode} location</Text>
-                <Text style={styles.shopItemMeta}>{shoppingLocation?.address || 'Add a location'}</Text>
-              </View>
-              <Pressable onPress={() => setScreen('shoppingLocation')} style={styles.tinyAction}>
-                <Text style={styles.tinyActionText}>Change</Text>
-              </Pressable>
-            </View>
-            <Pressable onPress={() => setScreen('shoppingStores')} style={styles.orderHistoryButton}>
-              <Text style={[styles.orderHistoryText, { color: flowColors.shopping.accent }]}>Browse Nearby Stores</Text>
-            </Pressable>
-          </View>
           <View style={[styles.shopSearchCard, { borderColor: flowColors.shopping.tint }]}>
-            <Text style={[styles.shopTitle, { color: flowColors.shopping.accent }]}>Search Items</Text>
-            <View style={styles.dislikeInputRow}>
+            <Text style={[styles.shopTitle, { color: flowColors.shopping.accent }]}>List</Text>
+            <Text style={styles.settingsSubtitle}>Build a simple grocery list from recipes or add your own items.</Text>
+            <View style={styles.profileGrid}>
+              {[
+                ['Items', normalizedGrocery.length],
+                ['Bought', boughtCount],
+                ['Missing', missingCount],
+                ['Open', Math.max(0, normalizedGrocery.length - boughtCount)]
+              ].map(([label, value]) => (
+                <View key={label} style={styles.profileStat}>
+                  <Text style={styles.profileStatValue}>{value}</Text>
+                  <Text style={styles.profileStatLabel}>{label}</Text>
+                </View>
+              ))}
+            </View>
+            <View style={styles.groceryInputStack}>
               <TextInput
-                value={shoppingQuery}
-                onChangeText={setShoppingQuery}
-                onSubmitEditing={() => searchShoppingItems()}
-                placeholder="search eggs, berries, chicken..."
+                value={customGroceryItem}
+                onChangeText={setCustomGroceryItem}
+                placeholder="Add item"
                 placeholderTextColor={palette.muted}
                 autoCapitalize="none"
-                style={styles.dislikeInput}
+                style={styles.groceryPrimaryInput}
               />
-              <Pressable onPress={() => searchShoppingItems()} style={styles.addDislikeButton}>
-                <Text style={styles.addDislikeText}>{isShoppingLoading ? '...' : 'Find'}</Text>
-              </Pressable>
+              <View style={styles.groceryInlineInputs}>
+                <TextInput
+                  value={customGroceryQuantity}
+                  onChangeText={setCustomGroceryQuantity}
+                  placeholder="Quantity"
+                  placeholderTextColor={palette.muted}
+                  autoCapitalize="none"
+                  style={styles.groceryEditInput}
+                />
+                <TextInput
+                  value={customGroceryNotes}
+                  onChangeText={setCustomGroceryNotes}
+                  placeholder="Notes"
+                  placeholderTextColor={palette.muted}
+                  autoCapitalize="sentences"
+                  style={styles.groceryEditInput}
+                />
+              </View>
+              <Button accent={flowColors.shopping.accent} onPress={addCustomGroceryItem}>Add Item</Button>
             </View>
-            {recentSearches.some((item) => item.type === 'grocery') ? (
-              <View style={styles.recentSearchWrap}>
-                <Text style={styles.scanOptionsLabel}>Recent Searches</Text>
-                <View style={styles.optionRow}>
-                  {recentSearches.filter((item) => item.type === 'grocery').slice(0, 4).map((item) => (
-                    <Pressable
-                      key={`grocery-${item.query}`}
-                      onPress={() => {
-                        setShoppingQuery(item.query);
-                        searchShoppingItems(item.query);
-                      }}
-                      style={styles.optionChip}
-                    >
-                      <Text style={styles.optionChipText}>{item.query}</Text>
-                    </Pressable>
-                  ))}
-                </View>
-              </View>
-            ) : null}
-            {shoppingNotice ? <Text style={styles.shopNotice}>{shoppingNotice}</Text> : null}
-            <Pressable onPress={() => navigateTab('orderHistory')} style={styles.orderHistoryButton}>
-              <Text style={[styles.orderHistoryText, { color: flowColors.shopping.accent }]}>Order History</Text>
-            </Pressable>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-              <View style={styles.storeFilterRow}>
-                {storeFilters.map((store) => (
-                  <Pressable
-                    key={store}
-                    onPress={() => setShoppingStoreFilter(store)}
-                    style={[
-                      styles.storeChip,
-                      shoppingStoreFilter === store && styles.activeStoreChip,
-                      shoppingStoreFilter === store && { backgroundColor: flowColors.shopping.tint, borderColor: flowColors.shopping.accent }
-                    ]}
-                  >
-                    <Text style={[styles.storeChipText, shoppingStoreFilter === store && styles.activeStoreChipText, shoppingStoreFilter === store && { color: flowColors.shopping.accent }]}>{store}</Text>
-                  </Pressable>
-                ))}
-              </View>
-            </ScrollView>
+            <View style={styles.groceryActionStack}>
+              <CompactButton onPress={addMissingIngredientsToGroceryList} accent={flowColors.shopping.accent}>Add Missing Ingredients</CompactButton>
+              <CompactButton variant="ghost" onPress={() => emailGroceryList()}>Email My Grocery List</CompactButton>
+            </View>
           </View>
 
-          {tabLoading === 'shopping' ? <LoadingState text="Loading shop..." rows={2} tone={flowColors.shopping} /> : null}
-          {isShoppingLoading ? <LoadingState text="Searching groceries..." rows={3} tone={flowColors.shopping} /> : null}
-          {groupedResults.map(([store, items]) => (
-            <View key={store} style={[styles.listCard, { borderColor: flowColors.shopping.tint }]}>
-              <Text style={[styles.listTitle, { color: flowColors.shopping.accent }]}>{store}</Text>
-              <Text style={styles.shopItemMeta}>{nearbyStores.find((item) => item.name === store)?.eta || fulfillmentMode}</Text>
+          {tabLoading === 'shopping' ? <LoadingState text="Loading list..." rows={2} tone={flowColors.shopping} /> : null}
+          {normalizedGrocery.length === 0 ? <EmptyState title="Your list is empty" text="Add items manually or from recipe missing ingredients." tone={flowColors.shopping} symbol="☑" /> : null}
+          {Object.entries(groupedGrocery).map(([category, items]) => (
+            <View key={category} style={[styles.listCard, { borderColor: flowColors.shopping.tint }]}>
+              <View style={styles.demoHeader}>
+                <Text style={styles.listTitle}>{category}</Text>
+                <Text style={styles.demoMeta}>{items.length} items</Text>
+              </View>
               {items.map((item) => (
-                <View key={item.id} style={styles.shopItemRow}>
-                  <View style={styles.productThumb}>
-                    <Text style={styles.productThumbText}>{item.name.slice(0, 1)}</Text>
+                <View key={item.id} style={styles.groceryListItemCard}>
+                  <View style={styles.groceryRowTop}>
+                    <Pressable onPress={() => toggleGroceryChecked(item)} style={[styles.checkBox, groceryChecked[item.id] && styles.qaCheckBoxActive]}>
+                      <Text style={styles.checkBoxText}>{groceryChecked[item.id] ? '✓' : ''}</Text>
+                    </Pressable>
+                    <View style={styles.shopItemInfo}>
+                      <Text style={[styles.groceryText, groceryChecked[item.id] && styles.checkedGroceryText]}>{item.name}</Text>
+                      {(item.quantity || item.notes) ? <Text style={styles.listRowMeta}>{[item.quantity, item.notes].filter(Boolean).join(' • ')}</Text> : null}
+                    </View>
+                    <Pressable onPress={() => deleteGroceryItem(item)} style={styles.tinyAction}>
+                      <Text style={styles.tinyActionText}>Remove</Text>
+                    </Pressable>
                   </View>
-                  <View style={styles.shopItemInfo}>
-                    <Text style={styles.shopItemName}>{item.name}</Text>
-                    <Text style={styles.shopItemMeta}>
-                      {[item.store || item.brand, item.size, item.price, item.eta].filter(Boolean).join(' • ')}
-                    </Text>
+                  <View style={styles.groceryEditRow}>
+                    <TextInput
+                      value={item.quantity}
+                      onChangeText={(value) => updateGroceryItem(item, { quantity: value })}
+                      placeholder="quantity"
+                      placeholderTextColor={palette.muted}
+                      style={styles.groceryEditInput}
+                    />
+                    <TextInput
+                      value={item.notes}
+                      onChangeText={(value) => updateGroceryItem(item, { notes: value })}
+                      placeholder="notes"
+                      placeholderTextColor={palette.muted}
+                      style={styles.groceryEditInput}
+                    />
                   </View>
-                  <TapScale onPress={() => addShoppingItem(item)} style={styles.tinyAction} accessibilityLabel="Add to cart">
-                    <Text style={styles.tinyActionText}>Add</Text>
-                  </TapScale>
                 </View>
               ))}
             </View>
           ))}
-
-          {shoppingSuggestions.length > 0 ? (
-            <View style={styles.listCard}>
-              <Text style={styles.listTitle}>Smart Suggestions</Text>
-              {shoppingSuggestions.map((group) => (
-                <View key={group.title} style={styles.suggestionGroup}>
-                  <Text style={styles.filterLabel}>{group.title}</Text>
-                  {group.products.map((product) => {
-                    const suggestedItem = localShoppingSearch(product.key).find((item) => item.name === product.name) ||
-                      localShoppingSearch(product.key)[0];
-                    return (
-                      <View key={`${group.title}-${product.name}`} style={styles.suggestionRow}>
-                        <View style={styles.shopItemInfo}>
-                          <Text style={styles.shopItemName}>{product.name}</Text>
-                          <Text style={styles.shopItemMeta}>{product.store} • {product.size} • {product.price}</Text>
-                        </View>
-                        <TapScale onPress={() => addShoppingItem(suggestedItem)} style={styles.tinyAction} accessibilityLabel={`Add ${product.name}`}>
-                          <Text style={styles.tinyActionText}>Add</Text>
-                        </TapScale>
-                      </View>
-                    );
-                  })}
-                </View>
-              ))}
+          {normalizedGrocery.length > 0 ? (
+            <View style={styles.groceryActionStack}>
+              <CompactButton variant="ghost" onPress={clearGroceryList}>Clear List</CompactButton>
+              <CompactButton onPress={() => emailGroceryList()} accent={flowColors.shopping.accent}>Email My Grocery List</CompactButton>
             </View>
           ) : null}
-
-          <View style={[styles.listCard, { borderColor: flowColors.shopping.tint }]}>
-            <View style={styles.demoHeader}>
-              <Text style={styles.listTitle}>Cart</Text>
-              <Text style={styles.demoMeta}>{cartItemCount} items</Text>
-            </View>
-            {shoppingCart.length === 0 ? <EmptyState title="Your cart is empty" text="Search ingredients to get started." tone={flowColors.shopping} symbol="+" /> : null}
-            {cartGroups.map((group) => (
-              <View key={group.store} style={styles.cartStoreSection}>
-                <View style={styles.storeCardHeader}>
-                  <Text style={styles.filterLabel}>{group.store}</Text>
-                  <Text style={styles.shopItemMeta}>{formatMoney(group.totals.subtotal)}</Text>
-                </View>
-                {group.items.map((item) => (
-                  <View key={item.id} style={styles.shopItemRow}>
-                    <View style={styles.productThumb}>
-                      <Text style={styles.productThumbText}>{item.name.slice(0, 1)}</Text>
-                    </View>
-                    <View style={styles.shopItemInfo}>
-                      <Text style={styles.shopItemName}>{item.name}</Text>
-                      <Text style={styles.shopItemMeta}>{item.price}</Text>
-                    </View>
-                    <View style={styles.quantityControl}>
-                      <Pressable onPress={() => updateShoppingQuantity(item.id, -1)} style={styles.quantityButton}>
-                        <Text style={styles.quantityText}>-</Text>
-                      </Pressable>
-                      <Text style={styles.quantityValue}>{item.quantity || 1}</Text>
-                      <Pressable onPress={() => updateShoppingQuantity(item.id, 1)} style={styles.quantityButton}>
-                        <Text style={styles.quantityText}>+</Text>
-                      </Pressable>
-                    </View>
-                    <Pressable onPress={() => removeShoppingItem(item.id)} style={styles.tinyAction}>
-                      <Text style={styles.tinyActionText}>Remove</Text>
-                    </Pressable>
-                  </View>
-                ))}
-              </View>
-            ))}
-            {shoppingCart.length > 0 ? (
-              <View style={styles.totalPanel}>
-                <View style={styles.totalRow}>
-                  <Text style={styles.totalLabel}>Subtotal</Text>
-                  <Text style={styles.totalValue}>{formatMoney(cartTotals.subtotal)}</Text>
-                </View>
-                <View style={styles.totalRow}>
-                  <Text style={styles.totalLabel}>Estimated fees</Text>
-                  <Text style={styles.totalValue}>{formatMoney(cartTotals.fees)}</Text>
-                </View>
-                {cartTotals.savings > 0 ? (
-                  <View style={styles.totalRow}>
-                    <Text style={styles.totalLabel}>Savings</Text>
-                    <Text style={styles.totalValue}>-{formatMoney(cartTotals.savings)}</Text>
-                  </View>
-                ) : null}
-                <View style={styles.totalRow}>
-                  <Text style={styles.totalStrong}>Estimated total</Text>
-                  <Text style={styles.totalStrong}>{formatMoney(cartTotals.total)}</Text>
-                </View>
-              </View>
-            ) : null}
-          </View>
-
-          <Button accent={flowColors.shopping.accent} onPress={startShoppingCheckout} disabled={shoppingCart.length === 0}>Checkout</Button>
         </ScrollView>
         <BottomTabs active="shopping" onNavigate={navigateTab} />
       </Screen>
     );
   }
 
-  if (screen === 'shoppingCheckout') {
+  if (false && screen === 'shoppingCheckout') {
     const deliveryEta = primaryNearbyStore?.eta || (fulfillmentMode === 'Delivery' ? primaryStoreMeta.delivery : primaryStoreMeta.pickup);
     return (
       <Screen toast={toast}>
@@ -8185,7 +9242,7 @@ function FoodFusionApp() {
     );
   }
 
-  if (screen === 'shoppingTracking') {
+  if (false && screen === 'shoppingTracking') {
     const order = orderConfirmation || orderHistory[0];
     const statusIndex = orderStatusIndex(order) + trackingPulse * 0;
     const steps = orderTimelineSteps[order?.mode || 'Delivery'];
@@ -8258,7 +9315,7 @@ function FoodFusionApp() {
     );
   }
 
-  if (screen === 'orderHistory') {
+  if (false && screen === 'orderHistory') {
     return (
       <Screen toast={toast}>
         <AppHeader eyebrow="Orders" onSettings={() => setScreen('settings')} accent={flowColors.shopping.accent} />
@@ -8460,9 +9517,10 @@ function FoodFusionApp() {
         protein: sum.protein + (meal.macros?.protein || 24),
         calories: sum.calories + (meal.macros?.calories || 460),
         carbs: sum.carbs + (meal.macros?.carbs || 48),
+        sugar: sum.sugar + macroSugarValue(meal.macros || { carbs: 48 }),
         fat: sum.fat + (meal.macros?.fat || 16)
       }),
-      { protein: 0, calories: 0, carbs: 0, fat: 0 }
+      { protein: 0, calories: 0, carbs: 0, sugar: 0, fat: 0 }
     );
     return (
       <Screen>
@@ -8473,7 +9531,8 @@ function FoodFusionApp() {
               ['Protein', `${planTotals.protein}g`],
               ['Calories', planTotals.calories],
               ['Carbs', `${planTotals.carbs}g`],
-              ['Fats', `${planTotals.fat}g`]
+              ['Sugar', `${planTotals.sugar}g`],
+              ['Fat', `${planTotals.fat}g`]
             ].map(([label, value]) => (
               <View key={label} style={styles.profileStat}>
                 <Text style={styles.profileStatValue}>{value}</Text>
@@ -8675,9 +9734,10 @@ function FoodFusionApp() {
         protein: sum.protein + (meal.macros?.protein || 0),
         calories: sum.calories + (meal.macros?.calories || 0),
         carbs: sum.carbs + (meal.macros?.carbs || 0),
+        sugar: sum.sugar + macroSugarValue(meal.macros || {}),
         fat: sum.fat + (meal.macros?.fat || 0)
       }),
-      { protein: 0, calories: 0, carbs: 0, fat: 0 }
+      { protein: 0, calories: 0, carbs: 0, sugar: 0, fat: 0 }
     );
     return (
       <Screen>
@@ -8688,7 +9748,8 @@ function FoodFusionApp() {
               ['Protein', `${totals.protein}g`],
               ['Calories', totals.calories],
               ['Carbs', `${totals.carbs}g`],
-              ['Fats', `${totals.fat}g`],
+              ['Sugar', `${totals.sugar}g`],
+              ['Fat', `${totals.fat}g`],
               ['Hydration', `${Math.min(100, scanCountToday * 18 + 32)}%`],
               ['Shakes', homeMeals.filter((meal) => meal.type === 'Protein Shakes').length],
               ['Smoothies', homeMeals.filter((meal) => meal.type === 'Smoothies').length],
@@ -8700,6 +9761,322 @@ function FoodFusionApp() {
                 <Text style={styles.profileStatLabel}>{label}</Text>
               </View>
             ))}
+          </View>
+        </ScrollView>
+      </Screen>
+    );
+  }
+
+  if (screen === 'macroTracker') {
+    const todayDateKey = todayKey();
+    const weekWindow = activeMacroWeekWindow(weekStartPreference);
+    const entryDateKey = (entry) => localDateKey(parseAppDate(entry.date));
+    const todayEntries = mealHistory.filter((entry) => entryDateKey(entry) === todayDateKey);
+    const todayMeals = flattenMealsForTracking(todayEntries);
+    const todayTotals = mealMacroTotals(todayMeals);
+    const weeklyEntries = mealHistory.filter((entry) => {
+      const key = entryDateKey(entry);
+      return key >= weekWindow.startKey && key <= weekWindow.endKey;
+    });
+    const weeklyMeals = flattenMealsForTracking(weeklyEntries);
+    const weeklyTotals = mealMacroTotals(weeklyMeals);
+    const todayEntryIds = todayEntries.map((entry) => entry.id);
+    const weekEntryIds = weeklyEntries.map((entry) => entry.id);
+    const calorieTarget = Number(budgetGoals.calorieTarget || 2200);
+    const proteinTarget = Number(budgetGoals.proteinGoal || 160);
+    const carbsTarget = Number(budgetGoals.carbsGoal || 260);
+    const sugarTarget = Number(budgetGoals.sugarGoal || 50);
+    const fatTarget = Number(budgetGoals.fatGoal || 75);
+    const progressItems = [
+      ['Calories', todayTotals.calories, calorieTarget, flowColors.fusion.accent],
+      ['Protein', todayTotals.protein, proteinTarget, flowColors.Meals.accent],
+      ['Carbs', todayTotals.carbs, carbsTarget, flowColors.Drinks.accent],
+      ['Sugar', todayTotals.sugar, sugarTarget, palette.gold],
+      ['Fat', todayTotals.fat, fatTarget, flowColors['Protein Shakes'].accent]
+    ];
+
+    return (
+      <Screen>
+        <AppHeader eyebrow="Macro Tracker" onSettings={() => setScreen('settings')} accent={flowColors.fusion.accent} />
+        <ScrollView showsVerticalScrollIndicator={false} style={styles.tabScroll} contentContainerStyle={styles.tabScrollContent}>
+          <View style={[styles.listCard, { borderColor: flowColors.fusion.tint }]}>
+            <Text style={[styles.shopTitle, { color: flowColors.fusion.accent }]}>Today macros</Text>
+            <View style={styles.profileGrid}>
+              {[
+                ['Calories', todayTotals.calories],
+                ['Protein', `${todayTotals.protein}g`],
+                ['Carbs', `${todayTotals.carbs}g`],
+                ['Sugar', `${todayTotals.sugar}g`],
+                ['Fat', `${todayTotals.fat}g`]
+              ].map(([label, value]) => (
+                <View key={label} style={styles.profileStat}>
+                  <Text style={styles.profileStatValue}>{value}</Text>
+                  <Text style={styles.profileStatLabel}>{label}</Text>
+                </View>
+              ))}
+            </View>
+          </View>
+
+          <View style={[styles.listCard, { borderColor: flowColors.fusion.tint }]}>
+            <View style={styles.demoHeader}>
+              <View>
+                <Text style={styles.listTitle}>Week Start</Text>
+                <Text style={styles.listMeta}>Tracking week: {weekWindow.label}</Text>
+              </View>
+            </View>
+            <View style={styles.optionRow}>
+              {['Today', 'Sunday', 'Monday', 'Custom date'].map((mode) => (
+                <Pressable
+                  key={mode}
+                  onPress={() => updateWeekStartPreference(mode)}
+                  style={[styles.optionChip, weekStartPreference.mode === mode && styles.activeOptionChip]}
+                >
+                  <Text style={[styles.optionChipText, weekStartPreference.mode === mode && styles.activeOptionChipText]}>{mode}</Text>
+                </Pressable>
+              ))}
+            </View>
+            {weekStartPreference.mode === 'Custom date' ? (
+              <TextInput
+                value={weekStartPreference.customDate}
+                onChangeText={(value) => updateWeekStartPreference('Custom date', value)}
+                placeholder="YYYY-MM-DD"
+                placeholderTextColor={palette.muted}
+                style={styles.groceryPrimaryInput}
+              />
+            ) : null}
+          </View>
+
+          <View style={[styles.listCard, { borderColor: flowColors.fusion.tint }]}>
+            <View style={styles.macroProgressHeader}>
+              <Text
+                numberOfLines={1}
+                adjustsFontSizeToFit
+                minimumFontScale={0.82}
+                style={styles.macroProgressTitle}
+              >
+                Macro Progress
+              </Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Edit macro goals"
+                onPress={() => setScreen('macroGoals')}
+                style={({ pressed }) => [
+                  styles.editGoalsButton,
+                  { borderColor: flowColors.fusion.accent },
+                  pressed && styles.pressed
+                ]}
+              >
+                <Text
+                  numberOfLines={1}
+                  adjustsFontSizeToFit
+                  minimumFontScale={0.82}
+                  style={[styles.editGoalsButtonText, { color: flowColors.fusion.accent }]}
+                >
+                  Edit Goals
+                </Text>
+              </Pressable>
+            </View>
+            {progressItems.map(([label, value, target, color]) => {
+              const progress = Math.min(100, Math.round((Number(value || 0) / Number(target || 1)) * 100));
+              return (
+                <View key={label} style={styles.macroProgressRow}>
+                  <View style={styles.storeCardHeader}>
+                    <Text style={styles.totalLabel}>{label}</Text>
+                    <Text style={styles.totalValue}>{value}{label === 'Calories' ? '' : 'g'} / {target}{label === 'Calories' ? '' : 'g'}</Text>
+                  </View>
+                  <View style={styles.macroProgressTrack}>
+                    <View style={[styles.macroProgressFill, { width: `${progress}%`, backgroundColor: color }]} />
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+
+          <View style={[styles.listCard, { borderColor: flowColors.fusion.tint }]}>
+            <Text style={styles.listTitle}>Weekly macros</Text>
+            <View style={styles.profileGrid}>
+              {[
+                ['Calories', weeklyTotals.calories],
+                ['Protein', `${weeklyTotals.protein}g`],
+                ['Carbs', `${weeklyTotals.carbs}g`],
+                ['Sugar', `${weeklyTotals.sugar}g`],
+                ['Fat', `${weeklyTotals.fat}g`]
+              ].map(([label, value]) => (
+                <View key={label} style={styles.profileStat}>
+                  <Text style={styles.profileStatValue}>{value}</Text>
+                  <Text style={styles.profileStatLabel}>{label}</Text>
+                </View>
+              ))}
+            </View>
+          </View>
+
+          <View style={styles.listCard}>
+            <View style={styles.demoHeader}>
+              <Text style={styles.listTitle}>Meals eaten today</Text>
+              <Text style={styles.demoMeta}>{todayMeals.length} meals</Text>
+            </View>
+            <View style={styles.feedbackRow}>
+              <CompactButton onPress={() => setRecentMealPickerOpen(!recentMealPickerOpen)} accent={flowColors.fusion.accent}>Add from Recents</CompactButton>
+              <CompactButton variant="ghost" onPress={() => confirmClearToday(todayEntryIds)}>Clear Today</CompactButton>
+            </View>
+            {recentMealPickerOpen ? (
+              <View style={styles.inlinePickerCard}>
+                <Text style={styles.settingsSubtitle}>Select one or more recent meals.</Text>
+                {recentRecipes.slice(0, 8).map((meal) => {
+                  const key = recipeKey(meal, meal.recipeType);
+                  const selected = selectedRecentMealIds.includes(key);
+                  return (
+                    <Pressable
+                      key={`recent-picker-${key}`}
+                      onPress={() => setSelectedRecentMealIds((current) =>
+                        selected ? current.filter((item) => item !== key) : [...current, key]
+                      )}
+                      style={[styles.pickerMealRow, selected && { borderColor: flowColors.fusion.accent, backgroundColor: flowColors.fusion.tint }]}
+                    >
+                      <Text style={styles.searchResultTitle}>{meal.title}</Text>
+                      <Text style={styles.searchResultMeta}>{meal.macros?.calories || 0} cal • {meal.macros?.protein || 0}g protein</Text>
+                    </Pressable>
+                  );
+                })}
+                <View style={styles.feedbackRow}>
+                  <CompactButton onPress={addSelectedRecentMealsToToday} accent={flowColors.fusion.accent}>Add Selected</CompactButton>
+                  <CompactButton variant="ghost" onPress={() => {
+                    setSelectedRecentMealIds([]);
+                    setRecentMealPickerOpen(false);
+                  }}>Cancel</CompactButton>
+                </View>
+              </View>
+            ) : null}
+            {todayMeals.length === 0 ? <EmptyState title="No meals logged today yet." text="Add a meal from Recents to start tracking." tone={flowColors.fusion} symbol="▥" /> : null}
+            {todayMeals.map((meal) => (
+              <View key={`${meal.entryId}-${meal.mealIndex}-today`} style={styles.searchResultRow}>
+                <View style={styles.searchResultText}>
+                  <Text style={styles.searchResultTitle}>{meal.title}</Text>
+                  {meal.subtitle ? <Text style={styles.searchResultMeta}>{meal.subtitle}</Text> : null}
+                  <Text style={styles.searchResultMeta}>
+                    {`${meal.macros?.calories || 0} cal • ${meal.macros?.protein || 0}g protein • ${meal.macros?.carbs || 0}g carbs • ${macroSugarValue(meal.macros || {})}g sugar • ${meal.macros?.fat || 0}g fat`}
+                  </Text>
+                </View>
+                <View style={styles.eatenMealActions}>
+                  <Pressable onPress={() => startEditEatenMeal(meal)} style={styles.tinyAction}>
+                    <Text style={styles.tinyActionText}>Edit</Text>
+                  </Pressable>
+                  <Pressable onPress={() => removeEatenMeal(meal)} style={styles.tinyAction}>
+                    <Text style={styles.tinyActionText}>Remove</Text>
+                  </Pressable>
+                </View>
+              </View>
+            ))}
+          </View>
+
+          {editingEatenMeal && eatenMealEditForm ? (
+            <View style={[styles.listCard, { borderColor: flowColors.fusion.tint }]}>
+              <Text style={styles.listTitle}>Edit Meal</Text>
+              {[
+                ['title', 'Meal name'],
+                ['servingPercent', 'Serving %'],
+                ['calories', 'Calories'],
+                ['protein', 'Protein'],
+                ['carbs', 'Carbs'],
+                ['sugar', 'Sugar'],
+                ['fat', 'Fat']
+              ].map(([key, label]) => (
+                <View key={key} style={styles.macroGoalRow}>
+                  <Text style={styles.totalLabel}>{label}</Text>
+                  <TextInput
+                    value={eatenMealEditForm[key]}
+                    onChangeText={(value) => updateEatenMealForm(key, value)}
+                    keyboardType={key === 'title' ? 'default' : 'number-pad'}
+                    placeholder={label}
+                    placeholderTextColor={palette.muted}
+                    selectTextOnFocus
+                    style={key === 'title' ? styles.eatenMealNameInput : styles.macroGoalInput}
+                  />
+                </View>
+              ))}
+              <View style={styles.feedbackRow}>
+                <CompactButton onPress={saveEatenMealEdit} accent={flowColors.fusion.accent}>Save Meal</CompactButton>
+                <CompactButton variant="ghost" onPress={() => {
+                  setEditingEatenMeal(null);
+                  setEatenMealEditForm(null);
+                }}>Cancel</CompactButton>
+              </View>
+            </View>
+          ) : null}
+
+          <View style={styles.listCard}>
+            <View style={styles.demoHeader}>
+              <Text style={styles.listTitle}>Weekly Meals</Text>
+              <Text style={styles.demoMeta}>{weeklyMeals.length} meals</Text>
+            </View>
+            <View style={styles.feedbackRow}>
+              <CompactButton variant="ghost" onPress={() => updateWeekStartPreference('Custom date')}>Edit Week</CompactButton>
+              <CompactButton variant="ghost" onPress={() => confirmClearWeek(weekEntryIds)}>Clear Week</CompactButton>
+            </View>
+            {weeklyMeals.length === 0 ? <EmptyState title="No meals in this tracking week." text="Add a meal from Recents to start tracking." tone={flowColors.fusion} symbol="▥" /> : null}
+            {weeklyMeals.map((meal) => (
+              <View key={`${meal.entryId}-${meal.mealIndex}-week`} style={styles.searchResultRow}>
+                <View style={styles.searchResultText}>
+                  <Text style={styles.searchResultTitle}>{meal.title}</Text>
+                  <Text style={styles.searchResultMeta}>{dateDisplay(meal.entryDate)} • {meal.macros?.calories || 0} cal • {meal.macros?.protein || 0}g protein</Text>
+                </View>
+                <View style={styles.eatenMealActions}>
+                  <Pressable onPress={() => startEditEatenMeal(meal)} style={styles.tinyAction}>
+                    <Text style={styles.tinyActionText}>Edit</Text>
+                  </Pressable>
+                  <Pressable onPress={() => removeEatenMeal(meal)} style={styles.tinyAction}>
+                    <Text style={styles.tinyActionText}>Remove</Text>
+                  </Pressable>
+                </View>
+              </View>
+            ))}
+          </View>
+        </ScrollView>
+        <BottomTabs active="macroTracker" onNavigate={navigateTab} />
+      </Screen>
+    );
+  }
+
+  if (screen === 'macroGoals') {
+    const goalFields = [
+      ['calorieTarget', 'Calories', '2200'],
+      ['proteinGoal', 'Protein', '160'],
+      ['carbsGoal', 'Carbs', '260'],
+      ['sugarGoal', 'Sugar', '50'],
+      ['fatGoal', 'Fat', '75']
+    ];
+
+    return (
+      <Screen toast={toast}>
+        <AppHeader eyebrow="Edit Goals" onBack={() => setScreen('macroTracker')} accent={flowColors.fusion.accent} />
+        <ScrollView showsVerticalScrollIndicator={false} style={styles.tabScroll} contentContainerStyle={styles.tabScrollContent}>
+          <View style={[styles.listCard, { borderColor: flowColors.fusion.tint }]}>
+            <Text style={styles.settingsTitle}>Daily macro goals</Text>
+            <Text style={styles.settingsSubtitle}>Set targets for the Macro Tracker. Changes update progress immediately.</Text>
+            {goalFields.map(([key, label, fallback]) => (
+              <View key={key} style={styles.macroGoalRow}>
+                <Text style={styles.totalLabel}>{label}</Text>
+                <TextInput
+                  value={`${macroGoalDrafts[key] ?? ''}`}
+                  onChangeText={(value) => {
+                    setMacroGoalError('');
+                    setMacroGoalDrafts((current) => ({ ...current, [key]: value.replace(/[^0-9]/g, '') }));
+                  }}
+                  onBlur={() => saveMacroGoalDrafts({ touchedKey: key })}
+                  keyboardType="number-pad"
+                  placeholder={fallback}
+                  placeholderTextColor={palette.muted}
+                  selectTextOnFocus
+                  style={styles.macroGoalInput}
+                />
+              </View>
+            ))}
+            <View style={styles.groceryActionStack}>
+              <CompactButton onPress={() => saveMacroGoalDrafts({ navigateBack: true })} accent={flowColors.fusion.accent}>Done</CompactButton>
+              <CompactButton variant="ghost" onPress={resetMacroGoals}>Reset to Default</CompactButton>
+            </View>
+            {macroGoalError ? <Text style={styles.macroGoalError}>{macroGoalError}</Text> : null}
+            {macroGoalUpdateStatus ? <Text style={styles.macroGoalStatus}>{macroGoalUpdateStatus}</Text> : null}
           </View>
         </ScrollView>
       </Screen>
@@ -8782,13 +10159,10 @@ function FoodFusionApp() {
           </View>
 
           <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>Shopping Connection</Text>
-            <Text style={styles.settingsSubtitle}>{shoppingConnectionStatus}</Text>
-            <Text style={styles.legalText}>
-              {shoppingLocation?.address ? `${fulfillmentMode} location: ${shoppingLocation.address}` : 'Add a location in Shop to browse store options.'}
-            </Text>
-            <Button variant="ghost" accent={flowColors.shopping.accent} onPress={() => setScreen('shoppingLocation')}>
-              {shoppingLocation?.address ? 'Update Shopping Location' : 'Add Shopping Location'}
+            <Text style={styles.settingsTitle}>Grocery List</Text>
+            <Text style={styles.settingsSubtitle}>Manage recipe ingredients, pantry needs, and checked-off items.</Text>
+            <Button variant="ghost" accent={flowColors.shopping.accent} onPress={() => setScreen('shopping')}>
+              Open List
             </Button>
           </View>
 
@@ -8798,7 +10172,7 @@ function FoodFusionApp() {
             {[
               ['recipeIdeas', 'Recipe ideas'],
               ['groceryReminders', 'Grocery reminders'],
-              ['orderUpdates', 'Order updates'],
+              ['orderUpdates', 'List updates'],
               ['fusionUpdates', 'Fusion+ updates']
             ].map(([key, label]) => (
               <Pressable key={key} onPress={() => toggleNotificationPreference(key)} style={styles.settingsToggleRow}>
@@ -8959,13 +10333,13 @@ function FoodFusionApp() {
             <Text style={styles.settingsTitle}>Privacy Policy</Text>
             <Text style={styles.settingsSubtitle}>Your choices and account information are handled with care.</Text>
             <Text style={styles.legalSectionTitle}>What Data We Collect</Text>
-            <Text style={styles.legalText}>FoodFusion AI syncs account details, preferences, favorites, saved recipes, structured scan history, shopping location, orders, and subscription status to your account when signed in. This device retains an offline cache for reliable access.</Text>
+            <Text style={styles.legalText}>FoodFusion AI syncs account details, preferences, favorites, saved recipes, structured scan history, grocery list items, macro tracking activity, and subscription status to your account when signed in. This device retains an offline cache for reliable access.</Text>
             <Text style={styles.legalSectionTitle}>How Photos Are Used</Text>
             <Text style={styles.legalText}>Photos are used to analyze ingredients and generate recipe suggestions.</Text>
             <Text style={styles.legalSectionTitle}>Recipe and Nutrition Data</Text>
             <Text style={styles.legalText}>Saved recipes, ingredient selections, and nutrition estimates support recommendations and your saved cooking activity.</Text>
-            <Text style={styles.legalSectionTitle}>Shopping and Order Data</Text>
-            <Text style={styles.legalText}>Your saved shopping location, cart items, and placed orders support store discovery, checkout, order history, and tracking. Your shopping location is shared with a connected shopping provider only when you use shopping features.</Text>
+            <Text style={styles.legalSectionTitle}>Grocery List and Macro Data</Text>
+            <Text style={styles.legalText}>Your grocery list items, checked status, quantities, notes, and macro estimates support list organization and nutrition tracking.</Text>
             <Text style={styles.legalSectionTitle}>Account Data</Text>
             <Text style={styles.legalText}>You may log out or delete your account and local app data at any time in Settings.</Text>
             <Text style={styles.legalSectionTitle}>Contact and Support</Text>
@@ -8983,17 +10357,17 @@ function FoodFusionApp() {
         <ScrollView showsVerticalScrollIndicator={false}>
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Terms of Service</Text>
-            <Text style={styles.settingsSubtitle}>FoodFusion AI provides ingredient scanning, recipe suggestions, shopping organization, and Fusion+ access.</Text>
+            <Text style={styles.settingsSubtitle}>FoodFusion AI provides ingredient scanning, recipe suggestions, grocery lists, macro tracking, and Fusion+ access.</Text>
             <Text style={styles.legalSectionTitle}>App Usage Terms</Text>
-            <Text style={styles.legalText}>Review ingredients, allergens, cooking temperatures, purchases, and subscription selections before acting on suggestions.</Text>
+            <Text style={styles.legalText}>Review ingredients, allergens, cooking temperatures, nutrition estimates, and subscription selections before acting on suggestions.</Text>
             <Text style={styles.legalSectionTitle}>Subscription Terms</Text>
-            <Text style={styles.legalText}>Fusion+ plan selection and account management are available in Settings. Plan terms and renewal details presented at checkout apply to your selection.</Text>
+            <Text style={styles.legalText}>Fusion+ plan selection and account management are available in Settings. Plan terms and renewal details apply to your selection.</Text>
             <Text style={styles.legalSectionTitle}>Nutrition Disclaimer</Text>
             <Text style={styles.legalText}>Recipe, macro, and calorie estimates are informational only and are not medical advice.</Text>
-            <Text style={styles.legalSectionTitle}>Shopping Integration Disclaimer</Text>
-            <Text style={styles.legalText}>Product availability, pricing, fulfillment times, and order status may vary by participating shopping provider and store.</Text>
+            <Text style={styles.legalSectionTitle}>Grocery List Disclaimer</Text>
+            <Text style={styles.legalText}>Grocery lists are planning tools. Review quantities, brands, allergens, and availability before buying items.</Text>
             <Text style={styles.legalSectionTitle}>Limitation of Liability</Text>
-            <Text style={styles.legalText}>To the fullest extent permitted by law, you are responsible for reviewing recipes, allergens, purchases, and dietary choices before use.</Text>
+            <Text style={styles.legalText}>To the fullest extent permitted by law, you are responsible for reviewing recipes, allergens, nutrition, and dietary choices before use.</Text>
             <Text style={styles.legalSectionTitle}>Support</Text>
             <Text style={styles.legalText}>For account or product support, contact {SUPPORT_EMAIL}.</Text>
           </View>
@@ -9019,6 +10393,17 @@ function FoodFusionApp() {
   }
 
   if (screen === 'launchChecklist') {
+    const qaWeekWindow = activeMacroWeekWindow(weekStartPreference);
+    const qaEntryDateKey = (entry) => localDateKey(parseAppDate(entry.date));
+    const qaTodayMeals = flattenMealsForTracking(mealHistory.filter((entry) => qaEntryDateKey(entry) === todayKey()));
+    const qaWeeklyMeals = flattenMealsForTracking(mealHistory.filter((entry) => {
+      const key = qaEntryDateKey(entry);
+      return key >= qaWeekWindow.startKey && key <= qaWeekWindow.endKey;
+    }));
+    const qaDailySugarTotal = qaTodayMeals.reduce((sum, meal) => sum + macroSugarValue(meal.macros || {}), 0);
+    const qaWeeklySugarTotal = qaWeeklyMeals.reduce((sum, meal) => sum + macroSugarValue(meal.macros || {}), 0);
+    const qaSugarGoal = Number(budgetGoals.sugarGoal || DEFAULT_MACRO_GOALS.sugarGoal);
+    const qaSugarProgress = Math.min(100, Math.round((qaDailySugarTotal / Math.max(1, qaSugarGoal)) * 100));
     return (
       <Screen>
         <AppHeader eyebrow="QA Checklist" onBack={() => setScreen('settings')} accent={flowColors.profile.accent} />
@@ -9033,17 +10418,36 @@ function FoodFusionApp() {
               ['FOOD_SCAN_ENDPOINT value', FOOD_SCAN_ENDPOINT || 'Missing'],
               ['MCP endpoint value', RECIPE_MCP_ENDPOINT || 'Missing'],
               ['Current AI mode', aiScanMode],
+              ['Last network timeout source', lastNetworkTimeoutSource],
+              ['Last login network used', lastLoginNetworkUsed],
               ['Development bridge', scanEndpointIsDevelopment ? 'In use' : 'Not in use'],
               ['Recipe MCP endpoint used', recipeMcpDebug.endpointUsed || RECIPE_MCP_ENDPOINT || 'Missing'],
               ['Recipe MCP mode', recipeMcpDebug.mode || 'hosted'],
               ['Last MCP error', recipeMcpDebug.lastError || 'None'],
               ['Last MCP response status', recipeMcpDebug.lastStatus || 'None'],
               ['Recipe source used', recipeMcpDebug.sourceUsed || 'hosted'],
-              ['Store lookup mode', storeLookupDebug.mode],
-              ['Location permission status', storeLookupDebug.permissionStatus || locationPermissionStatus],
-              ['Last GPS coordinates', storeLookupDebug.currentCoordinates || 'None'],
-              ['Store count returned', `${storeLookupDebug.count}`],
-              ['Last store lookup error', storeLookupDebug.error || 'None'],
+              ['Grocery list items', `${groceryList.length}`],
+              ['Grocery checked items', `${Object.values(groceryChecked).filter(Boolean).length}`],
+              ['Macro tracker', 'Enabled'],
+              ['Calories goal', `${budgetGoals.calorieTarget || DEFAULT_MACRO_GOALS.calorieTarget}`],
+              ['Protein goal', `${budgetGoals.proteinGoal || DEFAULT_MACRO_GOALS.proteinGoal}g`],
+              ['Carbs goal', `${budgetGoals.carbsGoal || DEFAULT_MACRO_GOALS.carbsGoal}g`],
+              ['Sugar goal', `${budgetGoals.sugarGoal || DEFAULT_MACRO_GOALS.sugarGoal}g`],
+              ['Fat goal', `${budgetGoals.fatGoal || DEFAULT_MACRO_GOALS.fatGoal}g`],
+              ['Last macro goal update status', macroGoalUpdateStatus],
+              ['Daily sugar total', `${qaDailySugarTotal}g`],
+              ['Weekly sugar total', `${qaWeeklySugarTotal}g`],
+              ['Sugar progress', `${qaSugarProgress}%`],
+              ['Eaten meals today count', `${qaTodayMeals.length}`],
+              ['Active week start date', qaWeekWindow.startKey],
+              ['Active week end date', qaWeekWindow.endKey],
+              ['Weekly eaten meal count', `${qaWeeklyMeals.length}`],
+              ['Last eaten meal edit status', lastEatenMealEditStatus],
+              ['Last clear action status', lastClearActionStatus],
+              ['originalRecipeName', recipeNamingSample?.originalRecipeName || 'None'],
+              ['cleanedRecipeName', recipeNamingSample?.cleanedRecipeName || 'None'],
+              ['namingStyleUsed', recipeNamingSample?.namingStyleUsed || 'None'],
+              ['subtitleGenerated', recipeNamingSample?.subtitle || 'None'],
               ['Hosted macro endpoint used', macroDebug.endpointUsed || 'Not requested'],
               ['Macro source used', macroDebug.source],
               ['Macro lookup status', macroDebug.lookupStatus || 'Not requested'],
@@ -9077,7 +10481,11 @@ function FoodFusionApp() {
               ['autoRefreshToken', authDebug.autoRefreshToken ? 'true' : 'false'],
               ['Session user ID', authDebug.sessionUserId || 'None'],
               ['Session email', authDebug.sessionEmail || 'None'],
-              ['Last auth error', authDebug.lastAuthError || 'None']
+              ['Last auth error', authDebug.lastAuthError || 'None'],
+              ['Last reset method', passwordResetDebug.lastResetMethod],
+              ['Reset code sent status', passwordResetDebug.resetCodeSentStatus],
+              ['Reset verify status', passwordResetDebug.resetVerifyStatus],
+              ['Reset password update status', passwordResetDebug.resetPasswordUpdateStatus]
             ].map(([label, value]) => (
               <View key={label} style={styles.launchRow}>
                 <Text style={styles.launchLabel}>{label}</Text>
@@ -9412,6 +10820,15 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     marginTop: 8
   },
+  splashNetworkHint: {
+    color: palette.muted,
+    fontSize: 13,
+    fontWeight: '800',
+    lineHeight: 19,
+    marginTop: 18,
+    maxWidth: 280,
+    textAlign: 'center'
+  },
   safe: {
     flex: 1,
     backgroundColor: palette.background
@@ -9590,6 +11007,42 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     lineHeight: 18,
     marginBottom: 2
+  },
+  resetMethodRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 10
+  },
+  resetMethodButton: {
+    alignItems: 'center',
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 999,
+    borderWidth: 1,
+    flex: 1,
+    minHeight: 42,
+    justifyContent: 'center',
+    paddingHorizontal: 10
+  },
+  resetMethodButtonActive: {
+    backgroundColor: palette.greenDeep,
+    borderColor: palette.green
+  },
+  resetMethodText: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '900',
+    textAlign: 'center'
+  },
+  resetMethodTextActive: {
+    color: palette.cream
+  },
+  resetHelper: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '700',
+    lineHeight: 17,
+    marginBottom: 12
   },
   authSwitch: {
     alignItems: 'center',
@@ -10260,6 +11713,26 @@ const styles = StyleSheet.create({
   searchResultCopy: {
     flex: 1
   },
+  inlinePickerCard: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 18,
+    borderWidth: 1,
+    gap: 10,
+    marginTop: 12,
+    padding: 12
+  },
+  pickerMealRow: {
+    backgroundColor: palette.card,
+    borderColor: palette.line,
+    borderRadius: 14,
+    borderWidth: 1,
+    padding: 12
+  },
+  eatenMealActions: {
+    alignItems: 'flex-end',
+    gap: 8
+  },
   moodCard: {
     backgroundColor: palette.card,
     borderColor: palette.line,
@@ -10520,9 +11993,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: palette.green,
     borderRadius: 999,
-    flex: 1,
+    flexGrow: 1,
+    flexShrink: 1,
     minHeight: 48,
-    paddingVertical: 15
+    minWidth: 132,
+    paddingHorizontal: 12,
+    paddingVertical: 14
   },
   buttonText: {
     color: palette.black,
@@ -11284,6 +12760,14 @@ const styles = StyleSheet.create({
     fontSize: 22,
     fontWeight: '900'
   },
+  mealSubtitle: {
+    color: palette.muted,
+    fontSize: 14,
+    fontWeight: '700',
+    lineHeight: 20,
+    marginBottom: 10,
+    marginTop: 4
+  },
   mealTime: {
     color: palette.green,
     fontSize: 14,
@@ -11519,6 +13003,13 @@ const styles = StyleSheet.create({
     color: palette.cream,
     fontSize: 34,
     fontWeight: '900',
+    marginBottom: 8
+  },
+  recipeSubtitle: {
+    color: palette.muted,
+    fontSize: 16,
+    fontWeight: '700',
+    lineHeight: 23,
     marginBottom: 16
   },
   recipeMetaRow: {
@@ -12328,6 +13819,152 @@ const styles = StyleSheet.create({
   checkedGroceryText: {
     color: palette.muted,
     textDecorationLine: 'line-through'
+  },
+  groceryListItemCard: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 16,
+    borderWidth: 1,
+    marginBottom: 10,
+    padding: 12
+  },
+  groceryRowTop: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 10
+  },
+  groceryEditRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10
+  },
+  groceryInputStack: {
+    gap: 10,
+    marginBottom: 14
+  },
+  groceryInlineInputs: {
+    flexDirection: 'row',
+    gap: 8
+  },
+  groceryPrimaryInput: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 16,
+    borderWidth: 1,
+    color: palette.cream,
+    fontSize: 15,
+    fontWeight: '800',
+    minHeight: 48,
+    paddingHorizontal: 14
+  },
+  groceryActionStack: {
+    gap: 10,
+    marginTop: 2
+  },
+  groceryEditInput: {
+    backgroundColor: palette.card,
+    borderColor: palette.line,
+    borderRadius: 12,
+    borderWidth: 1,
+    color: palette.cream,
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '800',
+    minHeight: 38,
+    paddingHorizontal: 10
+  },
+  macroProgressRow: {
+    marginBottom: 14
+  },
+  macroProgressHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    justifyContent: 'space-between',
+    marginBottom: 18
+  },
+  macroProgressTitle: {
+    color: palette.cream,
+    flexGrow: 1,
+    flexShrink: 1,
+    fontSize: 18,
+    fontWeight: '900',
+    minWidth: 170
+  },
+  editGoalsButton: {
+    alignItems: 'center',
+    borderRadius: 999,
+    borderWidth: 1,
+    justifyContent: 'center',
+    maxWidth: 160,
+    minHeight: 36,
+    minWidth: 104,
+    paddingHorizontal: 14,
+    paddingVertical: 8
+  },
+  editGoalsButtonText: {
+    fontSize: 13,
+    fontWeight: '900',
+    textAlign: 'center'
+  },
+  macroProgressTrack: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 999,
+    borderWidth: 1,
+    height: 10,
+    overflow: 'hidden'
+  },
+  macroProgressFill: {
+    borderRadius: 999,
+    height: '100%'
+  },
+  macroGoalRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+    justifyContent: 'space-between',
+    marginBottom: 12
+  },
+  macroGoalInput: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 14,
+    borderWidth: 1,
+    color: palette.cream,
+    fontSize: 16,
+    fontWeight: '900',
+    minHeight: 44,
+    paddingHorizontal: 14,
+    textAlign: 'right',
+    width: 112
+  },
+  eatenMealNameInput: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 14,
+    borderWidth: 1,
+    color: palette.cream,
+    flex: 1,
+    fontSize: 14,
+    fontWeight: '900',
+    minHeight: 44,
+    paddingHorizontal: 14
+  },
+  macroGoalStatus: {
+    color: palette.green,
+    fontSize: 12,
+    fontWeight: '800',
+    marginTop: 10,
+    textAlign: 'center'
+  },
+  macroGoalError: {
+    color: '#ff8d8d',
+    fontSize: 12,
+    fontWeight: '800',
+    marginTop: 10,
+    textAlign: 'center'
   },
   checkBox: {
     alignItems: 'center',

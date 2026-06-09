@@ -189,6 +189,20 @@ export async function logOutRevenueCat() {
   if (!configured) {
     return null;
   }
+  let currentAppUserId = configuredUserId;
+  try {
+    if (typeof Purchases.getAppUserID === 'function') {
+      currentAppUserId = await Purchases.getAppUserID();
+    }
+  } catch (error) {
+    console.warn('[RevenueCat] current user lookup failed before logout:', error?.message || String(error));
+  }
+  const isAnonymous = !currentAppUserId || `${currentAppUserId}`.startsWith('$RCAnonymousID:');
+  if (isAnonymous) {
+    configuredUserId = null;
+    console.log('[RevenueCat] logout skipped: already anonymous');
+    return null;
+  }
   configuredUserId = null;
   return Purchases.logOut();
 }

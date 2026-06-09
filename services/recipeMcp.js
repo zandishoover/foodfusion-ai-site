@@ -170,7 +170,11 @@ function normalizeRecipe(recipe) {
     time: recipe.time || recipe.cookTime || recipe.readyIn || recipe.readyInMinutes && `${recipe.readyInMinutes} min` || '20 min',
     difficulty: recipe.difficulty || 'Easy',
     ingredients,
-    macros: recipe.macros || recipe.nutrition || { calories: 480, protein: 24, carbs: 52, fat: 18 },
+    macros: {
+      ...(recipe.macros || recipe.nutrition || { calories: 480, protein: 24, carbs: 52, fat: 18 }),
+      sugar: recipe.macros?.sugar || recipe.macros?.sugars || recipe.nutrition?.sugar || recipe.nutrition?.sugars ||
+        Math.round(((recipe.macros || recipe.nutrition || {}).carbs || 52) * 0.22)
+    },
     missingIngredients: recipe.missingIngredients || recipe.missedIngredients?.map((item) => item.name).filter(Boolean) || [],
     steps: steps.length > 0 ? steps : ['Prep ingredients.', 'Cook until ready.', 'Serve warm.']
   };
