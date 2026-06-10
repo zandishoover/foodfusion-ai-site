@@ -46,14 +46,11 @@ import {
   observeSupabaseAuth,
   resendSupabaseConfirmation,
   resetSupabasePassword,
-  sendPasswordResetCode,
   signInWithSupabase,
   signOutOfSupabase,
   signUpWithSupabase,
   supabaseAuthConfig,
-  supabaseConfigured,
-  updatePasswordWithResetCode,
-  verifyPasswordResetCode
+  supabaseConfigured
 } from './services/supabaseAuth';
 import {
   clearRemoteScanHistory,
@@ -3044,12 +3041,6 @@ function AuthScreen({
   onLogin,
   onSignUp,
   onResetPassword,
-  onSendResetCode,
-  onVerifyResetCode,
-  onUpdatePasswordWithCode,
-  resetFlow,
-  onResetFlowChange,
-  onResetMethodChange,
   onResendConfirmation,
   onShowLogin,
   onShowSignUp,
@@ -3061,33 +3052,11 @@ function AuthScreen({
   const isSignUp = mode === 'signup';
   const isForgotPassword = mode === 'forgotPassword';
   const [showPassword, setShowPassword] = useState(false);
-  const [showResetPassword, setShowResetPassword] = useState(false);
   const passwordItems = passwordValidationItems(form.password);
   const passwordStrong = isStrongPassword(form.password);
   const confirmPasswordMatches = !isSignUp || !form.confirmPassword || form.password === form.confirmPassword;
   const submitDisabled = isSignUp && (!passwordStrong || !form.confirmPassword || !confirmPasswordMatches);
   const passwordToggleLabel = showPassword ? 'Hide password' : 'Show password';
-  const resetMethod = resetFlow?.method || 'code';
-  const resetStep = resetFlow?.step || 'request';
-  const resetPassword = resetFlow?.newPassword || '';
-  const resetConfirmPassword = resetFlow?.confirmPassword || '';
-  const resetPasswordItems = passwordValidationItems(resetPassword);
-  const resetPasswordStrong = isStrongPassword(resetPassword);
-  const resetPasswordsMatch = !resetConfirmPassword || resetPassword === resetConfirmPassword;
-  const resetPasswordToggleLabel = showResetPassword ? 'Hide password' : 'Show password';
-  const resetPrimaryAction = !isForgotPassword
-    ? null
-    : resetMethod === 'link'
-    ? { label: 'Send Email Reset Link', onPress: onResetPassword, disabled: false }
-    : resetStep === 'verify'
-    ? { label: 'Verify Code', onPress: onVerifyResetCode, disabled: !(resetFlow?.code || '').trim() }
-    : resetStep === 'password'
-    ? {
-        label: 'Update Password',
-        onPress: onUpdatePasswordWithCode,
-        disabled: !resetPasswordStrong || !resetConfirmPassword || resetPassword !== resetConfirmPassword
-      }
-    : { label: 'Send Reset Code', onPress: onSendResetCode, disabled: false };
 
   return (
     <Screen>
@@ -3125,105 +3094,7 @@ function AuthScreen({
               style={styles.authInput}
             />
             {isForgotPassword ? (
-              <>
-                <View style={styles.resetMethodRow}>
-                  {[
-                    ['code', 'Use Reset Code'],
-                    ['link', 'Email Reset Link']
-                  ].map(([method, label]) => (
-                    <Pressable
-                      key={method}
-                      accessibilityRole="button"
-                      onPress={() => onResetMethodChange(method)}
-                      style={({ pressed }) => [
-                        styles.resetMethodButton,
-                        resetMethod === method && styles.resetMethodButtonActive,
-                        pressed && styles.pressed
-                      ]}
-                    >
-                      <Text
-                        style={[
-                          styles.resetMethodText,
-                          resetMethod === method && styles.resetMethodTextActive
-                        ]}
-                      >
-                        {label}
-                      </Text>
-                    </Pressable>
-                  ))}
-                </View>
-                <Text style={styles.resetHelper}>
-                  {resetMethod === 'code'
-                    ? 'A 6-digit code will be sent to your email. Text code coming soon.'
-                    : 'A secure reset link will open the hosted FoodFusion page.'}
-                </Text>
-                {resetMethod === 'code' && resetStep !== 'request' ? (
-                  <TextInput
-                    value={resetFlow?.code || ''}
-                    onChangeText={(value) => onResetFlowChange('code', value.replace(/\D/g, '').slice(0, 6))}
-                    placeholder="6-digit code"
-                    placeholderTextColor={palette.muted}
-                    keyboardType="number-pad"
-                    maxLength={6}
-                    style={styles.authInput}
-                  />
-                ) : null}
-                {resetMethod === 'code' && resetStep === 'password' ? (
-                  <>
-                    <View style={styles.passwordInputWrap}>
-                      <TextInput
-                        value={resetPassword}
-                        onChangeText={(value) => onResetFlowChange('newPassword', value)}
-                        placeholder="New password"
-                        placeholderTextColor={palette.muted}
-                        secureTextEntry={!showResetPassword}
-                        textContentType="newPassword"
-                        autoComplete="new-password"
-                        style={styles.passwordInput}
-                      />
-                      <Pressable
-                        accessibilityRole="button"
-                        accessibilityLabel={resetPasswordToggleLabel}
-                        onPress={() => setShowResetPassword((current) => !current)}
-                        style={({ pressed }) => [styles.passwordToggle, pressed && styles.pressed]}
-                      >
-                        <PasswordEyeIcon visible={showResetPassword} />
-                      </Pressable>
-                    </View>
-                    <View style={styles.passwordChecklist}>
-                      {resetPasswordItems.map((item) => (
-                        <Text
-                          key={item.label}
-                          style={[styles.passwordChecklistItem, item.valid && styles.passwordChecklistItemValid]}
-                        >
-                          {item.valid ? '✓' : '•'} {item.label}
-                        </Text>
-                      ))}
-                    </View>
-                    <View style={styles.passwordInputWrap}>
-                      <TextInput
-                        value={resetConfirmPassword}
-                        onChangeText={(value) => onResetFlowChange('confirmPassword', value)}
-                        placeholder="Confirm new password"
-                        placeholderTextColor={palette.muted}
-                        secureTextEntry={!showResetPassword}
-                        textContentType="newPassword"
-                        autoComplete="new-password"
-                        style={styles.passwordInput}
-                      />
-                      <Pressable
-                        accessibilityRole="button"
-                        accessibilityLabel={resetPasswordToggleLabel}
-                        onPress={() => setShowResetPassword((current) => !current)}
-                        style={({ pressed }) => [styles.passwordToggle, pressed && styles.pressed]}
-                      >
-                        <PasswordEyeIcon visible={showResetPassword} />
-                      </Pressable>
-                    </View>
-                    {!resetPasswordsMatch ? <Text style={styles.authError}>Passwords must match.</Text> : null}
-                  </>
-                ) : null}
-              </>
+              <Text style={styles.resetHelper}>We’ll email you a secure link to reset your password.</Text>
             ) : null}
             {!isForgotPassword ? (
               <>
@@ -3289,8 +3160,8 @@ function AuthScreen({
             {error ? <Text style={styles.authError}>{error}</Text> : null}
             {message ? <Text style={styles.authMessage}>{message}</Text> : null}
             <Button
-              disabled={(isForgotPassword ? resetPrimaryAction?.disabled : submitDisabled) || authLoading}
-              onPress={isForgotPassword ? resetPrimaryAction?.onPress : isSignUp ? onSignUp : onLogin}
+              disabled={submitDisabled || authLoading}
+              onPress={isForgotPassword ? onResetPassword : isSignUp ? onSignUp : onLogin}
             >
               {authLoading
                 ? isForgotPassword
@@ -3299,7 +3170,7 @@ function AuthScreen({
                   ? 'Creating...'
                   : 'Signing in...'
                 : isForgotPassword
-                ? resetPrimaryAction?.label
+                ? 'Send Password Reset Link'
                 : isSignUp
                 ? 'Create Account'
                 : 'Log In'}
@@ -3375,19 +3246,11 @@ function FoodFusionApp() {
   const [authError, setAuthError] = useState('');
   const [authMessage, setAuthMessage] = useState('');
   const [authLoading, setAuthLoading] = useState(false);
-  const [resetFlow, setResetFlow] = useState({
-    method: 'code',
-    step: 'request',
-    code: '',
-    resetToken: '',
-    newPassword: '',
-    confirmPassword: ''
-  });
   const [passwordResetDebug, setPasswordResetDebug] = useState({
     lastResetMethod: 'None',
-    resetCodeSentStatus: 'Not requested',
-    resetVerifyStatus: 'Not requested',
-    resetPasswordUpdateStatus: 'Not requested'
+    resetEmailSentStatus: 'Not requested',
+    resetPasswordUpdatedStatus: 'Not requested',
+    resetLinkOpenedStatus: 'Not opened'
   });
   const [startupNetworkHint, setStartupNetworkHint] = useState(false);
   const [lastNetworkTimeoutSource, setLastNetworkTimeoutSource] = useState('None');
@@ -3595,6 +3458,30 @@ function FoodFusionApp() {
   const restoredUserIdRef = useRef(null);
   const restoreFailsafeTimerRef = useRef(null);
   const loginInFlightRef = useRef(false);
+
+  useEffect(() => {
+    function handleAuthUrl(url = '') {
+      if (!url || (!url.includes('reset-password') && !url.includes('auth/callback'))) {
+        return;
+      }
+      console.log('[Auth] reset link opened', { url });
+      setPasswordResetDebug((current) => ({
+        ...current,
+        lastResetMethod: 'Email Reset Link',
+        resetLinkOpenedStatus: 'Opened',
+        resetPasswordUpdatedStatus: 'Completed on reset page'
+      }));
+      setAuthScreen('login');
+      setAuthMessage('Password reset complete. You can log in.');
+      setAuthError('');
+    }
+
+    Linking.getInitialURL()
+      .then((url) => handleAuthUrl(url || ''))
+      .catch((error) => console.warn('[Auth] initial reset link check failed:', error?.message || String(error)));
+    const subscription = Linking.addEventListener('url', ({ url }) => handleAuthUrl(url));
+    return () => subscription.remove();
+  }, []);
 
   function cacheKey(key, userId = activeUserIdRef.current) {
     return scopedCacheKey(key, userId);
@@ -6703,50 +6590,15 @@ function FoodFusionApp() {
     }
   }
 
-  function updateResetFlowField(key, value) {
-    setResetFlow((current) => ({ ...current, [key]: value }));
-    if (authError) {
-      setAuthError('');
-    }
-    if (authMessage) {
-      setAuthMessage('');
-    }
-  }
-
-  function changeResetMethod(method) {
-    setResetFlow({
-      method,
-      step: 'request',
-      code: '',
-      resetToken: '',
-      newPassword: '',
-      confirmPassword: ''
-    });
-    setAuthError('');
-    setAuthMessage('');
-    setPasswordResetDebug((current) => ({
-      ...current,
-      lastResetMethod: method === 'link' ? 'Email Reset Link' : 'Use Reset Code'
-    }));
-  }
-
   function showAuthMode(nextMode) {
     setAuthScreen(nextMode);
     setAuthError('');
     setAuthMessage('');
     setAuthNeedsConfirmation(false);
     if (nextMode === 'forgotPassword') {
-      setResetFlow({
-        method: 'code',
-        step: 'request',
-        code: '',
-        resetToken: '',
-        newPassword: '',
-        confirmPassword: ''
-      });
       setPasswordResetDebug((current) => ({
         ...current,
-        lastResetMethod: 'Use Reset Code'
+        lastResetMethod: 'Email Reset Link'
       }));
     }
   }
@@ -6939,7 +6791,8 @@ function FoodFusionApp() {
       setPasswordResetDebug((current) => ({
         ...current,
         lastResetMethod: 'Email Reset Link',
-        resetPasswordUpdateStatus: 'Not requested'
+        resetEmailSentStatus: 'Sending',
+        resetPasswordUpdatedStatus: 'Not requested'
       }));
       if (supabaseConfigured) {
         await resetSupabasePassword(email);
@@ -6949,7 +6802,7 @@ function FoodFusionApp() {
       setPasswordResetDebug((current) => ({
         ...current,
         lastResetMethod: 'Email Reset Link',
-        resetCodeSentStatus: 'Email reset link sent'
+        resetEmailSentStatus: 'Sent'
       }));
     } catch (error) {
       const readable = readablePasswordResetError(error);
@@ -6958,148 +6811,7 @@ function FoodFusionApp() {
       setPasswordResetDebug((current) => ({
         ...current,
         lastResetMethod: 'Email Reset Link',
-        resetCodeSentStatus: readable
-      }));
-    } finally {
-      setAuthLoading(false);
-    }
-  }
-
-  async function handleSendResetCode() {
-    const email = authForm.email.trim();
-    if (!email) {
-      setAuthError('Email is required.');
-      return;
-    }
-    try {
-      setAuthLoading(true);
-      setAuthError('');
-      setAuthMessage('Sending reset code...');
-      setPasswordResetDebug((current) => ({
-        ...current,
-        lastResetMethod: 'Use Reset Code',
-        resetCodeSentStatus: 'Sending',
-        resetVerifyStatus: 'Not requested',
-        resetPasswordUpdateStatus: 'Not requested'
-      }));
-      await sendPasswordResetCode(email);
-      setResetFlow((current) => ({ ...current, method: 'code', step: 'verify' }));
-      setAuthMessage('Reset code sent. Please check your email.');
-      setPasswordResetDebug((current) => ({
-        ...current,
-        resetCodeSentStatus: 'Sent'
-      }));
-    } catch (error) {
-      const readable = readablePasswordResetError(error);
-      setAuthMessage('');
-      setAuthError(readable);
-      setPasswordResetDebug((current) => ({
-        ...current,
-        resetCodeSentStatus: readable
-      }));
-    } finally {
-      setAuthLoading(false);
-    }
-  }
-
-  async function handleVerifyResetCode() {
-    const email = authForm.email.trim();
-    const code = resetFlow.code.trim();
-    if (!email) {
-      setAuthError('Email is required.');
-      return;
-    }
-    if (code.length !== 6) {
-      setAuthError('Enter the 6-digit reset code.');
-      return;
-    }
-    try {
-      setAuthLoading(true);
-      setAuthError('');
-      setAuthMessage('Verifying code...');
-      setPasswordResetDebug((current) => ({
-        ...current,
-        lastResetMethod: 'Use Reset Code',
-        resetVerifyStatus: 'Verifying'
-      }));
-      const result = await verifyPasswordResetCode(email, code);
-      setResetFlow((current) => ({
-        ...current,
-        step: 'password',
-        resetToken: result.resetToken || ''
-      }));
-      setAuthMessage('Code verified. Enter a new password.');
-      setPasswordResetDebug((current) => ({
-        ...current,
-        resetVerifyStatus: 'Verified'
-      }));
-    } catch (error) {
-      const readable = readablePasswordResetError(error);
-      setAuthMessage('');
-      setAuthError(readable);
-      setPasswordResetDebug((current) => ({
-        ...current,
-        resetVerifyStatus: readable
-      }));
-    } finally {
-      setAuthLoading(false);
-    }
-  }
-
-  async function handleUpdatePasswordWithCode() {
-    const email = authForm.email.trim();
-    if (!email) {
-      setAuthError('Email is required.');
-      return;
-    }
-    if (!isStrongPassword(resetFlow.newPassword)) {
-      console.log('[Auth] password validation fail');
-      setAuthError('Password must contain at least 10 characters, including uppercase, lowercase, number, and special character.');
-      return;
-    }
-    console.log('[Auth] password validation pass');
-    if (resetFlow.newPassword !== resetFlow.confirmPassword) {
-      setAuthError('Passwords must match.');
-      return;
-    }
-    try {
-      setAuthLoading(true);
-      setAuthError('');
-      setAuthMessage('Updating password...');
-      setPasswordResetDebug((current) => ({
-        ...current,
-        lastResetMethod: 'Use Reset Code',
-        resetPasswordUpdateStatus: 'Updating'
-      }));
-      await updatePasswordWithResetCode({
-        email,
-        code: resetFlow.code,
-        resetToken: resetFlow.resetToken,
-        password: resetFlow.newPassword
-      });
-      setAuthScreen('login');
-      setResetFlow({
-        method: 'code',
-        step: 'request',
-        code: '',
-        resetToken: '',
-        newPassword: '',
-        confirmPassword: ''
-      });
-      setAuthForm((current) => ({ ...current, password: '', confirmPassword: '' }));
-      setAuthError('');
-      setAuthMessage('Password updated. You can now log in.');
-      setPasswordResetDebug((current) => ({
-        ...current,
-        resetPasswordUpdateStatus: 'Updated'
-      }));
-    } catch (error) {
-      const readable = readablePasswordResetError(error);
-      setAuthMessage('');
-      setAuthError(readable);
-      setPasswordResetDebug((current) => ({
-        ...current,
-        resetPasswordUpdateStatus: readable
+        resetEmailSentStatus: readable
       }));
     } finally {
       setAuthLoading(false);
@@ -7765,12 +7477,6 @@ function FoodFusionApp() {
         onLogin={handleLogin}
         onSignUp={handleSignUp}
         onResetPassword={handleResetPassword}
-        onSendResetCode={handleSendResetCode}
-        onVerifyResetCode={handleVerifyResetCode}
-        onUpdatePasswordWithCode={handleUpdatePasswordWithCode}
-        resetFlow={resetFlow}
-        onResetFlowChange={updateResetFlowField}
-        onResetMethodChange={changeResetMethod}
         onResendConfirmation={handleResendConfirmation}
         onShowLogin={() => showAuthMode('login')}
         onShowSignUp={() => showAuthMode('signup')}
@@ -10483,9 +10189,9 @@ function FoodFusionApp() {
               ['Session email', authDebug.sessionEmail || 'None'],
               ['Last auth error', authDebug.lastAuthError || 'None'],
               ['Last reset method', passwordResetDebug.lastResetMethod],
-              ['Reset code sent status', passwordResetDebug.resetCodeSentStatus],
-              ['Reset verify status', passwordResetDebug.resetVerifyStatus],
-              ['Reset password update status', passwordResetDebug.resetPasswordUpdateStatus]
+              ['Reset email sent', passwordResetDebug.resetEmailSentStatus],
+              ['Reset password updated', passwordResetDebug.resetPasswordUpdatedStatus],
+              ['Reset link opened', passwordResetDebug.resetLinkOpenedStatus]
             ].map(([label, value]) => (
               <View key={label} style={styles.launchRow}>
                 <Text style={styles.launchLabel}>{label}</Text>
@@ -11007,35 +10713,6 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     lineHeight: 18,
     marginBottom: 2
-  },
-  resetMethodRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 10
-  },
-  resetMethodButton: {
-    alignItems: 'center',
-    backgroundColor: palette.panel,
-    borderColor: palette.line,
-    borderRadius: 999,
-    borderWidth: 1,
-    flex: 1,
-    minHeight: 42,
-    justifyContent: 'center',
-    paddingHorizontal: 10
-  },
-  resetMethodButtonActive: {
-    backgroundColor: palette.greenDeep,
-    borderColor: palette.green
-  },
-  resetMethodText: {
-    color: palette.muted,
-    fontSize: 12,
-    fontWeight: '900',
-    textAlign: 'center'
-  },
-  resetMethodTextActive: {
-    color: palette.cream
   },
   resetHelper: {
     color: palette.muted,
