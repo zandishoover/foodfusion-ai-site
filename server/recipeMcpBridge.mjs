@@ -17,6 +17,7 @@ const scanAccessToken = process.env.FOODFUSION_SCAN_ACCESS_TOKEN?.trim();
 const isNetworkExposed = !['127.0.0.1', 'localhost', '::1'].includes(host);
 const maxJsonBodyBytes = Number(process.env.FOODFUSION_MAX_JSON_BODY_BYTES || 8 * 1024 * 1024);
 const spoonacularApiKey = process.env.SPOONACULAR_API_KEY?.trim();
+const mealDbApiKey = process.env.THEMEALDB_API_KEY?.trim();
 const edamamAppId = process.env.EDAMAM_APP_ID?.trim();
 const edamamAppKey = process.env.EDAMAM_APP_KEY?.trim();
 const usdaApiKey = process.env.USDA_API_KEY?.trim();
@@ -768,7 +769,25 @@ async function scanFoodImage({ image }) {
   return detections;
 }
 
-function normalizeRecipe(recipe, fallbackIngredients = []) {
+function structuredRecipeSteps(rawSteps) {
+  const values = Array.isArray(rawSteps)
+    ? rawSteps
+    : `${rawSteps || ''}`.split(/(?:^|\n)\s*\d+[.)]\s+|\n+|(?<=[.!?])\s+(?=[A-Z])/).map((item) => item.trim()).filter(Boolean);
+  return values.map((step, index) => {
+    if (step && typeof step === 'object') {
+      return {
+        number: Number(step.number) || index + 1,
+        title: step.title || `Step ${index + 1}`,
+        instruction: step.instruction || step.step || step.text || '',
+        ...(step.durationMinutes ? { durationMinutes: Number(step.durationMinutes) } : {}),
+        ...(step.temperature ? { temperature: step.temperature } : {})
+      };
+    }
+    return { number: index + 1, title: `Step ${index + 1}`, instruction: `${step}` };
+  }).filter((step) => step.instruction);
+}
+
+function normalizeRecipe(recipe, fallbackIngredients = [], provenance = {}) {
   if (!recipe || typeof recipe !== 'object') {
     return fallbackRecipes(fallbackIngredients)[0];
   }
@@ -778,11 +797,12 @@ function normalizeRecipe(recipe, fallbackIngredients = []) {
   const ingredients = Array.isArray(recipe.ingredients) && recipe.ingredients.length > 0
     ? recipe.ingredients
     : fallbackIngredients;
-  const steps = recipe.steps || recipe.instructions || [
+  const rawSteps = recipe.steps || recipe.instructions || [
     'Prep ingredients.',
     'Cook until ready.',
     'Serve warm.'
   ];
+  const steps = structuredRecipeSteps(rawSteps);
 
   return {
     title: recipe.title || recipe.name || 'Recipe MCP Meal',
@@ -797,7 +817,17 @@ function normalizeRecipe(recipe, fallbackIngredients = []) {
       fat: recipe.fat || recipe.macros?.fat || 16
     },
     missingIngredients: recipe.missingIngredients || [],
-    steps: Array.isArray(steps) ? steps : [`${steps}`]
+    description: recipe.description || recipe.summary || '',
+    prepTimeMinutes: prep || null,
+    cookTimeMinutes: cook || null,
+    totalTimeMinutes: Math.max(8, prep + cook),
+    servings: Number(recipe.servings) || null,
+    equipment: Array.isArray(recipe.equipment) ? recipe.equipment : recipe.equipment ? [recipe.equipment] : [],
+    steps,
+    tips: Array.isArray(recipe.tips) ? recipe.tips : [],
+    source: provenance.source || recipe.source || 'FoodFusion',
+    sourceUrl: provenance.sourceUrl || recipe.sourceUrl || null,
+    attribution: provenance.attribution || recipe.attribution || null
   };
 }
 
@@ -837,15 +867,18 @@ async function recipesFromSpoonacular(ingredients, options = {}) {
 }
 
 async function recipesFromMealDb(ingredients, options = {}) {
+  if (!mealDbApiKey) {
+    throw new Error('TheMealDB production key is not configured');
+  }
   const primary = encodeURIComponent(ingredients[0] || 'chicken');
-  const data = await fetchJsonWithTimeout(`https://www.themealdb.com/api/json/v1/1/filter.php?i=${primary}`);
+  const data = await fetchJsonWithTimeout(`https://www.themealdb.com/api/json/v1/${encodeURIComponent(mealDbApiKey)}/filter.php?i=${primary}`);
   const meals = Array.isArray(data?.meals) ? data.meals.slice(0, 3) : [];
   if (meals.length === 0) {
     throw new Error('TheMealDB returned no recipes');
   }
   const detailed = await Promise.all(meals.map(async (meal) => {
     try {
-      const detail = await fetchJsonWithTimeout(`https://www.themealdb.com/api/json/v1/1/lookup.php?i=${meal.idMeal}`);
+      const detail = await fetchJsonWithTimeout(`https://www.themealdb.com/api/json/v1/${encodeURIComponent(mealDbApiKey)}/lookup.php?i=${meal.idMeal}`);
       const fullMeal = detail?.meals?.[0] || meal;
       const mealIngredients = Array.from({ length: 20 }, (_, index) => fullMeal[`strIngredient${index + 1}`])
         .filter(Boolean)
@@ -856,7 +889,11 @@ async function recipesFromMealDb(ingredients, options = {}) {
         ingredients: mealIngredients,
         instructions: fullMeal.strInstructions || 'Cook according to taste.',
         time: '30 min'
-      }, ingredients);
+      }, ingredients, {
+        source: 'TheMealDB',
+        sourceUrl: `https://www.themealdb.com/meal/${meal.idMeal}`,
+        attribution: 'Recipe data from TheMealDB'
+      });
     } catch {
       return normalizeRecipe({ title: meal.strMeal, ingredients, time: '30 min' }, ingredients);
     }
@@ -888,29 +925,46 @@ async function recipesFromEdamam(ingredients, options = {}) {
 }
 
 async function recipesFromFallbackSources(ingredients = [], options = {}) {
-  const sources = [
+  const providers = [
     ['spoonacular', recipesFromSpoonacular],
-    ['themealdb', recipesFromMealDb],
-    ['edamam', recipesFromEdamam],
-    ['internal', async () => fallbackRecipes(ingredients, options)]
+    ['themealdb', recipesFromMealDb]
   ];
+  const settled = await Promise.allSettled(providers.map(([, loader]) => loader(ingredients, options)));
   const chain = [];
-  for (const [source, loader] of sources) {
-    try {
-      const recipes = await loader(ingredients, options);
-      if (recipes.length > 0) {
-        console.log('[Recipe MCP] source used', source);
-        console.log('[Recipe MCP] fallback chain', [...chain, source].join(' -> '));
-        return { recipes, source, fallbackChain: [...chain, source] };
-      }
-      throw new Error(`${source} returned no recipes`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      chain.push(`${source}: ${message}`);
-      console.warn('[Recipe MCP] source failed', { source, error: message });
+  const aggregated = [];
+  settled.forEach((result, index) => {
+    const source = providers[index][0];
+    if (result.status === 'fulfilled' && result.value.length > 0) {
+      console.log('[Recipe MCP] source used', source);
+      result.value.forEach((recipe) => aggregated.push({
+        ...recipe,
+        source: recipe.source && recipe.source !== 'FoodFusion' ? recipe.source : source,
+        attribution: recipe.attribution || `Recipe data from ${source}`
+      }));
+      chain.push(source);
+      return;
     }
-  }
-  return { recipes: fallbackRecipes(ingredients, options), source: 'internal', fallbackChain: chain };
+    const message = result.status === 'rejected'
+      ? (result.reason instanceof Error ? result.reason.message : 'Unknown error')
+      : `${source} returned no recipes`;
+    chain.push(`${source}: ${message}`);
+    console.warn('[Recipe MCP] source failed', { source, error: message });
+  });
+  fallbackRecipes(ingredients, options).forEach((recipe) => aggregated.push({
+    ...recipe,
+    source: 'FoodFusion',
+    attribution: 'FoodFusion original guidance'
+  }));
+  const deduplicated = aggregated.filter((recipe, index, all) => {
+    const key = `${recipe.title}|${(recipe.ingredients || []).slice(0, 3).join('|')}`.toLowerCase();
+    return all.findIndex((candidate) => `${candidate.title}|${(candidate.ingredients || []).slice(0, 3).join('|')}`.toLowerCase() === key) === index;
+  }).slice(0, 6);
+  const successfulSources = [...new Set(deduplicated.map((recipe) => recipe.source))];
+  return {
+    recipes: deduplicated,
+    source: successfulSources.join(' + ') || 'FoodFusion',
+    fallbackChain: chain
+  };
 }
 
 async function ensureClient() {
@@ -971,23 +1025,38 @@ async function recipesFromIngredients({
   ingredients = [],
   recipeType = 'Meals',
   preferences = [],
+  ingredientsToAvoid = [],
   equipment = 'Stove',
+  availableEquipment = [],
   servings = 2
 } = {}) {
   try {
     const recipe = await callRecipeTool('generate_recipe', {
-      prompt: `Create FoodFusion ${recipeType} using these detected ingredients: ${ingredients.join(', ')}. Preferences: ${preferences.join(', ') || 'none'}. Equipment: ${equipment}. Keep it practical and premium.`,
+      prompt: `Create FoodFusion ${recipeType} using these detected ingredients: ${ingredients.join(', ')}. Preferences: ${preferences.join(', ') || 'none'}. Avoid: ${ingredientsToAvoid.join(', ') || 'none'}. Primary equipment: ${equipment}. Available equipment: ${availableEquipment.join(', ') || equipment}. Return detailed, practical cooking directions as 5 to 12 distinct steps when appropriate.`,
       servings,
       protein: preferences.some((preference) => `${preference}`.toLowerCase().includes('protein')) ? '40' : '30'
     });
-    const normalized = normalizeRecipe(recipe, ingredients);
-    const recipes = [normalized, ...fallbackRecipes(ingredients, { recipeType, preferences }).filter((item) => item.title !== normalized.title)].slice(0, 3);
+    const normalized = {
+      ...normalizeRecipe(recipe, ingredients),
+      source: 'Recipe MCP',
+      attribution: 'Recipe generated by Recipe MCP'
+    };
+    const recipes = [
+      normalized,
+      ...fallbackRecipes(ingredients, { recipeType, preferences })
+        .filter((item) => item.title !== normalized.title)
+        .map((item) => ({
+          ...item,
+          source: 'FoodFusion',
+          attribution: 'FoodFusion original guidance'
+        }))
+    ].slice(0, 3);
     console.log('[Recipe MCP] source used', 'hosted');
     return { recipes, source: 'hosted', fallbackChain: ['hosted'] };
   } catch (error) {
     console.error('[Recipe MCP] source failed', { source: 'hosted', error: error.message });
     console.log('[Recipe MCP] fallback reason', error.message);
-    return recipesFromFallbackSources(ingredients, { recipeType, preferences, equipment, servings });
+    return recipesFromFallbackSources(ingredients, { recipeType, preferences, ingredientsToAvoid, equipment, availableEquipment, servings });
   }
 }
 

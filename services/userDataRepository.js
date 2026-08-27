@@ -20,6 +20,22 @@ function recipeClientId(recipe, recipeType = 'Meals') {
   return `${recipe.id || `${recipeType}-${recipe.title}`}`.slice(0, 160);
 }
 
+function recipeMetadata(recipe) {
+  return {
+    time: recipe.time || null,
+    difficulty: recipe.difficulty || null,
+    description: recipe.description || null,
+    prepTimeMinutes: recipe.prepTimeMinutes || null,
+    cookTimeMinutes: recipe.cookTimeMinutes || null,
+    totalTimeMinutes: recipe.totalTimeMinutes || null,
+    equipment: recipe.equipment || [],
+    tips: recipe.tips || [],
+    source: recipe.source || null,
+    sourceUrl: recipe.sourceUrl || null,
+    attribution: recipe.attribution || null
+  };
+}
+
 function mapStoredRecipe(recipe, saved = {}) {
   return {
     ...(recipe.metadata || {}),
@@ -260,7 +276,7 @@ export async function saveStructuredScanResult(scan) {
       steps: recipe.steps || [],
       macros: recipe.macros || {},
       missing_ingredients: recipe.missingIngredients || [],
-      metadata: { time: recipe.time || null, difficulty: recipe.difficulty || null }
+      metadata: recipeMetadata(recipe)
     })));
     if (recipeError) {
       throw recipeError;
@@ -288,7 +304,7 @@ export async function replaceFavoriteRecipes(favorites = []) {
       steps: meal.steps || [],
       macros: meal.macros || {},
       missing_ingredients: meal.missingIngredients || [],
-      metadata: { time: meal.time || null, difficulty: meal.difficulty || null }
+      metadata: recipeMetadata(meal)
     };
     const { data: existingRecipe, error: lookupError } = await supabase
       .from('recipes').select('id').eq('user_id', userId).eq('client_id', clientId).maybeSingle();
@@ -334,7 +350,7 @@ export async function saveOpenedRecipe(meal) {
     steps: meal.steps || [],
     macros: meal.macros || {},
     missing_ingredients: meal.missingIngredients || [],
-    metadata: { time: meal.time || null, difficulty: meal.difficulty || null }
+    metadata: recipeMetadata(meal)
   };
   const { data: existingRecipe, error: recipeLookupError } = await supabase
     .from('recipes').select('id').eq('user_id', userId).eq('client_id', clientId).maybeSingle();

@@ -54,7 +54,7 @@
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>FoodFusion AI uses your location to find nearby grocery stores for your cart.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>FoodFusion AI connects to your nearby analysis service while testing photo scans.</string>
+	<string>FoodFusion AI connects to nearby devices and services used to analyze food photos.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Allow $(PRODUCT_NAME) to access your microphone</string>
 	<key>RCTNewArchEnabled</key>

@@ -8,6 +8,7 @@ import {
   KeyboardAvoidingView,
   Linking,
   LogBox,
+  Modal,
   Platform,
   Pressable,
   SafeAreaView,
@@ -69,6 +70,8 @@ import {
 import {
   initializeRevenueCat,
   getRevenueCatSubscription,
+  getRevenueCatPaywallPackages,
+  addRevenueCatCustomerInfoUpdateListener,
   logOutRevenueCat,
   purchaseMonthlySubscription,
   purchaseYearlySubscription,
@@ -76,13 +79,22 @@ import {
   revenueCatConfigured,
   revenueCatDebugConfig,
   revenueCatSetupPaused,
-  isKnownRevenueCatSetupError
+  isKnownRevenueCatSetupError,
+  revenueCatErrorCategory
 } from './services/revenueCat';
 import {
   getMacroNutritionDebug,
   lookupHostedMacros
 } from './services/macroNutrition';
 import { PremiumProvider, usePremium } from './contexts/PremiumContext';
+
+// Rich diagnostics stay available in development. Production warnings retain
+// only their event label so user data and backend payloads are not logged.
+const console = __DEV__ ? globalThis.console : {
+  log: () => {},
+  warn: (label) => globalThis.console.warn(typeof label === 'string' ? label : '[FoodFusion] Recoverable error'),
+  error: (label) => globalThis.console.error(typeof label === 'string' ? label : '[FoodFusion] Error')
+};
 
 if (__DEV__) {
   LogBox.ignoreLogs([
@@ -99,6 +111,7 @@ if (__DEV__) {
 const SCAN_KEY = 'foodfusion:lastScanDate';
 const PREMIUM_KEY = 'foodfusion:fusionPlus';
 const PREMIUM_PLAN_KEY = 'foodfusion:fusionPlusPlan';
+const PREMIUM_EXPIRATION_KEY = 'foodfusion:fusionPlusExpiration';
 const AUTH_KEY = 'foodfusion:isLoggedIn';
 const USER_PROFILE_KEY = 'foodfusion:userProfile';
 const HISTORY_KEY = 'foodfusion:mealHistory';
@@ -108,6 +121,7 @@ const SHOPPING_CART_KEY = 'foodfusion:shoppingCart';
 const SHOPPING_LOCATION_KEY = 'foodfusion:shoppingLocation';
 const ORDER_HISTORY_KEY = 'foodfusion:orderHistory';
 const PREFERENCES_KEY = 'foodfusion:preferences';
+const CUSTOM_PREFERENCES_KEY = 'foodfusion:customPreferences';
 const DISLIKES_KEY = 'foodfusion:dislikedIngredients';
 const SERVINGS_KEY = 'foodfusion:servings';
 const EQUIPMENT_KEY = 'foodfusion:equipment';
@@ -148,6 +162,7 @@ const USER_SCOPED_CACHE_KEYS = new Set([
   SCAN_KEY,
   PREMIUM_KEY,
   PREMIUM_PLAN_KEY,
+  PREMIUM_EXPIRATION_KEY,
   HISTORY_KEY,
   FAVORITE_SCANS_KEY,
   FAVORITES_KEY,
@@ -157,6 +172,7 @@ const USER_SCOPED_CACHE_KEYS = new Set([
   RECENT_SEARCHES_KEY,
   ORDER_HISTORY_KEY,
   PREFERENCES_KEY,
+  CUSTOM_PREFERENCES_KEY,
   DISLIKES_KEY,
   SERVINGS_KEY,
   EQUIPMENT_KEY,
@@ -301,11 +317,27 @@ const recipeTypes = ['Meals', 'Smoothies', 'Protein Shakes', 'Drinks'];
 const recipeTypeFilters = ['Meals', 'Smoothies', 'Protein Shakes', 'Drinks', 'All'];
 const favoriteFolders = ['All', 'Favorites', 'Meal Prep', 'Family', 'Gym Meals', 'Drinks', 'Quick Meals'];
 const fusionPlans = [
-  { id: 'monthly', name: 'Monthly', price: '$7.99', cadence: '/month', badge: '', detail: 'Flexible cancel anytime' },
-  { id: 'yearly', name: 'Yearly', price: '$69.99', cadence: '/year', badge: 'Best Value', savings: 'SAVE 27%', detail: '2 months free' }
+  { id: 'monthly', name: 'Monthly', cadence: '/month', badge: '', detail: 'Flexible cancel anytime' },
+  { id: 'yearly', name: 'Yearly', cadence: '/year', badge: 'Best Value', detail: 'Annual billing' }
 ];
-function fusionPlanById(planId = 'yearly') {
-  return fusionPlans.find((plan) => plan.id === planId) || fusionPlans.find((plan) => plan.id === 'yearly') || fusionPlans[0];
+function fusionPlanById(planId = 'yearly', plans = fusionPlans) {
+  return plans.find((plan) => plan.id === planId) || plans.find((plan) => plan.id === 'yearly') || plans[0];
+}
+function offeringLoadErrorMessage(error) {
+  const category = revenueCatErrorCategory(error);
+  if (category === 'network') {
+    return 'Unable to load subscription options. Check your connection and try again.';
+  }
+  if (category === 'no_current_offering') {
+    return 'No Fusion+ subscription Offering is currently available. Please try again.';
+  }
+  if (category === 'missing_packages') {
+    return 'The monthly or yearly Fusion+ option is unavailable. Please try again.';
+  }
+  if (category === 'configuration') {
+    return 'Fusion+ is not configured correctly for this build. Please try again later.';
+  }
+  return error?.message || 'Subscription options could not be loaded. Please try again.';
 }
 const fusionBenefits = [
   'Unlimited scans',
@@ -376,6 +408,77 @@ const expandedPreferenceOptions = [
   'Anti-Inflammatory',
   'Dairy Free',
 ];
+const preferenceSections = [
+  { title: 'Diet', options: ['Vegetarian', 'Vegan', 'Carnivore'] },
+  {
+    title: 'Allergies',
+    options: [
+      { value: 'No Dairy', label: 'Dairy' },
+      { value: 'Nut Free', label: 'Nuts' },
+      { value: 'Seafood Free', label: 'Seafood' },
+      { value: 'Gluten Free', label: 'Wheat / Gluten' }
+    ]
+  },
+  {
+    title: 'Nutrition Goals',
+    options: [
+      'High Protein', 'Low Carb', 'Healthy', 'Weight Loss', 'Bulking', 'Cutting',
+      'Low Sugar', 'Low Sodium', 'High Fiber', 'Diabetic Friendly', 'Heart Healthy',
+      'Anti-Inflammatory'
+    ]
+  },
+  {
+    title: 'Eating Styles',
+    options: ['Keto', 'Mediterranean', 'Dairy Free', { value: 'No Pork', label: 'Pork Free' }]
+  },
+  {
+    title: 'Meal Preferences',
+    options: [
+      'Kids / Family', 'Comfort Food', 'Meal Prep', 'Quick Meals',
+      '5 Ingredients or Less', 'Cheap Meals', 'College Budget', 'Picky Eater',
+      'Athlete Meals'
+    ]
+  },
+  {
+    title: 'Cuisine Preferences',
+    options: [
+      'Asian-Inspired', 'Mexican-Inspired', 'Italian-Inspired', 'Japanese', 'Korean',
+      'Thai', 'Vietnamese', 'Chinese', 'Indian', 'Greek', 'Spanish', 'French',
+      'Caribbean', 'Jamaican', 'Brazilian', 'Middle Eastern', 'Lebanese', 'Ethiopian',
+      'West African', 'Southern US', 'Cajun / Creole'
+    ]
+  }
+];
+const CUSTOM_PREFERENCE_CATEGORIES = [
+  'Diet',
+  'Allergies',
+  'Nutrition Goals',
+  'Eating Styles',
+  'Meal Preferences',
+  'Cuisine Preferences',
+  'Ingredients To Avoid',
+  'Kitchen Equipment'
+];
+const EMPTY_CUSTOM_PREFERENCES = Object.fromEntries(
+  CUSTOM_PREFERENCE_CATEGORIES.map((category) => [category, []])
+);
+function preferenceOption(option) {
+  return typeof option === 'string' ? { value: option, label: option } : option;
+}
+function titleCasePreference(value = '') {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+function normalizeCustomPreferences(value) {
+  return Object.fromEntries(CUSTOM_PREFERENCE_CATEGORIES.map((category) => [
+    category,
+    Array.isArray(value?.[category])
+      ? [...new Map(value[category].filter(Boolean).map((item) => {
+          const label = titleCasePreference(`${item}`);
+          return [label.toLowerCase(), label];
+        })).values()]
+      : []
+  ]));
+}
 const equipmentOptions = ['Microwave', 'Air Fryer', 'Stove', 'Oven', 'No Cooking'];
 const kitchenEquipmentOptions = [
   'stove',
@@ -1252,9 +1355,20 @@ function normalizeFoodItems(payload) {
 async function fetchFoodScan(endpoint, imageUrl, authToken = null) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), FOOD_SCAN_TIMEOUT_MS);
+  const startedAt = Date.now();
+  let hostname = 'invalid-endpoint';
   try {
-    console.log('[AI Scan] request started', { endpoint });
-    return await fetch(endpoint, {
+    hostname = new URL(endpoint).hostname;
+  } catch {}
+  try {
+    if (__DEV__) {
+      console.log('[FoodScan Diagnostics] request started', {
+        hostname,
+        authorizationHeaderPresent: Boolean(!scanEndpointIsDevelopment && authToken),
+        scanTokenHeaderPresent: Boolean(FOOD_SCAN_ACCESS_TOKEN)
+      });
+    }
+    const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1264,7 +1378,22 @@ async function fetchFoodScan(endpoint, imageUrl, authToken = null) {
       body: JSON.stringify({ image: imageUrl }),
       signal: controller.signal
     });
+    if (__DEV__) {
+      console.log('[FoodScan Diagnostics] response received', {
+        hostname,
+        status: response.status,
+        durationMs: Date.now() - startedAt
+      });
+    }
+    return response;
   } catch (error) {
+    if (__DEV__) {
+      console.warn('[FoodScan Diagnostics] request failed', {
+        hostname,
+        durationMs: Date.now() - startedAt,
+        message: error?.message || String(error)
+      });
+    }
     if (controller.signal.aborted) {
       throw new Error('AI scan timed out.');
     }
@@ -1278,11 +1407,9 @@ async function scanFoodItemsFromImage(uri, mimeType) {
   if (!FOOD_SCAN_ENDPOINT || (scanEndpointIsDevelopment && !__DEV__)) {
     const fallbackReason = !FOOD_SCAN_ENDPOINT ? 'missing endpoint' : 'development endpoint in production build';
     console.warn('[AI Scan] fallback reason', fallbackReason);
-    return {
-      detections: reviewSafeScanDetections,
-      source: 'demo',
-      notice: reviewSafeScanNotice
-    };
+    throw new Error(!FOOD_SCAN_ENDPOINT
+      ? 'Food analysis is not configured in this build.'
+      : 'This build cannot use a development-only food scan endpoint.');
   }
   if (!uri) {
     throw new Error('No image was selected for analysis.');
@@ -1318,25 +1445,40 @@ async function scanFoodItemsFromImage(uri, mimeType) {
 
   let response;
   try {
-    const authToken = scanEndpointIsDevelopment ? null : await getSupabaseAccessToken();
+    let authToken = null;
+    if (!scanEndpointIsDevelopment) {
+      try {
+        authToken = await getSupabaseAccessToken();
+      } catch (error) {
+        // The scan service also accepts its configured app token. Account auth
+        // being temporarily unavailable must not prevent the scan request.
+        console.warn('[FoodScan] Supabase access token unavailable; continuing with app authentication:', error?.message || String(error));
+      }
+    }
     response = await fetchFoodScan(FOOD_SCAN_ENDPOINT, imageUrl, authToken);
   } catch (error) {
-    console.error('[AI Scan] fallback reason', error?.message || 'fetch failed');
-    console.error('[FoodScan] Fetch failed:', error);
+    console.warn('[AI Scan] fallback reason', error?.message || 'fetch failed');
+    console.warn('[FoodScan] Fetch failed; using safe fallback:', error?.message || String(error));
     throw error;
   }
 
   const rawResponse = await response.text();
   console.log('[AI Scan] response status', response.status);
-  console.log('[FoodScan] Raw response:', rawResponse);
+  if (__DEV__) console.log('[FoodScan] Response body received:', { length: rawResponse.length });
   if (!response.ok) {
-    console.error('[AI Scan] fallback reason', `non-200 response ${response.status}`);
-    console.error('[FoodScan] Request failed:', { status: response.status, payload: rawResponse });
+    console.warn('[AI Scan] fallback reason', `non-200 response ${response.status}`);
+    console.warn('[FoodScan] Request failed; using safe fallback:', { status: response.status, payload: rawResponse });
     let serverDetail = '';
     try {
       serverDetail = JSON.parse(rawResponse)?.detail || JSON.parse(rawResponse)?.error || '';
     } catch {
       serverDetail = rawResponse;
+    }
+    if (__DEV__) {
+      console.warn('[FoodScan Diagnostics] backend error', {
+        status: response.status,
+        message: serverDetail || `HTTP ${response.status}`
+      });
     }
     throw new Error(serverDetail || `AI scan request failed (${response.status}).`);
   }
@@ -1345,7 +1487,7 @@ async function scanFoodItemsFromImage(uri, mimeType) {
   try {
     payload = JSON.parse(rawResponse);
   } catch (error) {
-    console.error('[FoodScan] Invalid JSON response:', error);
+    console.warn('[FoodScan] Invalid JSON response; using safe fallback:', error?.message || String(error));
     throw new Error('AI scan returned an invalid response.');
   }
   console.log('[FoodScan] Request succeeded. Response payload:', payload);
@@ -1582,12 +1724,23 @@ function normalizeHostedMacroSummary(payload = {}, localSummary = {}) {
 }
 
 function stepSeconds(step) {
-  const match = `${step}`.match(/(\d+)\s*(min|minute|minutes|sec|second|seconds)/i);
+  if (typeof step === 'object' && Number.isFinite(Number(step?.durationMinutes))) {
+    return Number(step.durationMinutes) * 60;
+  }
+  const match = `${typeof step === 'object' ? step?.instruction || '' : step}`.match(/(\d+)\s*(min|minute|minutes|sec|second|seconds)/i);
   if (!match) {
     return 0;
   }
   const amount = Number(match[1]);
   return match[2].toLowerCase().startsWith('sec') ? amount : amount * 60;
+}
+
+function recipeStepInstruction(step) {
+  return typeof step === 'object' ? step?.instruction || '' : `${step || ''}`;
+}
+
+function recipeStepTitle(step, index) {
+  return typeof step === 'object' && step?.title ? step.title : `Step ${index + 1}`;
 }
 
 function formatTimer(seconds) {
@@ -1964,6 +2117,20 @@ function ingredientSwapSuggestions(ingredients = []) {
   return [...new Set(matched.length > 0 ? matched : ['No exact match? Choose a similar protein or fresh vegetable.'])].slice(0, 4);
 }
 
+function foodSafetyGuidance(meal) {
+  const ingredients = (meal?.ingredients || []).join(' ').toLowerCase();
+  if (/chicken|turkey|poultry/.test(ingredients)) return 'Cook poultry to 165°F (74°C) at the thickest part.';
+  if (/ground beef|ground pork|ground lamb/.test(ingredients)) return 'Cook ground meat to 160°F (71°C).';
+  if (/fish|salmon|tuna|cod|tilapia/.test(ingredients)) return 'Cook fish to 145°F (63°C), or until opaque and it flakes easily.';
+  return '';
+}
+
+function recipeEquipmentList(meal) {
+  if (Array.isArray(meal?.equipment) && meal.equipment.length) return meal.equipment;
+  if (typeof meal?.equipment === 'string' && meal.equipment) return [meal.equipment];
+  return [inferEquipment(meal)];
+}
+
 function parsePrice(price) {
   const amount = Number(`${price || ''}`.replace(/[^0-9.]/g, ''));
   return Number.isFinite(amount) ? amount : 0;
@@ -2098,7 +2265,8 @@ function recreateRestaurantRecipe(query, servings) {
 }
 
 function coachTip(step, meal) {
-  if (step.toLowerCase().includes('cook')) {
+  const instruction = recipeStepInstruction(step).toLowerCase();
+  if (instruction.includes('cook')) {
     return 'Coach: lower heat if edges brown too fast. Start timer when food hits the pan.';
   }
   if (meal.airFryer) {
@@ -2930,9 +3098,13 @@ function FusionPlusScreen({
   onManage,
   selectedPlan,
   premiumAccess,
-  setupPaused
+  plans,
+  offeringsStatus,
+  offeringsError,
+  onRetryOfferings
 }) {
-  const currentPlan = fusionPlanById(selectedPlan);
+  const currentPlan = fusionPlanById(selectedPlan, plans);
+  const offeringsReady = offeringsStatus === 'ready';
 
   return (
     <Screen>
@@ -2956,10 +3128,10 @@ function FusionPlusScreen({
         </View>
 
         <View style={styles.pricingRow}>
-          {fusionPlans.map((plan) => (
+          {plans.map((plan) => (
             <Pressable
               key={plan.id}
-              onPress={() => onSelectPlan(plan.id)}
+              onPress={() => offeringsReady && onSelectPlan(plan.id)}
               style={({ pressed }) => [
                 styles.pricingCard,
                 selectedPlan === plan.id && styles.selectedPricingCard,
@@ -2978,7 +3150,7 @@ function FusionPlusScreen({
                 </View>
               ) : null}
               <Text style={styles.planName}>{plan.name}</Text>
-              <Text style={styles.planPrice}>{plan.price}</Text>
+              <Text style={styles.planPrice}>{offeringsReady ? plan.price : '—'}</Text>
               <Text style={styles.planCadence}>{plan.cadence}</Text>
               <Text style={styles.planDetail}>{plan.detail}</Text>
             </Pressable>
@@ -3004,17 +3176,27 @@ function FusionPlusScreen({
         {isPremium ? (
           <View style={styles.subscriptionStatusCard}>
             <Text style={styles.settingsTitle}>Fusion+ Active</Text>
-            <Text style={styles.settingsSubtitle}>Current plan: {currentPlan.name} {currentPlan.price}{currentPlan.cadence}</Text>
+            <Text style={styles.settingsSubtitle}>Current plan: {currentPlan.name}{currentPlan.price ? ` ${currentPlan.price}${currentPlan.cadence}` : ''}</Text>
             <Button accent={flowColors.fusion.accent} onPress={onManage}>Manage Subscription</Button>
           </View>
         ) : (
-          <Button accent={flowColors.fusion.accent} onPress={() => onSelectPlan(selectedPlan)}>Continue with {currentPlan.name}</Button>
+          <Button accent={flowColors.fusion.accent} disabled={!offeringsReady} onPress={() => onSelectPlan(selectedPlan)}>
+            {offeringsStatus === 'loading' ? 'Loading subscription options...' : `Continue with ${currentPlan.name}`}
+          </Button>
         )}
 
-        {premiumAccess.status === 'loading' ? (
+        {offeringsStatus === 'loading' ? (
+          <View>
+            <ActivityIndicator color={flowColors.fusion.accent} style={styles.paymentSpinner} />
+            <Text style={styles.authMessage}>Loading App Store prices...</Text>
+          </View>
+        ) : offeringsStatus === 'error' ? (
+          <View>
+            <Text style={styles.authError}>{offeringsError}</Text>
+            <Button variant="ghost" onPress={onRetryOfferings}>Retry</Button>
+          </View>
+        ) : premiumAccess.status === 'loading' ? (
           <Text style={styles.authMessage}>Checking Fusion+ access...</Text>
-        ) : setupPaused ? (
-          <Text style={styles.authMessage}>Purchases are paused for Apple setup. App testing can continue.</Text>
         ) : premiumAccess.error ? (
           <Text style={styles.authError}>{premiumAccess.error}</Text>
         ) : null}
@@ -3291,6 +3473,10 @@ function FoodFusionApp() {
   const [subscriptionManagementUrl, setSubscriptionManagementUrl] = useState(null);
   const [subscriptionRenewalDate, setSubscriptionRenewalDate] = useState(null);
   const [revenueCatDebug, setRevenueCatDebug] = useState(revenueCatDebugConfig());
+  const [revenueCatPackages, setRevenueCatPackages] = useState({ monthly: null, yearly: null });
+  const [offeringsStatus, setOfferingsStatus] = useState('idle');
+  const [offeringsError, setOfferingsError] = useState('');
+  const offeringsRequestRef = useRef(0);
   const [macroFilter, setMacroFilter] = useState('Balanced');
   const [fridgePersonality, setFridgePersonality] = useState('');
   const [mealHistory, setMealHistory] = useState([]);
@@ -3353,6 +3539,9 @@ function FoodFusionApp() {
   const [analysisStep, setAnalysisStep] = useState(0);
   const [recipeStepIndex, setRecipeStepIndex] = useState(0);
   const [preferences, setPreferences] = useState([]);
+  const [customPreferences, setCustomPreferences] = useState(EMPTY_CUSTOM_PREFERENCES);
+  const [customPreferenceModal, setCustomPreferenceModal] = useState(null);
+  const [customPreferenceQuery, setCustomPreferenceQuery] = useState('');
   const [dislikedIngredients, setDislikedIngredients] = useState([]);
   const [dislikeInput, setDislikeInput] = useState('');
   const [servings, setServings] = useState(2);
@@ -3603,6 +3792,7 @@ function FoodFusionApp() {
       storedDate,
       storedPremium,
       storedPremiumPlan,
+      storedPremiumExpiration,
       storedHistory,
       storedFavoriteScans,
       storedFavorites,
@@ -3612,6 +3802,7 @@ function FoodFusionApp() {
       storedRecentSearches,
       storedOrderHistory,
       storedPreferences,
+      storedCustomPreferences,
       storedDislikes,
       storedServings,
       storedEquipment,
@@ -3635,6 +3826,7 @@ function FoodFusionApp() {
       getCachedItem(SCAN_KEY, userId),
       getCachedItem(PREMIUM_KEY, userId),
       getCachedItem(PREMIUM_PLAN_KEY, userId),
+      getCachedItem(PREMIUM_EXPIRATION_KEY, userId),
       getCachedItem(HISTORY_KEY, userId),
       getCachedItem(FAVORITE_SCANS_KEY, userId),
       getCachedItem(FAVORITES_KEY, userId),
@@ -3644,6 +3836,7 @@ function FoodFusionApp() {
       getCachedItem(RECENT_SEARCHES_KEY, userId),
       getCachedItem(ORDER_HISTORY_KEY, userId),
       getCachedItem(PREFERENCES_KEY, userId),
+      getCachedItem(CUSTOM_PREFERENCES_KEY, userId),
       getCachedItem(DISLIKES_KEY, userId),
       getCachedItem(SERVINGS_KEY, userId),
       getCachedItem(EQUIPMENT_KEY, userId),
@@ -3669,8 +3862,11 @@ function FoodFusionApp() {
     return {
       scanDate: storedDate,
       subscription: storedPremium === null ? null : {
-        isPremium: storedPremium === 'true',
-        selectedPlan: storedPremiumPlan || 'yearly'
+        isPremium: storedPremium === 'true' && Boolean(storedPremiumExpiration) &&
+          Number.isFinite(new Date(storedPremiumExpiration).getTime()) &&
+          new Date(storedPremiumExpiration).getTime() > Date.now(),
+        selectedPlan: storedPremiumPlan || 'yearly',
+        expirationDate: storedPremiumExpiration || null
       },
       history: parseStoredJson(storedHistory, []),
       favoriteScanIds: parseStoredJson(storedFavoriteScans, []),
@@ -3681,6 +3877,7 @@ function FoodFusionApp() {
       recentSearches: parseStoredJson(storedRecentSearches, []),
       orderHistory: parseStoredJson(storedOrderHistory, []),
       preferences: parseStoredJson(storedPreferences, []),
+      customPreferences: normalizeCustomPreferences(parseStoredJson(storedCustomPreferences, EMPTY_CUSTOM_PREFERENCES)),
       dislikes: parseStoredJson(storedDislikes, []),
       servings: storedServings ? Number(storedServings) : 2,
       equipment: storedEquipment || 'Stove',
@@ -3721,6 +3918,7 @@ function FoodFusionApp() {
       recentSearches: [],
       orderHistory: [],
       preferences: [],
+      customPreferences: EMPTY_CUSTOM_PREFERENCES,
       dislikes: [],
       servings: 2,
       equipment: 'Stove',
@@ -3782,6 +3980,7 @@ function FoodFusionApp() {
     setRecentSearches(snapshot.recentSearches || []);
     setOrderHistory(snapshot.orderHistory || []);
     setPreferences(snapshot.preferences || []);
+    setCustomPreferences(normalizeCustomPreferences(snapshot.customPreferences));
     setDislikedIngredients(snapshot.dislikes || []);
     setServings(snapshot.servings || 2);
     setEquipment(snapshot.equipment || 'Stove');
@@ -3853,7 +4052,7 @@ function FoodFusionApp() {
 
   async function applySubscriptionResultForUser(userId, result, source = 'RevenueCat') {
     const active = Boolean(result?.isPremium);
-    const plan = active ? result?.selectedPlan || selectedFusionPlan || 'yearly' : 'yearly';
+    const plan = result?.selectedPlan || selectedFusionPlan || 'yearly';
     if (activeUserIdRef.current === userId) {
       setIsPremium(active);
       setSelectedFusionPlan(plan);
@@ -3872,7 +4071,8 @@ function FoodFusionApp() {
     });
     await withRestoreTimeout(multiSetCachedForUser(userId, [
       [PREMIUM_KEY, active ? 'true' : 'false'],
-      [PREMIUM_PLAN_KEY, plan]
+      [PREMIUM_PLAN_KEY, plan],
+      [PREMIUM_EXPIRATION_KEY, result?.expirationDate || result?.renewsAt || '']
     ]), 'Subscription cache save', 2500).catch((error) => {
       console.warn('[Subscription] Cache save deferred:', error?.message);
     });
@@ -3996,18 +4196,32 @@ function FoodFusionApp() {
     let finalPlan = 'yearly';
     let source = 'Free';
 
+    const remoteExpiration = remoteSubscription?.renews_at || null;
+    const cachedExpiration = cachedAccount.subscription?.expirationDate || null;
+    const hasFutureExpiration = (value) => {
+      if (!value) return false;
+      const timestamp = new Date(value).getTime();
+      return Number.isFinite(timestamp) && timestamp > Date.now();
+    };
+
     if (remoteSubscription) {
-      finalActive = remoteSubscription.status === 'active' && remoteSubscription.plan !== 'free';
+      finalActive = remoteSubscription.status === 'active' &&
+        remoteSubscription.plan !== 'free' &&
+        hasFutureExpiration(remoteExpiration);
       finalPlan = remoteSubscription.plan === 'free' ? 'yearly' : remoteSubscription.plan || 'yearly';
       source = 'Supabase';
-    } else if (cachedAccount.subscription?.isPremium) {
+    } else if (cachedAccount.subscription?.isPremium && hasFutureExpiration(cachedExpiration)) {
       finalActive = true;
       finalPlan = cachedAccount.subscription.selectedPlan || 'yearly';
       source = 'Cache';
       if (options.syncCacheToSupabase && supabaseConfigured && activeUserIdRef.current === userId) {
         try {
           await withRestoreTimeout(
-            syncSubscriptionStatus({ isPremium: true, selectedPlan: finalPlan }),
+            syncSubscriptionStatus({
+              isPremium: true,
+              selectedPlan: finalPlan,
+              renewsAt: cachedExpiration
+            }),
             'Subscription cache backfill'
           );
           source = 'Cache';
@@ -4021,7 +4235,7 @@ function FoodFusionApp() {
       setIsPremium(finalActive);
       setSelectedFusionPlan(finalPlan);
       setSubscriptionManagementUrl(null);
-      setSubscriptionRenewalDate(remoteSubscription?.renews_at || null);
+      setSubscriptionRenewalDate(remoteExpiration || cachedExpiration || null);
     }
     premiumAccess.setPremiumState({
       isPremium: finalActive,
@@ -4029,13 +4243,14 @@ function FoodFusionApp() {
       source,
       status: finalActive ? 'active' : 'inactive',
       error: '',
-      expirationDate: remoteSubscription?.renews_at || null,
+      expirationDate: remoteExpiration || cachedExpiration || null,
       managementURL: null,
       productIdentifier: remoteSubscription?.external_subscription_id || null
     });
     await withRestoreTimeout(multiSetCachedForUser(userId, [
       [PREMIUM_KEY, finalActive ? 'true' : 'false'],
-      [PREMIUM_PLAN_KEY, finalPlan]
+      [PREMIUM_PLAN_KEY, finalPlan],
+      [PREMIUM_EXPIRATION_KEY, finalActive ? (remoteExpiration || cachedExpiration || '') : '']
     ]), 'Subscription cache save', 2500).catch((error) => {
       console.warn('[Subscription] Cache save deferred:', error?.message);
     });
@@ -4114,9 +4329,13 @@ function FoodFusionApp() {
 
     if (remote?.preferences) {
       const remoteFoodStyles = remote.preferences.food_styles || [];
+      const remoteCustomPreferences = remote.preferences.nutrition_goals?.customPreferences
+        ? normalizeCustomPreferences(remote.preferences.nutrition_goals.customPreferences)
+        : normalizeCustomPreferences(cachedAccount.customPreferences);
       const remoteDislikes = remote.preferences.disliked_ingredients || [];
       const remoteEquipment = remote.preferences.equipment || [];
       setPreferences(remoteFoodStyles);
+      setCustomPreferences(remoteCustomPreferences);
       setDislikedIngredients(remoteDislikes);
       setEquipmentProfile(remoteEquipment);
       setEquipment(remote.preferences.primary_equipment || 'Stove');
@@ -4136,6 +4355,7 @@ function FoodFusionApp() {
         }
       await withRestoreTimeout(multiSetCachedForUser(userId, [
         [PREFERENCES_KEY, JSON.stringify(remoteFoodStyles)],
+        [CUSTOM_PREFERENCES_KEY, JSON.stringify(remoteCustomPreferences)],
         [DISLIKES_KEY, JSON.stringify(remoteDislikes)],
         [EQUIPMENT_PROFILE_KEY, JSON.stringify(remoteEquipment)],
         [EQUIPMENT_KEY, remote.preferences.primary_equipment || 'Stove'],
@@ -4202,8 +4422,11 @@ function FoodFusionApp() {
   }
 
   const fusionStatusLoading = Boolean(isLoggedIn && subscriptionLoading);
-  const revenueCatSetupPausedForDev = __DEV__ && Boolean(revenueCatDebug.setupPaused);
   const devForceFusionPlusEnabled = __DEV__ && Boolean(revenueCatDebug.devForceFusionPlus);
+  const localizedFusionPlans = useMemo(() => fusionPlans.map((plan) => ({
+    ...plan,
+    price: revenueCatPackages[plan.id]?.product?.priceString || ''
+  })), [revenueCatPackages]);
   const scansLeft = fusionStatusLoading || isPremium || scanDate !== todayKey();
   const recentRecipes = useMemo(() => {
     const seen = new Set();
@@ -4586,13 +4809,38 @@ function FoodFusionApp() {
   }, []);
 
   useEffect(() => {
-    checkRecipeMcpStatus().then((status) => {
-      setRecipeMcpStatus(status);
-      setRecipeMcpDebug(getRecipeMcpDebug());
-    }).catch(() => {
-      setRecipeMcpStatus({ connected: false, status: 'Not Connected' });
-      setRecipeMcpDebug(getRecipeMcpDebug());
-    });
+    if (['paywall', 'fusionPayment', 'manageSubscription'].includes(screen)) {
+      loadFusionOfferings();
+    }
+  }, [screen]);
+
+  useEffect(() => {
+    let removeListener = null;
+    let disposed = false;
+    initializeRevenueCat()
+      .then(() => {
+        if (disposed || !revenueCatConfigured()) {
+          return;
+        }
+        removeListener = addRevenueCatCustomerInfoUpdateListener((subscription) => {
+          const userId = activeUserIdRef.current;
+          if (!userId) {
+            return;
+          }
+          applySubscriptionResultForUser(userId, subscription, 'RevenueCat').catch((error) => {
+            console.warn('[RevenueCat] live entitlement refresh failed:', error?.message || String(error));
+          });
+        });
+      })
+      .catch((error) => {
+        console.warn('[RevenueCat] customer info listener unavailable:', error?.message || String(error));
+      });
+    return () => {
+      disposed = true;
+      if (removeListener) {
+        removeListener();
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -4811,6 +5059,7 @@ function FoodFusionApp() {
     setScanDetections([]);
     setScanSource('');
     setPreferences([]);
+    setCustomPreferences(EMPTY_CUSTOM_PREFERENCES);
     setDislikedIngredients([]);
     setServings(2);
     setEquipment('Stove');
@@ -4954,7 +5203,7 @@ function FoodFusionApp() {
       servings,
       recipeSource,
       macroLock,
-      nutritionGoals: {},
+      nutritionGoals: { customPreferences },
       household: { members: householdMembers },
       budgetGoals,
       notificationPreferences,
@@ -5098,15 +5347,17 @@ function FoodFusionApp() {
         detections: scannedDetections,
         source: scanResult.source || 'openai'
       });
-    } catch (error) {
-      console.error('[FoodScan] Scan failed:', error);
-      console.warn('[AI Scan] fallback reason', error?.message || 'scan failed');
-      const scannedIngredients = reviewSafeScanDetections.map((item) => item.name);
-      await completeScan(scannedIngredients, nextScreen, reviewSafeScanNotice, {
-        detections: reviewSafeScanDetections,
-        source: 'demo'
-      });
-      showToast('FoodFusion Analysis ready');
+  } catch (error) {
+      if (__DEV__) {
+        console.warn('[FoodScan] Scan failed:', error?.message || String(error));
+        console.warn('[AI Scan] fallback reason', error?.message || 'scan failed');
+      }
+      const message = 'FoodFusion couldn’t complete the scan. Please try again.';
+      setRecipeNotice(message);
+      Alert.alert('AI Unavailable', message, [
+        { text: 'Try Again', onPress: () => capturePhoto() },
+        { text: 'Add Manually', onPress: () => setScreen('ingredients') }
+      ]);
     } finally {
       setIsScanningPhoto(false);
       try {
@@ -5222,6 +5473,39 @@ function FoodFusionApp() {
     }
   }
 
+  async function loadFusionOfferings() {
+    const requestId = offeringsRequestRef.current + 1;
+    offeringsRequestRef.current = requestId;
+    setOfferingsStatus('loading');
+    setOfferingsError('');
+    try {
+      if (!revenueCatConfigured()) {
+        const error = new Error('RevenueCat is not configured in this build.');
+        error.revenueCatCategory = 'configuration';
+        throw error;
+      }
+      const packages = await getRevenueCatPaywallPackages(activeUserIdRef.current);
+      if (requestId !== offeringsRequestRef.current) {
+        return;
+      }
+      setRevenueCatPackages({ monthly: packages.monthly, yearly: packages.yearly });
+      setOfferingsStatus('ready');
+      setRevenueCatDebug(revenueCatDebugConfig());
+    } catch (error) {
+      if (requestId !== offeringsRequestRef.current) {
+        return;
+      }
+      setRevenueCatPackages({ monthly: null, yearly: null });
+      setOfferingsStatus('error');
+      setOfferingsError(offeringLoadErrorMessage(error));
+      setRevenueCatDebug(revenueCatDebugConfig());
+      console.warn('[RevenueCat] paywall offerings failed:', {
+        category: revenueCatErrorCategory(error),
+        message: error?.message || String(error)
+      });
+    }
+  }
+
   function chooseFusionPlan(planId) {
     setSelectedFusionPlan(planId);
     setScreen('fusionPayment');
@@ -5240,11 +5524,8 @@ function FoodFusionApp() {
       Alert.alert('Subscriptions Unavailable', 'Fusion+ checkout is not available in this build.');
       return;
     }
-    if (__DEV__ && revenueCatSetupPaused()) {
-      const message = 'Purchases are paused for Apple setup. App testing can continue.';
-      setRevenueCatDebug(revenueCatDebugConfig());
-      premiumAccess.setPremiumState({ status: 'setup_paused', error: message });
-      showToast(message);
+    if (offeringsStatus !== 'ready' || !revenueCatPackages[selectedFusionPlan]) {
+      setScreen('paywall');
       return;
     }
 
@@ -5261,23 +5542,22 @@ function FoodFusionApp() {
       setScreen('fusionSuccess');
     } catch (error) {
       setRevenueCatDebug(revenueCatDebugConfig());
-      const setupPaused = __DEV__ && revenueCatSetupPaused();
-      const message = setupPaused
-        ? 'Purchases are paused for Apple setup. App testing can continue.'
-        : error?.message || 'Fusion+ checkout could not be completed.';
-      if (setupPaused || isKnownRevenueCatSetupError(error)) {
-        console.log('[RevenueCat] setup paused:', message);
+      const category = revenueCatErrorCategory(error);
+      const userCancelled = category === 'purchase_cancelled';
+      const setupError = category === 'configuration';
+      const message = offeringLoadErrorMessage(error);
+      if (userCancelled) {
+        console.log('[RevenueCat] purchase cancelled by user');
+      } else if (setupError || isKnownRevenueCatSetupError(error)) {
+        console.warn('[RevenueCat] purchase configuration error:', message);
       } else {
         console.warn('[RevenueCat] purchase failed:', message);
       }
       premiumAccess.setPremiumState({
-        status: setupPaused ? 'setup_paused' : 'error',
-        error: message
+        status: userCancelled ? 'idle' : 'error',
+        error: userCancelled ? '' : message
       });
-      const userCancelled = Boolean(error?.userCancelled || error?.code === 'PURCHASE_CANCELLED');
-      if (setupPaused) {
-        showToast(message);
-      } else if (!userCancelled) {
+      if (!userCancelled) {
         Alert.alert('Purchase Unavailable', message);
       }
     } finally {
@@ -6516,6 +6796,107 @@ function FoodFusionApp() {
     hapticTap();
   }
 
+  function builtInOptionsForCategory(category) {
+    if (category === 'Ingredients To Avoid') return dislikedIngredients;
+    if (category === 'Kitchen Equipment') return kitchenEquipmentOptions.map(titleCasePreference);
+    const section = preferenceSections.find((item) => item.title === category);
+    return (section?.options || []).map((item) => preferenceOption(item).label);
+  }
+
+  function openCustomPreference(category) {
+    setCustomPreferenceModal(category);
+    setCustomPreferenceQuery('');
+  }
+
+  async function selectExistingPreference(category, label) {
+    if (category === 'Ingredients To Avoid') {
+      setCustomPreferenceQuery(label);
+      return;
+    }
+    if (category === 'Kitchen Equipment') {
+      const stored = kitchenEquipmentOptions.find((item) => titleCasePreference(item) === label) || label.toLowerCase();
+      await toggleEquipmentProfile(stored);
+      return;
+    }
+    const section = preferenceSections.find((item) => item.title === category);
+    const option = (section?.options || []).map(preferenceOption).find((item) => item.label === label);
+    if (option) await togglePreference(option.value);
+  }
+
+  async function persistCustomPreferenceState(nextCustomPreferences, overrides = {}) {
+    setCustomPreferences(nextCustomPreferences);
+    await updateOfflineCache(setCachedItem(CUSTOM_PREFERENCES_KEY, JSON.stringify(nextCustomPreferences)));
+    syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({
+      ...overrides,
+      nutritionGoals: { customPreferences: nextCustomPreferences }
+    })));
+  }
+
+  async function addCustomPreference(category, rawValue = customPreferenceQuery) {
+    const label = titleCasePreference(rawValue);
+    if (!category || !label) return;
+    const allKnown = [
+      ...builtInOptionsForCategory(category),
+      ...(customPreferences[category] || [])
+    ];
+    if (allKnown.some((item) => `${item}`.toLowerCase() === label.toLowerCase())) {
+      setCustomPreferenceQuery('');
+      return;
+    }
+    const nextCustomPreferences = normalizeCustomPreferences({
+      ...customPreferences,
+      [category]: [...(customPreferences[category] || []), label]
+    });
+    if (category === 'Allergies' || category === 'Ingredients To Avoid') {
+      const storedValue = label.toLowerCase();
+      const nextDislikes = dislikedIngredients.some((item) => item.toLowerCase() === storedValue)
+        ? dislikedIngredients
+        : [...dislikedIngredients, storedValue];
+      setDislikedIngredients(nextDislikes);
+      await updateOfflineCache(setCachedItem(DISLIKES_KEY, JSON.stringify(nextDislikes)));
+      await persistCustomPreferenceState(nextCustomPreferences, { dislikedIngredients: nextDislikes });
+    } else if (category === 'Kitchen Equipment') {
+      const storedValue = label.toLowerCase();
+      const nextEquipment = equipmentProfile.some((item) => item.toLowerCase() === storedValue)
+        ? equipmentProfile
+        : [...equipmentProfile, storedValue];
+      setEquipmentProfile(nextEquipment);
+      await updateOfflineCache(setCachedItem(EQUIPMENT_PROFILE_KEY, JSON.stringify(nextEquipment)));
+      await persistCustomPreferenceState(nextCustomPreferences, { equipment: nextEquipment });
+    } else {
+      const nextPreferences = preferences.some((item) => item.toLowerCase() === label.toLowerCase())
+        ? preferences
+        : [...preferences, label];
+      setPreferences(nextPreferences);
+      await updateOfflineCache(setCachedItem(PREFERENCES_KEY, JSON.stringify(nextPreferences)));
+      await persistCustomPreferenceState(nextCustomPreferences, { foodStyles: nextPreferences });
+    }
+    setCustomPreferenceQuery('');
+  }
+
+  async function removeCustomPreference(category, label) {
+    const nextCustomPreferences = normalizeCustomPreferences({
+      ...customPreferences,
+      [category]: (customPreferences[category] || []).filter((item) => item.toLowerCase() !== label.toLowerCase())
+    });
+    if (category === 'Allergies' || category === 'Ingredients To Avoid') {
+      const nextDislikes = dislikedIngredients.filter((item) => item.toLowerCase() !== label.toLowerCase());
+      setDislikedIngredients(nextDislikes);
+      await updateOfflineCache(setCachedItem(DISLIKES_KEY, JSON.stringify(nextDislikes)));
+      await persistCustomPreferenceState(nextCustomPreferences, { dislikedIngredients: nextDislikes });
+    } else if (category === 'Kitchen Equipment') {
+      const nextEquipment = equipmentProfile.filter((item) => item.toLowerCase() !== label.toLowerCase());
+      setEquipmentProfile(nextEquipment);
+      await updateOfflineCache(setCachedItem(EQUIPMENT_PROFILE_KEY, JSON.stringify(nextEquipment)));
+      await persistCustomPreferenceState(nextCustomPreferences, { equipment: nextEquipment });
+    } else {
+      const nextPreferences = preferences.filter((item) => item.toLowerCase() !== label.toLowerCase());
+      setPreferences(nextPreferences);
+      await updateOfflineCache(setCachedItem(PREFERENCES_KEY, JSON.stringify(nextPreferences)));
+      await persistCustomPreferenceState(nextCustomPreferences, { foodStyles: nextPreferences });
+    }
+  }
+
   async function addDislikedIngredient() {
     const nextDislike = dislikeInput.trim().toLowerCase();
     if (!nextDislike) {
@@ -6530,9 +6911,21 @@ function FoodFusionApp() {
 
   async function deleteDislikedIngredient(item) {
     const nextDislikes = dislikedIngredients.filter((dislike) => dislike !== item);
+    const nextCustomPreferences = normalizeCustomPreferences({
+      ...customPreferences,
+      Allergies: (customPreferences.Allergies || []).filter((label) => label.toLowerCase() !== item.toLowerCase()),
+      'Ingredients To Avoid': (customPreferences['Ingredients To Avoid'] || []).filter((label) => label.toLowerCase() !== item.toLowerCase())
+    });
     setDislikedIngredients(nextDislikes);
-    await updateOfflineCache(setCachedItem(DISLIKES_KEY, JSON.stringify(nextDislikes)));
-    syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ dislikedIngredients: nextDislikes })));
+    setCustomPreferences(nextCustomPreferences);
+    await updateOfflineCache(Promise.all([
+      setCachedItem(DISLIKES_KEY, JSON.stringify(nextDislikes)),
+      setCachedItem(CUSTOM_PREFERENCES_KEY, JSON.stringify(nextCustomPreferences))
+    ]));
+    syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({
+      dislikedIngredients: nextDislikes,
+      nutritionGoals: { customPreferences: nextCustomPreferences }
+    })));
   }
 
   async function selectServings(nextServings) {
@@ -6549,14 +6942,33 @@ function FoodFusionApp() {
 
   async function clearPreferences() {
     setPreferences([]);
-    await updateOfflineCache(removeCachedItem(PREFERENCES_KEY));
-    syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ foodStyles: [] })));
+    setCustomPreferences(EMPTY_CUSTOM_PREFERENCES);
+    await updateOfflineCache(Promise.all([
+      removeCachedItem(PREFERENCES_KEY),
+      removeCachedItem(CUSTOM_PREFERENCES_KEY)
+    ]));
+    syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({
+      foodStyles: [],
+      nutritionGoals: { customPreferences: EMPTY_CUSTOM_PREFERENCES }
+    })));
   }
 
   async function clearDislikes() {
+    const nextCustomPreferences = normalizeCustomPreferences({
+      ...customPreferences,
+      Allergies: [],
+      'Ingredients To Avoid': []
+    });
     setDislikedIngredients([]);
-    await updateOfflineCache(removeCachedItem(DISLIKES_KEY));
-    syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({ dislikedIngredients: [] })));
+    setCustomPreferences(nextCustomPreferences);
+    await updateOfflineCache(Promise.all([
+      removeCachedItem(DISLIKES_KEY),
+      setCachedItem(CUSTOM_PREFERENCES_KEY, JSON.stringify(nextCustomPreferences))
+    ]));
+    syncQuietly('preferences', () => syncUserPreferences(preferenceSnapshot({
+      dislikedIngredients: [],
+      nutritionGoals: { customPreferences: nextCustomPreferences }
+    })));
   }
 
   async function resetServingsEquipment() {
@@ -7103,6 +7515,7 @@ function FoodFusionApp() {
     setTrackingDetailsOpen(false);
     setPendingScan(null);
     setPreferences([]);
+    setCustomPreferences(EMPTY_CUSTOM_PREFERENCES);
     setDislikedIngredients([]);
     setDislikeInput('');
     setServings(2);
@@ -7151,6 +7564,7 @@ function FoodFusionApp() {
       RECENT_SEARCHES_KEY,
       ORDER_HISTORY_KEY,
       PREFERENCES_KEY,
+      CUSTOM_PREFERENCES_KEY,
       DISLIKES_KEY,
       SERVINGS_KEY,
       EQUIPMENT_KEY,
@@ -7183,7 +7597,7 @@ function FoodFusionApp() {
 
   async function shareRecipe(meal) {
     await Share.share({
-      message: `${meal.title}\n${meal.time} • ${meal.servingNote || `${servings} servings`}\n\nIngredients:\n${meal.ingredients.join(', ')}\n\nSteps:\n${meal.steps.join('\n')}\n\nFoodFusion AI - Scan. Match. Cook.`
+      message: `${meal.title}\n${meal.time} • ${meal.servingNote || `${servings} servings`}\n\nIngredients:\n${meal.ingredients.join(', ')}\n\nSteps:\n${meal.steps.map((step, index) => `${index + 1}. ${recipeStepInstruction(step)}`).join('\n')}\n\nFoodFusion AI - Scan. Match. Cook.`
     });
   }
 
@@ -7301,7 +7715,9 @@ function FoodFusionApp() {
         ingredients,
         recipeType: selectedRecipeType,
         preferences: mealSettings.preferences,
+        ingredientsToAvoid: dislikedIngredients,
         equipment,
+        availableEquipment: equipmentProfile,
         servings
       });
       const debug = getRecipeMcpDebug();
@@ -7522,7 +7938,7 @@ function FoodFusionApp() {
   }
 
   if (screen === 'home') {
-    const homeFusionPlan = fusionPlanById(selectedFusionPlan);
+    const homeFusionPlan = fusionPlanById(selectedFusionPlan, localizedFusionPlans);
     const recipeTone = flowColors[selectedRecipeType];
 
     return (
@@ -8171,11 +8587,6 @@ function FoodFusionApp() {
     const recipeTone = flowColors[recipeTypeForMeal(selectedMeal, selectedRecipeType)];
     const swapIdeas = ingredientSwapSuggestions(selectedMeal.ingredients);
     const isLastStep = recipeStepIndex === selectedMeal.steps.length - 1;
-    const goToRecipeStep = (nextIndex) => {
-      const boundedIndex = Math.max(0, Math.min(selectedMeal.steps.length - 1, nextIndex));
-      setRecipeStepIndex(boundedIndex);
-      recipePagerRef.current?.scrollTo({ x: boundedIndex * recipeCardWidth, animated: true });
-    };
 
     return (
       <Screen toast={toast}>
@@ -8184,13 +8595,12 @@ function FoodFusionApp() {
           <FlowProgress steps={['Scan', 'Ingredients', 'Recipes']} current={2} tone={recipeTone} />
           <MealPreviewArt title={selectedMeal.title} />
           <Text style={styles.recipeTitle}>{selectedMeal.title}</Text>
-          {selectedMeal.subtitle ? <Text style={styles.recipeSubtitle}>{selectedMeal.subtitle}</Text> : null}
+          {(selectedMeal.description || selectedMeal.subtitle) ? <Text style={styles.recipeSubtitle}>{selectedMeal.description || selectedMeal.subtitle}</Text> : null}
           <View style={styles.recipeMetaRow}>
-            <Pill label={recipeTypeForMeal(selectedMeal, selectedRecipeType)} active accent={recipeTone.accent} tint={recipeTone.tint} />
-            <Pill label={selectedMeal.time} active accent={recipeTone.accent} tint={recipeTone.tint} />
-            <Pill label={selectedMeal.difficulty} />
+            {selectedMeal.prepTimeMinutes ? <Pill label={`Prep ${selectedMeal.prepTimeMinutes} Min`} /> : null}
+            {selectedMeal.cookTimeMinutes ? <Pill label={`Cook ${selectedMeal.cookTimeMinutes} Min`} /> : null}
+            <Pill label={`Total ${selectedMeal.totalTimeMinutes ? `${selectedMeal.totalTimeMinutes} Min` : selectedMeal.time}`} active accent={recipeTone.accent} tint={recipeTone.tint} />
             <Pill label={selectedMeal.servingNote || `${servings} servings`} />
-            {selectedMeal.airFryer ? <Pill label={selectedMeal.airFryer} active /> : null}
           </View>
           <View style={styles.recipeActionRow}>
             <CompactButton accent={flowColors.saved.accent} onPress={() => toggleFavorite(selectedMeal)}>
@@ -8198,6 +8608,7 @@ function FoodFusionApp() {
             </CompactButton>
             <CompactButton variant="ghost" onPress={() => shareRecipe(selectedMeal)}>Share</CompactButton>
           </View>
+          {isPremium && selectedMeal.macros ? <MacroGrid macros={selectedMeal.macros} /> : null}
           <View style={styles.recipeIngredientCard}>
             <Text style={styles.swapTitle}>Ingredients</Text>
             <Text style={styles.swapText}>
@@ -8205,7 +8616,12 @@ function FoodFusionApp() {
             </Text>
             <Text style={styles.swapText}>Portion mode: {portionMode}</Text>
           </View>
-          {isPremium && selectedMeal.macros ? <MacroGrid macros={selectedMeal.macros} /> : null}
+          <View style={styles.recipeIngredientCard}>
+            <Text style={styles.swapTitle}>Equipment Needed</Text>
+            <Text style={styles.swapText}>
+              {recipeEquipmentList(selectedMeal).filter(Boolean).join(', ')}
+            </Text>
+          </View>
           <View style={styles.pairingCard}>
             <Text style={styles.swapTitle}>Meal + Drink Pairing</Text>
             {mealPairings(selectedMeal).map((pairing, index) => (
@@ -8215,25 +8631,21 @@ function FoodFusionApp() {
               </Pressable>
             ))}
           </View>
-          <ScrollView
-            ref={recipePagerRef}
-            horizontal
-            pagingEnabled
-            showsHorizontalScrollIndicator={false}
-            onMomentumScrollEnd={(event) => {
-              const nextIndex = Math.round(event.nativeEvent.contentOffset.x / recipeCardWidth);
-              setRecipeStepIndex(nextIndex);
-            }}
-            style={styles.stepPager}
-          >
+          <Text style={styles.recipeSectionTitle}>Directions</Text>
+          <View style={styles.recipeStepList}>
             {selectedMeal.steps.map((step, index) => (
-              <View key={step} style={[styles.tiktokStepCard, { width: recipeCardWidth }]}>
-                <Text style={styles.tiktokStepCount}>Step {index + 1} of {selectedMeal.steps.length}</Text>
-                <Text style={styles.tiktokStepNumber}>{index + 1}</Text>
-                <Text style={styles.tiktokStepText}>{step}</Text>
-                <Text style={styles.stepTimerText}>
-                  {selectedMeal.airFryer || (parseMinutes(selectedMeal.time) <= 15 ? `${selectedMeal.time} total` : 'Swipe or tap Next')} • For {selectedMeal.servingNote || `${servings} servings`}
-                </Text>
+              <View key={`${index}-${recipeStepInstruction(step)}`} style={styles.recipeDirectionCard}>
+                <Text style={styles.recipeDirectionNumber}>Step {index + 1}</Text>
+                {recipeStepTitle(step, index) !== `Step ${index + 1}` ? (
+                  <Text style={styles.recipeDirectionTitle}>{recipeStepTitle(step, index)}</Text>
+                ) : null}
+                <Text style={styles.recipeDirectionText}>{recipeStepInstruction(step)}</Text>
+                {typeof step === 'object' && (step.durationMinutes || step.temperature) ? (
+                  <Text style={styles.stepTimerText}>{[
+                    step.durationMinutes ? `${step.durationMinutes} Min` : null,
+                    step.temperature || null
+                  ].filter(Boolean).join(' • ')}</Text>
+                ) : null}
                 <Pressable onPress={() => startStepTimer(step, index)} style={styles.timerButton}>
                   <Text style={styles.timerButtonText}>
                     {activeTimerStep === index && timerSeconds > 0 ? formatTimer(timerSeconds) : 'Start Timer'}
@@ -8241,35 +8653,25 @@ function FoodFusionApp() {
                 </Pressable>
               </View>
             ))}
-          </ScrollView>
-          <View style={styles.stepNavRow}>
-            <CompactButton
-              variant="ghost"
-              disabled={recipeStepIndex === 0}
-              onPress={() => goToRecipeStep(recipeStepIndex - 1)}
-            >
-              Back
-            </CompactButton>
-            <CompactButton
-              onPress={() => {
-                if (isLastStep) {
-                  setScreen('home');
-                  return;
-                }
-                goToRecipeStep(recipeStepIndex + 1);
-              }}
-            >
-              {isLastStep ? 'Done' : 'Next'}
-            </CompactButton>
           </View>
           <View style={styles.swapCard}>
             <Text style={styles.swapTitle}>AI Cooking Coach</Text>
             <Text style={styles.swapText}>{coachTip(selectedMeal.steps[recipeStepIndex] || selectedMeal.steps[0], selectedMeal)}</Text>
-            <Text style={styles.swapTitle}>Ingredient Swaps</Text>
-            {swapIdeas.map((idea) => (
-              <Text key={idea} style={styles.swapText}>{idea}</Text>
-            ))}
           </View>
+          {(selectedMeal.tips?.length || swapIdeas.length || foodSafetyGuidance(selectedMeal)) ? (
+            <View style={styles.swapCard}>
+              <Text style={styles.swapTitle}>Tips / Substitutions</Text>
+              {foodSafetyGuidance(selectedMeal) ? <Text style={styles.swapText}>{foodSafetyGuidance(selectedMeal)}</Text> : null}
+              {(selectedMeal.tips || []).map((tip) => <Text key={tip} style={styles.swapText}>{tip}</Text>)}
+              {swapIdeas.map((idea) => <Text key={idea} style={styles.swapText}>{idea}</Text>)}
+            </View>
+          ) : null}
+          {selectedMeal.source ? (
+            <View style={styles.recipeSourceCard}>
+              <Text style={styles.swapTitle}>Source</Text>
+              <Text style={styles.swapText}>{selectedMeal.attribution || selectedMeal.source}</Text>
+            </View>
+          ) : null}
           <Button onPress={() => setScreen('cooking')}>Cooking Mode</Button>
           <Button variant="ghost" onPress={postCreation}>Post Creation</Button>
           {isLastStep ? (
@@ -8309,7 +8711,7 @@ function FoodFusionApp() {
         <View style={styles.cookingBody}>
           <Text style={styles.cookingStepCount}>Step {recipeStepIndex + 1} of {selectedMeal.steps.length}</Text>
           <Text style={styles.cookingAwakeText}>Display stays on while you cook</Text>
-          <Text style={styles.cookingText}>{currentStep}</Text>
+          <Text style={styles.cookingText}>{recipeStepInstruction(currentStep)}</Text>
           <View style={styles.cookingChecklist}>
             {selectedMeal.ingredients.slice(0, 5).map((item) => (
               <Text key={item} style={styles.cookingIngredient}>□ {item}</Text>
@@ -8352,37 +8754,61 @@ function FoodFusionApp() {
 
   if (screen === 'profile') {
     const mealsCooked = mealHistory.reduce((total, entry) => total + entry.meals.length, 0);
-    const plan = fusionPlanById(selectedFusionPlan);
+    const mealsLogged = mealHistory.reduce((total, entry) => total + (entry.meals?.length || 0), 0);
+    const groceryItemCount = groceryList.length;
+    const plan = fusionPlanById(selectedFusionPlan, localizedFusionPlans);
+    const profileStats = [
+      {
+        label: 'Plan',
+        value: fusionStatusLoading ? 'Checking...' : isPremium ? 'Fusion+' : 'Fusion Free',
+        subtitle: isPremium ? 'Unlimited scans' : '1 scan daily'
+      },
+      {
+        label: 'Scans today',
+        value: scanDate === todayKey() ? scanCountToday || 1 : 0
+      },
+      {
+        label: 'Meals cooked',
+        value: mealsCooked
+      },
+      {
+        label: 'Favorites saved',
+        value: favorites.length
+      },
+      {
+        label: 'Grocery items',
+        value: groceryItemCount
+      },
+      {
+        label: 'Meals logged',
+        value: mealsLogged
+      }
+    ];
     return (
       <Screen>
         <AppHeader eyebrow="Profile" onSettings={() => setScreen('settings')} accent={flowColors.profile.accent} />
-        <ScrollView showsVerticalScrollIndicator={false} style={styles.tabScroll} contentContainerStyle={styles.tabScrollContent}>
+        <ScrollView showsVerticalScrollIndicator={false} style={styles.tabScroll} contentContainerStyle={styles.profileScrollContent}>
           <View style={styles.profileHero}>
             <Text style={styles.profileTitle}>{userProfile?.name || userProfile?.email?.split('@')[0] || 'FoodFusion Member'}</Text>
             <Text style={styles.profileMeta}>{userProfile?.email || 'Signed in'}</Text>
             <Text style={styles.profileMeta}>{fusionStatusLoading ? 'Checking Fusion+ status...' : isPremium ? `Fusion+ • ${plan.name} plan` : 'Fusion Free'}</Text>
           </View>
           <View style={styles.profileGrid}>
-            <View style={styles.profileStat}>
-              <Text style={styles.profileStatValue}>{fusionStatusLoading ? '...' : isPremium ? 'Plus' : 'Free'}</Text>
-              <Text style={styles.profileStatLabel}>Fusion+</Text>
-            </View>
-            <View style={styles.profileStat}>
-              <Text style={styles.profileStatValue}>{scanDate === todayKey() ? scanCountToday || 1 : 0}</Text>
-              <Text style={styles.profileStatLabel}>Scans today</Text>
-            </View>
-            <View style={styles.profileStat}>
-              <Text style={styles.profileStatValue}>{mealsCooked}</Text>
-              <Text style={styles.profileStatLabel}>Meals cooked</Text>
-            </View>
-            <View style={styles.profileStat}>
-              <Text style={styles.profileStatValue}>{favorites.length}</Text>
-              <Text style={styles.profileStatLabel}>Favorites saved</Text>
-            </View>
-            <View style={styles.profileStat}>
-              <Text style={styles.profileStatValue}>{orderHistory.length}</Text>
-              <Text style={styles.profileStatLabel}>Orders placed</Text>
-            </View>
+            {profileStats.map((stat) => (
+              <View key={stat.label} style={[styles.profileStat, stat.label === 'Plan' && { borderColor: isPremium ? flowColors.fusion.accent : palette.line }]}>
+                <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82} style={styles.profileStatLabel}>
+                  {stat.label}
+                </Text>
+                <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.75} style={styles.profileStatValue}>
+                  {stat.value}
+                </Text>
+                {stat.subtitle ? (
+                  <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82} style={styles.profileStatSubtitle}>
+                    {stat.subtitle}
+                  </Text>
+                ) : null}
+              </View>
+            ))}
           </View>
           <Button accent={flowColors.fusion.accent} onPress={() => !fusionStatusLoading && setScreen(isPremium ? 'manageSubscription' : 'paywall')}>
             {fusionStatusLoading ? 'Checking Fusion+ status...' : 'Manage Subscription'}
@@ -9812,7 +10238,7 @@ function FoodFusionApp() {
   }
 
   if (screen === 'settings') {
-    const plan = fusionPlanById(selectedFusionPlan);
+    const plan = fusionPlanById(selectedFusionPlan, localizedFusionPlans);
     return (
       <Screen>
         <AppHeader eyebrow="Settings" onBack={() => setScreen('home')} accent={flowColors.profile.accent} />
@@ -9843,25 +10269,19 @@ function FoodFusionApp() {
           </View>
 
           <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>QA Checklist</Text>
-            <Text style={styles.settingsSubtitle}>Open account restore diagnostics for subscription, favorites, and recents.</Text>
-            <Button accent={flowColors.profile.accent} onPress={() => setScreen('launchChecklist')}>QA Checklist</Button>
+            <Text style={styles.settingsTitle}>Preferences</Text>
+            <Text style={styles.settingsSubtitle}>Diet, nutrition goals, meal styles, ingredients to avoid, and kitchen setup.</Text>
+            <Button variant="ghost" onPress={() => setScreen('preferences')}>Manage Preferences</Button>
           </View>
 
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Subscription</Text>
             <Text style={styles.settingsSubtitle}>
-              {fusionStatusLoading ? 'Checking Fusion+ status...' : isPremium ? `Fusion+ Active • ${plan.name} ${plan.price}${plan.cadence}` : 'Fusion Free • 1 scan daily'}
+              {fusionStatusLoading ? 'Checking Fusion+ Status...' : isPremium ? `Fusion+ Active • ${plan.name}${plan.price ? ` ${plan.price}${plan.cadence}` : ''}` : 'Fusion Free • 1 Scan Daily'}
             </Text>
             <Button accent={flowColors.fusion.accent} onPress={() => !fusionStatusLoading && setScreen(isPremium ? 'manageSubscription' : 'paywall')}>
-              {fusionStatusLoading ? 'Checking Fusion+ status...' : 'Manage Subscription'}
+              {fusionStatusLoading ? 'Checking Fusion+ Status...' : 'Manage Subscription'}
             </Button>
-          </View>
-
-          <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>Preferences</Text>
-            <Text style={styles.settingsSubtitle}>Food style, kitchen equipment, dislikes, servings, and cooking tools.</Text>
-            <Button variant="ghost" onPress={() => setScreen('preferences')}>Manage Preferences</Button>
           </View>
 
           <View style={styles.settingsCard}>
@@ -9874,12 +10294,12 @@ function FoodFusionApp() {
 
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Notifications</Text>
-            <Text style={styles.settingsSubtitle}>{notificationsEnabled ? 'Updates enabled' : 'Choose the updates you want to receive.'}</Text>
+            <Text style={styles.settingsSubtitle}>{notificationsEnabled ? 'Updates Enabled' : 'Choose the updates you want to receive.'}</Text>
             {[
-              ['recipeIdeas', 'Recipe ideas'],
-              ['groceryReminders', 'Grocery reminders'],
-              ['orderUpdates', 'List updates'],
-              ['fusionUpdates', 'Fusion+ updates']
+              ['recipeIdeas', 'Recipe Ideas'],
+              ['groceryReminders', 'Grocery Reminders'],
+              ['orderUpdates', 'List Updates'],
+              ['fusionUpdates', 'Fusion+ Updates']
             ].map(([key, label]) => (
               <Pressable key={key} onPress={() => toggleNotificationPreference(key)} style={styles.settingsToggleRow}>
                 <Text style={styles.settingsToggleLabel}>{label}</Text>
@@ -9891,19 +10311,13 @@ function FoodFusionApp() {
             {!notificationsEnabled ? <Button variant="ghost" onPress={() => setScreen('notificationPermission')}>Enable Notifications</Button> : null}
           </View>
 
-          <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>Beta Feedback</Text>
-            <Text style={styles.settingsSubtitle}>Share what works and what needs attention during testing.</Text>
-            <View style={styles.settingsActionRow}>
-              <Pressable
-                accessibilityRole="button"
-                onPress={() => openFeedback('settings')}
-                style={({ pressed }) => [styles.feedbackEntryButton, pressed && styles.pressed]}
-              >
-                <Text style={styles.feedbackEntryText}>Feedback</Text>
-              </Pressable>
+          {__DEV__ ? (
+            <View style={styles.settingsCard}>
+              <Text style={styles.settingsTitle}>QA Checklist</Text>
+              <Text style={styles.settingsSubtitle}>Open account restore diagnostics for subscription, favorites, and recents.</Text>
+              <Button accent={flowColors.profile.accent} onPress={() => setScreen('launchChecklist')}>QA Checklist</Button>
             </View>
-          </View>
+          ) : null}
 
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>About FoodFusion AI</Text>
@@ -9913,12 +10327,12 @@ function FoodFusionApp() {
             <Button variant="ghost" onPress={() => setScreen('terms')}>Terms of Service</Button>
             <Button variant="ghost" onPress={() => setScreen('nutritionDisclaimer')}>Nutrition Disclaimer</Button>
             <Button variant="ghost" onPress={() => setScreen('onboarding')}>View Onboarding</Button>
-            <Pressable onPress={unlockDeveloperMode} style={styles.versionTap}>
+            <Pressable onPress={__DEV__ ? unlockDeveloperMode : undefined} style={styles.versionTap}>
               <Text style={styles.versionTapText}>Build {APP_VERSION}</Text>
             </Pressable>
           </View>
 
-          {developerMode ? (
+          {__DEV__ && developerMode ? (
             <View style={styles.settingsCard}>
               <Text style={styles.settingsTitle}>Developer Mode</Text>
               <Text style={styles.settingsSubtitle}>Local app tools.</Text>
@@ -9930,17 +10344,19 @@ function FoodFusionApp() {
             </View>
           ) : null}
 
-          <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>Resets</Text>
-            <Text style={styles.settingsSubtitle}>Clear saved app data.</Text>
-            <Button variant="ghost" onPress={clearHistory}>Clear history</Button>
-            <Button variant="ghost" onPress={clearFavorites}>Clear favorites</Button>
-            <Button variant="ghost" onPress={clearGroceryList}>Clear grocery list</Button>
-            <Button variant="ghost" onPress={clearPreferences}>Clear preferences</Button>
-            <Button variant="ghost" onPress={clearDislikes}>Clear disliked ingredients</Button>
-            <Button variant="ghost" onPress={resetServingsEquipment}>Reset servings/equipment</Button>
-            <Button variant="cream" onPress={() => resetAllAppData()}>Reset all app data</Button>
-          </View>
+          {__DEV__ ? (
+            <View style={styles.settingsCard}>
+              <Text style={styles.settingsTitle}>Resets</Text>
+              <Text style={styles.settingsSubtitle}>Clear saved app data.</Text>
+              <Button variant="ghost" onPress={clearHistory}>Clear history</Button>
+              <Button variant="ghost" onPress={clearFavorites}>Clear favorites</Button>
+              <Button variant="ghost" onPress={clearGroceryList}>Clear grocery list</Button>
+              <Button variant="ghost" onPress={clearPreferences}>Clear preferences</Button>
+              <Button variant="ghost" onPress={clearDislikes}>Clear disliked ingredients</Button>
+              <Button variant="ghost" onPress={resetServingsEquipment}>Reset servings/equipment</Button>
+              <Button variant="cream" onPress={() => resetAllAppData()}>Reset all app data</Button>
+            </View>
+          ) : null}
         </ScrollView>
       </Screen>
     );
@@ -10284,66 +10700,59 @@ function FoodFusionApp() {
       <Screen>
         <AppHeader eyebrow="Preferences" onBack={() => setScreen('settings')} accent={flowColors.profile.accent} />
         <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.preferencesScroll}>
-          <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>Food Style</Text>
-            <Text style={styles.settingsSubtitle}>Choose as many as you want.</Text>
-            <Text style={styles.preferenceGroupLabel}>Core</Text>
-            <View style={styles.optionRow}>
-              {corePreferenceOptions.map((preference) => (
-                <Pressable
-                  key={preference}
-                  onPress={() => togglePreference(preference)}
-                  style={[styles.preferenceChip, preferences.includes(preference) && styles.activeOptionChip]}
-                >
-                  <Text style={[styles.preferenceChipText, preferences.includes(preference) && styles.activeOptionChipText]}>
-                    {preference}
-                  </Text>
+          {preferenceSections.map((section) => (
+            <View key={section.title} style={styles.settingsCard}>
+              <View style={styles.preferenceSectionHeader}>
+                <Text style={styles.settingsTitle}>{section.title}</Text>
+                <Pressable accessibilityLabel={`Add ${section.title}`} onPress={() => openCustomPreference(section.title)} style={styles.preferenceAddButton}>
+                  <Text style={styles.preferenceAddButtonText}>+</Text>
                 </Pressable>
-              ))}
+              </View>
+              <Text style={styles.settingsSubtitle}>Choose all that apply.</Text>
+              <View style={styles.optionRow}>
+                {section.options.map((option) => {
+                  const { value, label } = preferenceOption(option);
+                  return (
+                    <Pressable
+                      key={value}
+                      onPress={() => togglePreference(value)}
+                      style={[styles.preferenceChip, preferences.includes(value) && styles.activeOptionChip]}
+                    >
+                      <Text style={[styles.preferenceChipText, preferences.includes(value) && styles.activeOptionChipText]}>
+                        {label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+                {(customPreferences[section.title] || []).map((label) => (
+                  <Pressable
+                    key={`custom-${section.title}-${label}`}
+                    onPress={() => togglePreference(label)}
+                    onLongPress={() => removeCustomPreference(section.title, label)}
+                    style={[styles.preferenceChip, preferences.includes(label) && styles.activeOptionChip]}
+                  >
+                    <Text style={[styles.preferenceChipText, preferences.includes(label) && styles.activeOptionChipText]}>{label} ×</Text>
+                  </Pressable>
+                ))}
+              </View>
             </View>
-            <Text style={styles.preferenceGroupLabel}>More Styles</Text>
-            <View style={styles.optionRow}>
-              {expandedPreferenceOptions.map((preference) => (
-                <Pressable
-                  key={preference}
-                  onPress={() => togglePreference(preference)}
-                  style={[styles.preferenceChip, preferences.includes(preference) && styles.activeOptionChip]}
-                >
-                  <Text style={[styles.preferenceChipText, preferences.includes(preference) && styles.activeOptionChipText]}>
-                    {preference}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-          </View>
+          ))}
 
           <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>Kitchen Equipment</Text>
-            <Text style={styles.settingsSubtitle}>Recipes match what you own.</Text>
-            <View style={styles.optionRow}>
-              {kitchenEquipmentOptions.map((item) => (
-                <Pressable
-                  key={item}
-                  onPress={() => toggleEquipmentProfile(item)}
-                  style={[styles.optionChip, equipmentProfile.includes(item) && styles.activeOptionChip]}
-                >
-                  <Text style={[styles.optionChipText, equipmentProfile.includes(item) && styles.activeOptionChipText]}>
-                    {item}
-                  </Text>
-                </Pressable>
-              ))}
+            <View style={styles.preferenceSectionHeader}>
+              <Text style={styles.settingsTitle}>Ingredients To Avoid</Text>
+              <Pressable accessibilityLabel="Add Ingredient To Avoid" onPress={() => openCustomPreference('Ingredients To Avoid')} style={styles.preferenceAddButton}>
+                <Text style={styles.preferenceAddButtonText}>+</Text>
+              </Pressable>
             </View>
-          </View>
-
-          <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>I don't like...</Text>
+            <Text style={styles.settingsSubtitle}>Add any ingredient you do not want in recipe suggestions.</Text>
             <View style={styles.dislikeInputRow}>
               <TextInput
                 value={dislikeInput}
                 onChangeText={setDislikeInput}
-                placeholder="mushrooms, onions, tuna..."
+                placeholder="Mushrooms, Onions, Tuna..."
                 placeholderTextColor={palette.muted}
-                autoCapitalize="none"
+                autoCapitalize="words"
                 style={styles.dislikeInput}
               />
               <Pressable onPress={addDislikedIngredient} style={styles.addDislikeButton}>
@@ -10353,18 +10762,125 @@ function FoodFusionApp() {
             <View style={styles.optionRow}>
               {dislikedIngredients.map((item) => (
                 <Pressable key={item} onPress={() => deleteDislikedIngredient(item)} style={styles.optionChip}>
-                  <Text style={styles.optionChipText}>{item} ×</Text>
+                  <Text style={styles.optionChipText}>{titleCasePreference(item)} ×</Text>
                 </Pressable>
               ))}
             </View>
           </View>
+
+          <View style={styles.settingsCard}>
+            <View style={styles.preferenceSectionHeader}>
+              <Text style={styles.settingsTitle}>Kitchen Equipment</Text>
+              <Pressable accessibilityLabel="Add Kitchen Equipment" onPress={() => openCustomPreference('Kitchen Equipment')} style={styles.preferenceAddButton}>
+                <Text style={styles.preferenceAddButtonText}>+</Text>
+              </Pressable>
+            </View>
+            <Text style={styles.settingsSubtitle}>Recipes match what you own.</Text>
+            <View style={styles.optionRow}>
+              {kitchenEquipmentOptions.map((item) => (
+                <Pressable
+                  key={item}
+                  onPress={() => toggleEquipmentProfile(item)}
+                  style={[styles.optionChip, equipmentProfile.includes(item) && styles.activeOptionChip]}
+                >
+                  <Text style={[styles.optionChipText, equipmentProfile.includes(item) && styles.activeOptionChipText]}>
+                    {titleCasePreference(item)}
+                  </Text>
+                </Pressable>
+              ))}
+              {(customPreferences['Kitchen Equipment'] || []).map((label) => (
+                <Pressable
+                  key={`custom-equipment-${label}`}
+                  onPress={() => toggleEquipmentProfile(label.toLowerCase())}
+                  onLongPress={() => removeCustomPreference('Kitchen Equipment', label)}
+                  style={[styles.optionChip, equipmentProfile.some((item) => item.toLowerCase() === label.toLowerCase()) && styles.activeOptionChip]}
+                >
+                  <Text style={[styles.optionChipText, equipmentProfile.some((item) => item.toLowerCase() === label.toLowerCase()) && styles.activeOptionChipText]}>{label} ×</Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+
+          <View style={styles.settingsCard}>
+            <Text style={styles.settingsTitle}>Meal Setup</Text>
+            <Text style={styles.preferenceGroupLabel}>Serving Size</Text>
+            <View style={styles.optionRow}>
+              {servingOptions.map((option) => (
+                <Pressable
+                  key={option}
+                  onPress={() => selectServings(option)}
+                  style={[styles.optionChip, servings === option && styles.activeOptionChip]}
+                >
+                  <Text style={[styles.optionChipText, servings === option && styles.activeOptionChipText]}>
+                    {option} {option === 1 ? 'Serving' : 'Servings'}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            <Text style={styles.preferenceGroupLabel}>Primary Cooking Method</Text>
+            <View style={styles.optionRow}>
+              {equipmentOptions.map((option) => (
+                <Pressable
+                  key={option}
+                  onPress={() => selectEquipment(option)}
+                  style={[styles.optionChip, equipment === option && styles.activeOptionChip]}
+                >
+                  <Text style={[styles.optionChipText, equipment === option && styles.activeOptionChipText]}>
+                    {option}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+          <Modal visible={Boolean(customPreferenceModal)} transparent animationType="slide" onRequestClose={() => setCustomPreferenceModal(null)}>
+            <View style={styles.preferenceModalBackdrop}>
+              <View style={styles.preferenceModalCard}>
+                <View style={styles.preferenceSectionHeader}>
+                  <Text style={styles.settingsTitle}>Add {customPreferenceModal}</Text>
+                  <Pressable accessibilityLabel="Close" onPress={() => setCustomPreferenceModal(null)} style={styles.preferenceAddButton}>
+                    <Text style={styles.preferenceAddButtonText}>×</Text>
+                  </Pressable>
+                </View>
+                <TextInput
+                  value={customPreferenceQuery}
+                  onChangeText={setCustomPreferenceQuery}
+                  placeholder={`Search or add ${customPreferenceModal || 'preference'}...`}
+                  placeholderTextColor={palette.muted}
+                  autoCapitalize="words"
+                  style={styles.preferenceSearchInput}
+                />
+                <ScrollView style={styles.preferenceModalResults} keyboardShouldPersistTaps="handled">
+                  {builtInOptionsForCategory(customPreferenceModal)
+                    .filter((label) => !customPreferenceQuery || `${label}`.toLowerCase().includes(customPreferenceQuery.toLowerCase()))
+                    .map((label) => (
+                      <Pressable key={`available-${label}`} onPress={() => selectExistingPreference(customPreferenceModal, label)} style={styles.preferenceSearchResult}>
+                        <Text style={styles.preferenceChipText}>{label}</Text>
+                      </Pressable>
+                    ))}
+                  {(customPreferences[customPreferenceModal] || [])
+                    .filter((label) => !customPreferenceQuery || label.toLowerCase().includes(customPreferenceQuery.toLowerCase()))
+                    .map((label) => (
+                      <View key={`saved-${label}`} style={styles.preferenceSearchResultRow}>
+                        <Text style={styles.preferenceChipText}>{label}</Text>
+                        <Pressable onPress={() => removeCustomPreference(customPreferenceModal, label)}>
+                          <Text style={styles.preferenceRemoveText}>Remove</Text>
+                        </Pressable>
+                      </View>
+                    ))}
+                </ScrollView>
+                {customPreferenceQuery.trim() ? (
+                  <Button onPress={() => addCustomPreference(customPreferenceModal)}>Add “{titleCasePreference(customPreferenceQuery)}”</Button>
+                ) : null}
+              </View>
+            </View>
+          </Modal>
         </ScrollView>
       </Screen>
     );
   }
 
   if (screen === 'fusionPayment') {
-    const plan = fusionPlanById(selectedFusionPlan);
+    const plan = fusionPlanById(selectedFusionPlan, localizedFusionPlans);
     return (
       <Screen>
         <AppHeader eyebrow="Fusion+ Payment" onBack={() => setScreen('paywall')} accent={flowColors.fusion.accent} />
@@ -10372,18 +10888,16 @@ function FoodFusionApp() {
           <FlowProgress steps={['Plan', 'Payment', 'Active']} current={1} tone={flowColors.fusion} />
           <View style={[styles.subscriptionStatusCard, { borderColor: flowColors.fusion.tint }]}>
             <Text style={styles.paywallTitle}>{plan.name}</Text>
-            <Text style={styles.paywallText}>{plan.price}{plan.cadence}</Text>
+            <Text style={styles.paywallText}>{plan.price ? `${plan.price}${plan.cadence}` : 'Loading App Store price...'}</Text>
             {plan.savings ? <Text style={styles.demoPaymentText}>{plan.savings} • Best Value • 2 months free</Text> : null}
             <Text style={styles.settingsSubtitle}>Your subscription is completed securely through your App Store account.</Text>
           </View>
 
-          <Button accent={flowColors.fusion.accent} onPress={startFusionPlus} disabled={isProcessingPayment}>
-            {revenueCatSetupPausedForDev ? 'Unavailable during setup' : isProcessingPayment ? 'Opening checkout...' : `Subscribe ${plan.price}${plan.cadence}`}
+          <Button accent={flowColors.fusion.accent} onPress={startFusionPlus} disabled={isProcessingPayment || offeringsStatus !== 'ready'}>
+            {isProcessingPayment ? 'Opening checkout...' : offeringsStatus !== 'ready' ? 'Subscription options unavailable' : `Subscribe ${plan.price}${plan.cadence}`}
           </Button>
           {premiumAccess.status === 'loading' ? (
             <Text style={styles.authMessage}>Opening secure App Store checkout...</Text>
-          ) : revenueCatSetupPausedForDev ? (
-            <Text style={styles.authMessage}>Purchases are paused for Apple setup. App testing can continue.</Text>
           ) : premiumAccess.error ? (
             <Text style={styles.authError}>{premiumAccess.error}</Text>
           ) : null}
@@ -10395,7 +10909,7 @@ function FoodFusionApp() {
   }
 
   if (screen === 'fusionSuccess') {
-    const plan = fusionPlanById(selectedFusionPlan);
+    const plan = fusionPlanById(selectedFusionPlan, localizedFusionPlans);
     return (
       <Screen toast={toast}>
         <FlowProgress steps={['Plan', 'Payment', 'Active']} current={2} tone={flowColors.fusion} />
@@ -10410,7 +10924,7 @@ function FoodFusionApp() {
   }
 
   if (screen === 'manageSubscription') {
-    const plan = fusionPlanById(selectedFusionPlan);
+    const plan = fusionPlanById(selectedFusionPlan, localizedFusionPlans);
     return (
       <Screen>
         <AppHeader eyebrow="Manage Subscription" onBack={() => setScreen('settings')} accent={flowColors.fusion.accent} />
@@ -10418,14 +10932,14 @@ function FoodFusionApp() {
           <View style={[styles.subscriptionStatusCard, { borderColor: flowColors.fusion.tint }]}>
             <Text style={styles.settingsTitle}>{fusionStatusLoading ? 'Checking Fusion+ status...' : isPremium ? 'Fusion+ Active' : 'Free Plan'}</Text>
             <Text style={styles.settingsSubtitle}>
-              {fusionStatusLoading ? 'Restoring your subscription for this account.' : `Current plan: ${plan.name} ${plan.price}${plan.cadence}`}
+              {fusionStatusLoading ? 'Restoring your subscription for this account.' : `Current plan: ${plan.name}${plan.price ? ` ${plan.price}${plan.cadence}` : ''}`}
             </Text>
             <Text style={styles.settingsSubtitle}>
               {subscriptionRenewalDate ? `Renews or expires: ${new Date(subscriptionRenewalDate).toLocaleDateString()}` : 'Renewal details update after App Store confirmation.'}
             </Text>
           </View>
           <View style={styles.pricingRow}>
-            {fusionPlans.map((item) => (
+            {localizedFusionPlans.map((item) => (
               <Pressable
                 key={item.id}
                 onPress={() => setSelectedFusionPlan(item.id)}
@@ -10446,7 +10960,7 @@ function FoodFusionApp() {
                   </View>
                 ) : null}
                 <Text style={styles.planName}>{item.name}</Text>
-                <Text style={styles.planPrice}>{item.price}</Text>
+                <Text style={styles.planPrice}>{item.price || '—'}</Text>
                 <Text style={styles.planCadence}>{item.cadence}</Text>
                 <Text style={styles.planDetail}>{item.detail}</Text>
               </Pressable>
@@ -10470,7 +10984,10 @@ function FoodFusionApp() {
         onManage={() => setScreen('manageSubscription')}
         selectedPlan={selectedFusionPlan}
         premiumAccess={premiumAccess}
-        setupPaused={revenueCatSetupPausedForDev}
+        plans={localizedFusionPlans}
+        offeringsStatus={offeringsStatus}
+        offeringsError={offeringsError}
+        onRetryOfferings={loadFusionOfferings}
       />
     );
   }
@@ -10805,6 +11322,9 @@ const styles = StyleSheet.create({
   },
   tabScrollContent: {
     paddingBottom: 96
+  },
+  profileScrollContent: {
+    paddingBottom: 140
   },
   bottomTabs: {
     backgroundColor: palette.panel,
@@ -11972,6 +12492,75 @@ const styles = StyleSheet.create({
     marginTop: 10,
     textTransform: 'uppercase'
   },
+  preferenceSectionHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between'
+  },
+  preferenceAddButton: {
+    alignItems: 'center',
+    backgroundColor: palette.greenDeep,
+    borderColor: palette.green,
+    borderRadius: 18,
+    borderWidth: 1,
+    height: 36,
+    justifyContent: 'center',
+    width: 36
+  },
+  preferenceAddButtonText: {
+    color: palette.green,
+    fontSize: 24,
+    fontWeight: '800',
+    lineHeight: 27
+  },
+  preferenceModalBackdrop: {
+    backgroundColor: 'rgba(7, 16, 24, 0.82)',
+    flex: 1,
+    justifyContent: 'flex-end'
+  },
+  preferenceModalCard: {
+    backgroundColor: palette.card,
+    borderColor: palette.line,
+    borderTopLeftRadius: 26,
+    borderTopRightRadius: 26,
+    borderWidth: 1,
+    maxHeight: '78%',
+    padding: 20,
+    paddingBottom: 32
+  },
+  preferenceSearchInput: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 14,
+    borderWidth: 1,
+    color: palette.cream,
+    marginBottom: 12,
+    marginTop: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12
+  },
+  preferenceModalResults: {
+    marginBottom: 12,
+    maxHeight: 280
+  },
+  preferenceSearchResult: {
+    borderBottomColor: palette.line,
+    borderBottomWidth: 1,
+    paddingVertical: 13
+  },
+  preferenceSearchResultRow: {
+    alignItems: 'center',
+    borderBottomColor: palette.line,
+    borderBottomWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 13
+  },
+  preferenceRemoveText: {
+    color: palette.warning,
+    fontSize: 12,
+    fontWeight: '800'
+  },
   preferenceChip: {
     backgroundColor: palette.panel,
     borderColor: palette.line,
@@ -12699,6 +13288,52 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 12,
     marginBottom: 16
+  },
+  recipeSectionTitle: {
+    color: palette.cream,
+    fontSize: 23,
+    fontWeight: '900',
+    marginBottom: 12,
+    marginTop: 6
+  },
+  recipeStepList: {
+    gap: 12,
+    marginBottom: 16
+  },
+  recipeDirectionCard: {
+    backgroundColor: palette.card,
+    borderColor: palette.line,
+    borderRadius: 22,
+    borderWidth: 1,
+    padding: 18
+  },
+  recipeDirectionNumber: {
+    color: palette.green,
+    fontSize: 12,
+    fontWeight: '900',
+    letterSpacing: 0.8,
+    textTransform: 'uppercase'
+  },
+  recipeDirectionTitle: {
+    color: palette.cream,
+    fontSize: 19,
+    fontWeight: '900',
+    marginTop: 6
+  },
+  recipeDirectionText: {
+    color: palette.cream,
+    fontSize: 16,
+    fontWeight: '600',
+    lineHeight: 24,
+    marginTop: 9
+  },
+  recipeSourceCard: {
+    backgroundColor: palette.panel,
+    borderColor: palette.line,
+    borderRadius: 18,
+    borderWidth: 1,
+    marginBottom: 14,
+    padding: 14
   },
   stepList: {
     gap: 14,
@@ -13958,26 +14593,36 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 10,
-    marginBottom: 8
+    marginBottom: 12
   },
   profileStat: {
     backgroundColor: palette.panel,
     borderColor: palette.line,
     borderRadius: 18,
     borderWidth: 1,
-    flexBasis: '48%',
-    padding: 15
+    minHeight: 86,
+    padding: 14,
+    width: (Dimensions.get('window').width - 54) / 2
   },
   profileStatValue: {
     color: palette.cream,
-    fontSize: 22,
-    fontWeight: '900'
+    fontSize: 21,
+    fontWeight: '900',
+    lineHeight: 27
   },
   profileStatLabel: {
     color: palette.muted,
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '800',
+    lineHeight: 15,
     marginTop: 5
+  },
+  profileStatSubtitle: {
+    color: palette.muted,
+    fontSize: 10,
+    fontWeight: '800',
+    lineHeight: 14,
+    marginTop: 3
   },
   cookingSafe: {
     flex: 1,

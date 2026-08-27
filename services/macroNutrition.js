@@ -1,4 +1,10 @@
 const HOSTED_MACRO_ENDPOINT = 'https://foodfusion-ai-site.onrender.com/nutrition/macros';
+const isDevelopmentBuild = typeof __DEV__ !== 'undefined' && __DEV__;
+const console = isDevelopmentBuild ? globalThis.console : {
+  log: () => {},
+  warn: (label) => globalThis.console.warn(typeof label === 'string' ? label : '[Nutrition] Recoverable error'),
+  error: (label) => globalThis.console.error(typeof label === 'string' ? label : '[Nutrition] Error')
+};
 const configuredRecipeEndpoint = process.env.EXPO_PUBLIC_RECIPE_MCP_ENDPOINT?.trim();
 const configuredMacroEndpoint = process.env.EXPO_PUBLIC_MACRO_NUTRITION_ENDPOINT?.trim();
 const accessToken = process.env.EXPO_PUBLIC_FOOD_SCAN_ACCESS_TOKEN?.trim();

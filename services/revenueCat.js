@@ -1,6 +1,13 @@
 import { Platform } from 'react-native';
 import Purchases from 'react-native-purchases';
 
+const isDevelopmentBuild = typeof __DEV__ !== 'undefined' && __DEV__;
+const console = isDevelopmentBuild ? globalThis.console : {
+  log: () => {},
+  warn: (label) => globalThis.console.warn(typeof label === 'string' ? label : '[RevenueCat] Recoverable error'),
+  error: (label) => globalThis.console.error(typeof label === 'string' ? label : '[RevenueCat] Error')
+};
+
 export const FUSION_PLUS_ENTITLEMENT = 'fusion_plus';
 export const REVENUECAT_PRODUCT_IDS = {
   monthly: 'foodfusion_monthly',
@@ -25,6 +32,38 @@ const devForceFusionPlus = isDevBuild && process.env.EXPO_PUBLIC_DEV_FORCE_FUSIO
 const DEV_SETUP_PAUSED_MESSAGE = 'Purchases are paused for Apple setup. App testing can continue.';
 const PRODUCTION_PURCHASE_UNAVAILABLE_MESSAGE = 'Fusion+ checkout is unavailable right now. Please try again later.';
 
+export function revenueCatErrorCategory(error) {
+  if (error?.revenueCatCategory) {
+    return error.revenueCatCategory;
+  }
+  if (error?.userCancelled || error?.code === 'PURCHASE_CANCELLED') {
+    return 'purchase_cancelled';
+  }
+  const message = `${error?.message || error || ''}`.toLowerCase();
+  if (/network|offline|internet|timed out|timeout|connection|temporarily unavailable/.test(message)) {
+    return 'network';
+  }
+  if (/no current offering|offerings are empty|offering.*empty|no offerings/.test(message)) {
+    return 'no_current_offering';
+  }
+  if (/missing.*package|products could not be fetched|no products/.test(message)) {
+    return 'missing_packages';
+  }
+  if (/app store|configuration|configured|api key|bundle|project/.test(message)) {
+    return 'configuration';
+  }
+  return 'unknown';
+}
+
+function revenueCatError(category, message, cause = null) {
+  const error = new Error(message);
+  error.revenueCatCategory = category;
+  if (cause) {
+    error.cause = cause;
+  }
+  return error;
+}
+
 export function isKnownRevenueCatSetupError(error) {
   const message = error?.message || `${error || ''}`;
   return /there was a problem with the app store|products could not be fetched|offerings.*empty|offering.*empty|no offerings|no products|couldn't fetch|couldn.t be completed|couldn't be completed|could not be completed|offeringsmanager/i.test(message);
@@ -32,7 +71,17 @@ export function isKnownRevenueCatSetupError(error) {
 
 function friendlyRevenueCatError(error) {
   const message = error?.message || `${error || ''}` || 'RevenueCat is not ready.';
-  if (isKnownRevenueCatSetupError(error)) {
+  const category = revenueCatErrorCategory(error);
+  if (category === 'network') {
+    return 'Unable to load subscription options. Check your connection and try again.';
+  }
+  if (category === 'no_current_offering') {
+    return 'No current Fusion+ Offering is available. Please try again shortly.';
+  }
+  if (category === 'missing_packages') {
+    return 'The monthly or yearly Fusion+ option is unavailable. Please try again shortly.';
+  }
+  if (category === 'configuration' || isKnownRevenueCatSetupError(error)) {
     return isDevBuild ? DEV_SETUP_PAUSED_MESSAGE : PRODUCTION_PURCHASE_UNAVAILABLE_MESSAGE;
   }
   return message;
@@ -40,8 +89,8 @@ function friendlyRevenueCatError(error) {
 
 function markRevenueCatError(error) {
   lastRevenueCatError = friendlyRevenueCatError(error);
-  const knownSetupError = isKnownRevenueCatSetupError(error);
-  if (isDevBuild && knownSetupError) {
+  const configurationError = revenueCatErrorCategory(error) === 'configuration';
+  if (isDevBuild && configurationError) {
     setupPaused = true;
     offeringsLoaded = false;
     console.log('[RevenueCat] setup paused:', lastRevenueCatError);
@@ -139,7 +188,7 @@ export function mapCustomerInfoToSubscription(customerInfo) {
   }
   return {
     isPremium: active,
-    selectedPlan: active ? plan : 'yearly',
+    selectedPlan: plan,
     subscriptionStatus: active ? 'active' : entitlement ? 'expired' : 'inactive',
     source: 'RevenueCat',
     entitlement,
@@ -246,21 +295,25 @@ export async function getRevenueCatOfferings(userId) {
   try {
     await initializeRevenueCat(userId);
     lastOfferings = await Purchases.getOfferings();
-    offeringsLoaded = Boolean(lastOfferings?.current?.availablePackages?.length);
+    if (!lastOfferings?.current) {
+      throw revenueCatError('no_current_offering', 'No current RevenueCat Offering was returned.');
+    }
+    offeringsLoaded = Boolean(lastOfferings.current.availablePackages?.length);
     if (!offeringsLoaded) {
-      throw new Error('RevenueCat offerings are empty.');
+      throw revenueCatError('no_current_offering', 'The current RevenueCat Offering has no available packages.');
     }
     setupPaused = false;
     lastRevenueCatError = '';
     return lastOfferings;
   } catch (error) {
     offeringsLoaded = false;
+    const category = revenueCatErrorCategory(error);
     markRevenueCatError(error);
-    throw new Error(lastRevenueCatError);
+    throw revenueCatError(category, lastRevenueCatError, error);
   }
 }
 
-function findPackageForPlan(offerings, planId) {
+export function findPackageForPlan(offerings, planId) {
   const packages = offerings?.current?.availablePackages || [];
   const targetType = planId === 'monthly' ? 'MONTHLY' : 'ANNUAL';
   const targetProductId = REVENUECAT_PRODUCT_IDS[planId] || REVENUECAT_PRODUCT_IDS.yearly;
@@ -269,6 +322,21 @@ function findPackageForPlan(offerings, planId) {
     packages.find((item) => `${item.identifier}`.toLowerCase().includes(planId === 'monthly' ? 'month' : 'year')) ||
     packages.find((item) => `${item.product?.identifier || ''}`.toLowerCase().includes(planId === 'monthly' ? 'month' : 'year')) ||
     null;
+}
+
+export async function getRevenueCatPaywallPackages(userId) {
+  const offerings = await getRevenueCatOfferings(userId);
+  const packages = offerings.current.availablePackages || [];
+  const monthly = packages.find((item) => item.product?.identifier === REVENUECAT_PRODUCT_IDS.monthly) || null;
+  const yearly = packages.find((item) => item.product?.identifier === REVENUECAT_PRODUCT_IDS.yearly) || null;
+  if (!monthly || !yearly) {
+    const missing = [!monthly ? 'monthly' : null, !yearly ? 'yearly' : null].filter(Boolean).join(' and ');
+    offeringsLoaded = false;
+    const error = revenueCatError('missing_packages', `The current RevenueCat Offering is missing the ${missing} package.`);
+    markRevenueCatError(error);
+    throw error;
+  }
+  return { offerings, monthly, yearly };
 }
 
 export async function purchaseFusionPlan(userId, planId) {
@@ -306,4 +374,10 @@ export async function restoreRevenueCatPurchases(userId) {
     markRevenueCatError(error);
     throw new Error(lastRevenueCatError || 'Restore purchases is unavailable right now.');
   }
+}
+
+export function addRevenueCatCustomerInfoUpdateListener(listener) {
+  const wrappedListener = (customerInfo) => listener(mapCustomerInfoToSubscription(customerInfo));
+  Purchases.addCustomerInfoUpdateListener(wrappedListener);
+  return () => Purchases.removeCustomerInfoUpdateListener(wrappedListener);
 }

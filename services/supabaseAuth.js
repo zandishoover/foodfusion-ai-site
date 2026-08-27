@@ -5,10 +5,25 @@ import 'react-native-url-polyfill/auto';
 // dynamic telemetry import that Hermes cannot compile in production bundles.
 import { createClient, processLock } from '@supabase/supabase-js/dist/index.cjs';
 
+const isDevelopmentBuild = typeof __DEV__ !== 'undefined' && __DEV__;
+const console = isDevelopmentBuild ? globalThis.console : {
+  log: () => {},
+  warn: (label) => globalThis.console.warn(typeof label === 'string' ? label : '[Supabase] Recoverable error'),
+  error: (label) => globalThis.console.error(typeof label === 'string' ? label : '[Supabase] Error')
+};
+
 const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL;
 const supabaseKey =
   process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
   process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
+const supabaseUrlSource = process.env.EXPO_PUBLIC_SUPABASE_URL
+  ? 'EXPO_PUBLIC_SUPABASE_URL'
+  : 'missing';
+const supabaseKeySource = process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+  ? 'EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY'
+  : process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY
+    ? 'EXPO_PUBLIC_SUPABASE_ANON_KEY'
+    : 'missing';
 const authRedirectUrl = process.env.EXPO_PUBLIC_SUPABASE_REDIRECT_URL;
 const hostedAuthBaseUrl = 'https://foodfusion-ai-site.onrender.com';
 const authConfirmationRedirectUrl =
@@ -23,12 +38,23 @@ const usesSetupPlaceholder =
   supabaseUrl?.includes('your-project.supabase.co') ||
   supabaseKey?.includes('your-publishable-key');
 
+function resolvedSupabaseHostname() {
+  try {
+    return supabaseUrl ? new URL(supabaseUrl).hostname : '';
+  } catch {
+    return 'invalid-url';
+  }
+}
+
 export const supabaseConfigured = Boolean(supabaseUrl && supabaseKey && !usesSetupPlaceholder);
 
 export const supabaseAuthConfig = {
   supabaseConfigured,
   supabaseUrlLoaded: Boolean(supabaseUrl),
   publishableKeyLoaded: Boolean(supabaseKey),
+  supabaseHostname: resolvedSupabaseHostname(),
+  supabaseUrlSource,
+  supabaseKeySource,
   redirectUrlLoaded: Boolean(authRedirectUrl),
   supabaseUrl: supabaseUrl || '',
   redirectUrl: authRedirectUrl || '',
@@ -38,6 +64,16 @@ export const supabaseAuthConfig = {
   autoRefreshToken: true,
   detectSessionInUrl: false
 };
+
+if (typeof __DEV__ !== 'undefined' && __DEV__) {
+  console.log('[Supabase Config] resolved development configuration', {
+    hostname: resolvedSupabaseHostname() || 'missing',
+    urlSource: supabaseUrlSource,
+    publishableKeyPresent: Boolean(supabaseKey),
+    keySource: supabaseKeySource,
+    configured: supabaseConfigured
+  });
+}
 
 // GoTrue's auto-refresh tick probes the auth lock with a zero timeout.
 // In one React Native JS process, queue that probe behind in-flight auth work
@@ -85,27 +121,21 @@ async function loadProfileTableName(user) {
     return { name: '', source: '' };
   }
 
-  const attempts = [
-    { label: 'profile table user_id', query: () => supabase.from('profiles').select('name, full_name, email').eq('user_id', user.id).maybeSingle() },
-    { label: 'profile table id', query: () => supabase.from('profiles').select('name, full_name, email').eq('id', user.id).maybeSingle() },
-    { label: 'profile table user_id name', query: () => supabase.from('profiles').select('name, email').eq('user_id', user.id).maybeSingle() },
-    { label: 'profile table id name', query: () => supabase.from('profiles').select('name, email').eq('id', user.id).maybeSingle() }
-  ];
-
-  for (const attempt of attempts) {
-    try {
-      const { data, error } = await attempt.query();
-      if (error) {
-        console.warn('[Profile] profile table load skipped:', { source: attempt.label, message: error.message });
-        continue;
-      }
-      const name = data?.name || data?.full_name || '';
-      if (name) {
-        return { name, source: attempt.label };
-      }
-    } catch (error) {
-      console.warn('[Profile] profile table load failed:', { source: attempt.label, message: error?.message || String(error) });
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('name, email')
+      .eq('id', user.id)
+      .maybeSingle();
+    if (error) {
+      console.warn('[Profile] profile table load skipped:', { source: 'profile table id', message: error.message });
+      return { name: '', source: '' };
     }
+    if (data?.name) {
+      return { name: data.name, source: 'profile table id' };
+    }
+  } catch (error) {
+    console.warn('[Profile] profile table load failed:', { source: 'profile table id', message: error?.message || String(error) });
   }
 
   return { name: '', source: '' };
@@ -116,32 +146,20 @@ async function saveProfileTableName(profile) {
     return false;
   }
 
-  const rowWithBothIds = {
-    id: profile.id,
-    user_id: profile.id,
-    name: profile.name,
-    full_name: profile.name,
-    email: profile.email || ''
-  };
-  const attempts = [
-    { label: 'profiles id + user_id', payload: rowWithBothIds, options: { onConflict: 'id' } },
-    { label: 'profiles id', payload: { id: profile.id, name: profile.name, full_name: profile.name, email: profile.email || '' }, options: { onConflict: 'id' } },
-    { label: 'profiles user_id', payload: { user_id: profile.id, name: profile.name, full_name: profile.name, email: profile.email || '' }, options: { onConflict: 'user_id' } },
-    { label: 'profiles id name', payload: { id: profile.id, name: profile.name, email: profile.email || '' }, options: { onConflict: 'id' } },
-    { label: 'profiles user_id name', payload: { user_id: profile.id, name: profile.name, email: profile.email || '' }, options: { onConflict: 'user_id' } }
-  ];
-
-  for (const attempt of attempts) {
-    try {
-      const { error } = await supabase.from('profiles').upsert(attempt.payload, attempt.options);
-      if (!error) {
-        console.log('[Profile] saved display name to profile table:', { source: attempt.label, userId: profile.id });
-        return true;
-      }
-      console.warn('[Profile] profile table save skipped:', { source: attempt.label, message: error.message });
-    } catch (error) {
-      console.warn('[Profile] profile table save failed:', { source: attempt.label, message: error?.message || String(error) });
+  try {
+    const { error } = await supabase.from('profiles').upsert({
+      id: profile.id,
+      name: profile.name,
+      email: profile.email || ''
+    }, { onConflict: 'id' });
+    if (error) {
+      console.warn('[Profile] profile table save skipped:', { source: 'profiles id', message: error.message });
+      return false;
     }
+    console.log('[Profile] saved display name to profile table:', { source: 'profiles id', userId: profile.id });
+    return true;
+  } catch (error) {
+    console.warn('[Profile] profile table save failed:', { source: 'profiles id', message: error?.message || String(error) });
   }
 
   return false;
@@ -185,11 +203,18 @@ async function getSupabaseSession() {
     return null;
   }
   if (!sessionRequest) {
-    console.log('[Supabase Auth] getSession request starting');
+    console.log('[Supabase Auth] getSession request starting', {
+      hostname: resolvedSupabaseHostname() || 'missing'
+    });
     sessionRequest = supabase.auth.getSession()
       .then(({ data, error }) => {
         if (error) {
-          console.warn('[Supabase Auth] getSession error:', error);
+          console.warn('[Supabase Auth] getSession error:', {
+            hostname: resolvedSupabaseHostname() || 'missing',
+            message: error?.message || String(error),
+            name: error?.name || 'Error',
+            status: error?.status || 0
+          });
           throw error;
         }
         console.log('[Supabase Auth] getSession response:', {
